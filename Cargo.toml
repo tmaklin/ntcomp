@@ -18,8 +18,11 @@ path = "src/main.rs"
 [dependencies]
 ## core
 bincode = "2"
+bitpacking = "0.9"
 clap = { version = "4", features = ["derive"]}
+compressed-intvec = { version = "0.3" }
 csv = "1"
+flate2 = "1.1"
 kbo = "0.5"
 log = "0.4"
 needletail = "0.6"
