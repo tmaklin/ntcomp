@@ -17,14 +17,14 @@ use std::path::PathBuf;
 
 use bitpacking::{BitPacker8x, BitPacker};
 use bincode::encode_into_std_write;
-use compressed_intvec::intvec::BEIntVec;
-use compressed_intvec::codecs::*;
 use clap::Parser;
 use log::info;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 use sbwt::SbwtIndexVariant;
 use sbwt::StreamingIndex;
+
+use dsi_bitstream::prelude::*;
 
 // Command-line interface
 mod cli;
@@ -155,8 +155,6 @@ fn main() {
 
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
-            let sampling_param = 32;
-
             info!("Encoding fastX data...");
             match sbwt {
                 SbwtIndexVariant::SubsetMatrix(sbwt) => {
@@ -164,14 +162,11 @@ fn main() {
 
                     let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
                     let mut u64_encoding: Vec<u64> = Vec::new();
-                    let mut read_starts: Vec<u64> = Vec::new();
                     let mut i = 0;
 
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         let seqrec = rec.normalize(true);
                         let res: Vec<(usize, Range<usize>)> = index.matching_statistics(&seqrec);
-
-                        read_starts.push(i);
 
                         let mut bases = 0;
                         res.iter().rev().for_each(|matches| {
@@ -187,18 +182,18 @@ fn main() {
                         });
                     }
 
-                    let compressed_header = BEIntVec::<DeltaCodec>::from(&read_starts, sampling_param).unwrap();
-                    let _ = encode_into_std_write(
-                        compressed_header.limbs(),
-                            &mut stdout.lock(),
-                            bincode::config::standard(),
-                    );
+                    let word_write = MemWordWriterVec::new(Vec::<u64>::new());
+                    let mut writer = BufBitWriter::<BE, _>::new(word_write);
 
-                    // Best: Rice with param: usize = (read_starts.iter().sum::<u64>() / read_starts.len() as u64).ilog2() as usize;
-                    let param: usize = (u64_encoding.iter().sum::<u64>() / u64_encoding.len() as u64).ilog2() as usize;
-                    let compressed_data = BEIntVec::<RiceCodec>::from_with_param(&u64_encoding, sampling_param, param).unwrap();
+                    // Best: Rice
+                    let inv_mean: f64 = ((u64_encoding.len() as f64).ln() - (u64_encoding.iter().sum::<u64>() as f64).ln()).exp();
+                    let param = dsi_bitstream::codes::rice::log2_b(inv_mean);
 
-                    let mut bits = compressed_data.limbs().iter().flat_map(|x| {
+                    u64_encoding.iter().for_each(|n| { writer.write_rice(*n, param).unwrap(); } );
+
+                    let compressed_data = writer.into_inner().unwrap().into_inner();
+
+                    let mut bits = compressed_data.iter().flat_map(|x| {
                         let arr: [u8; 8] = x.to_ne_bytes();
                         let mut arr1: [u8; 4] = [0; 4];
                         let mut arr2: [u8; 4] = [0; 4];
