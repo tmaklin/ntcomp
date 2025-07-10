@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use bitpacking::{BitPacker8x, BitPacker};
 use bincode::encode_into_std_write;
 use bincode::decode_from_std_read;
-use bincode::{Encode, Decode};
 use bincode::decode_from_slice;
+use bincode::{Encode, Decode};
 use clap::Parser;
 use log::info;
 use needletail::Sequence;
@@ -27,10 +27,24 @@ use needletail::parser::SequenceRecord;
 use sbwt::SbwtIndexVariant;
 use sbwt::StreamingIndex;
 
-use dsi_bitstream::prelude::*;
+use dsi_bitstream::impls::MemWordWriterVec;
+use dsi_bitstream::impls::BufBitWriter;
+use dsi_bitstream::traits::BE;
+use dsi_bitstream::codes::RiceWrite;
+use dsi_bitstream::prelude::MemWordReader;
+use dsi_bitstream::prelude::BufBitReader;
+use dsi_bitstream::codes::RiceRead;
 
 // Command-line interface
 mod cli;
+
+#[derive(Encode, Decode)]
+struct HeaderPlaceholder {
+    pub ph1: u64,
+    pub ph2: u64,
+    pub ph3: u64,
+    pub ph4: u64,
+}
 
 #[derive(Encode, Decode)]
 struct BlockHeader {
@@ -176,6 +190,14 @@ fn main() {
             // TODO should use MB here
             let block_size = 65536;
 
+            let header_placeholder = HeaderPlaceholder{ ph1: 0, ph2: 0, ph3: 0, ph4: 0 };
+            let nbytes = encode_into_std_write(
+                &header_placeholder,
+                &mut stdout.lock(),
+                bincode::config::standard().with_fixed_int_encoding(),
+            );
+            assert_eq!(nbytes.unwrap(), 32);
+
             info!("Encoding fastX data...");
             match sbwt {
                 SbwtIndexVariant::SubsetMatrix(sbwt) => {
@@ -212,6 +234,7 @@ fn main() {
                             let mut writer = BufBitWriter::<BE, _>::new(word_write);
 
                             u64_encoding.iter().for_each(|n| { writer.write_rice(*n, param).unwrap(); } );
+                            let _ = writer.flush();
                             let compressed_data = writer.into_inner().unwrap().into_inner();
 
                             let mut bits = compressed_data.iter().flat_map(|x| {
@@ -266,42 +289,98 @@ fn main() {
 
                 },
             };
+            // TODO rewind back to start and fill file header
         },
+
         Some(cli::Commands::Decode {
             input_path,
             index_prefix,
         }) => {
             init_log(2);
             let stdout = std::io::stdout();
-            info!("Loading SBWT index...");
+            // info!("Loading SBWT index...");
             let (sbwt, _) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
-            info!("Reading encoded data...");
+            // info!("Reading encoded data...");
             let mut conn = std::fs::File::open(input_path).unwrap();
-            let in_data: Vec<Vec<(u8, usize)>> = bincode::decode_from_std_read(&mut conn, bincode::config::standard()).unwrap();
 
-            info!("Decoding encoded data...");
+            // File header
+            let mut header_bytes: [u8; 32] = [0_u8; 32];
+            let _ = conn.read_exact(&mut header_bytes);
+            let file_header: HeaderPlaceholder = decode_from_slice(&mut header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
 
-            match sbwt {
-                SbwtIndexVariant::SubsetMatrix(sbwt) => {
-                    let k = sbwt.k();
+            while let Ok(_) = conn.read_exact(&mut header_bytes) {
+                let header: BlockHeader = decode_from_slice(&mut header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
+                let mut bytes: Vec<u8> = Vec::new();
+                bytes.resize(header.block_size as usize, 0_u8);
 
-                    let mut i = 1;
-                    in_data.iter().for_each(|encoding| {
-                        let mut nucleotides: Vec<u8> = Vec::new();
+                let _ = conn.read_exact(&mut bytes);
 
-                        encoding.iter().for_each(|(suffix_len, colex)| {
-                            let kmer = sbwt.access_kmer(*colex);
-                            nucleotides.extend(kmer[(k - (*suffix_len as usize))..k].iter().rev());
-                        });
+                // TODO determine from block header parameters
+                let bitpacker = BitPacker8x::new();
+                let block_size = 4*256;
 
-                        let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
-                        let _ = writeln!(&mut stdout.lock(),
-                                         "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
+                info!("Unpacking bits...");
+                let mut bits: Vec<u32> = bytes.chunks(block_size).flat_map(|compressed| {
+                    let mut decompressed = vec![0u32; BitPacker8x::BLOCK_LEN];
+                    bitpacker.decompress(&compressed[..1024], &mut decompressed[..], 32);
+                    decompressed
+                }).collect();
 
-                        i += 1;
-                    });
-                },
+                bits[(header.encoded_size as usize)*2..bits.len()].iter().for_each(|x| assert_eq!(0, *x));
+                bits.resize((header.encoded_size as usize)*2, 0);
+
+                info!("Converting u32 to u64...");
+                let compressed_data: Vec<u64> = bits.chunks(2).map(|x| {
+                    let u32_1 = x[0].to_ne_bytes();
+                    let u32_2 = if x.len() == 2 { x[1].to_ne_bytes() } else { [0_u8; 4] };
+                    let mut arr = [0_u8; 8];
+                    arr[0..4].copy_from_slice(&u32_1);
+                    arr[4..8].copy_from_slice(&u32_2);
+                    u64::from_ne_bytes(arr)
+                }).collect();
+                assert_eq!(compressed_data.len(), header.encoded_size as usize);
+
+                info!("Decoding RiceCodec...");
+                let mut reader = BufBitReader::<BE, _>::new(MemWordReader::new(compressed_data));
+                let encoded: Vec<u64> = (0..header.num_u64).map(|x| {
+                    reader.read_rice(header.rice_param as usize).unwrap()
+                }).collect();
+
+                info!("Decoding u64 encoded (MS, colex interval) pairs...");
+                let decoded: Vec<(u8, u32)> = encoded.iter().map(|x| {
+                    let arr: [u8; 8] = x.to_ne_bytes();
+                    let mut arr1: [u8; 4] = [0; 4];
+                    let mut arr2: [u8; 4] = [0; 4];
+                    arr1.copy_from_slice(&arr[0..4]);
+                    arr2.copy_from_slice(&arr[4..8]);
+                    let colex_rank = u32::from_ne_bytes(arr1);
+                    let ms = u32::from_ne_bytes(arr2) as u8;
+                    (ms, colex_rank)
+                }).collect();
+
+                // info!("Decoding encoded data...");
+                // match sbwt {
+                //     SbwtIndexVariant::SubsetMatrix(sbwt) => {
+                //         let k = sbwt.k();
+
+                //         let mut i = 1;
+                //         decoded.iter().for_each(|encoding| {
+                //             let mut nucleotides: Vec<u8> = Vec::new();
+
+                //             encoding.iter().for_each(|(suffix_len, colex)| {
+                //                 let kmer = sbwt.access_kmer(*colex);
+                //                 nucleotides.extend(kmer[(k - (*suffix_len as usize))..k].iter().rev());
+                //             });
+
+                //             let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
+                //             let _ = writeln!(&mut stdout.lock(),
+                //                              "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
+
+                //             i += 1;
+                //         });
+                //     },
+                // }
             }
         },
         None => {},
