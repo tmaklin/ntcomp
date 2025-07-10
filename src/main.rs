@@ -210,6 +210,7 @@ fn main() {
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         let seqrec = rec.normalize(true);
                         let res: Vec<(usize, Range<usize>)> = index.matching_statistics(&seqrec);
+                        let mut read_start: u16 = 1;
                         num_records += 1;
 
                         let mut bases = 0;
@@ -218,8 +219,13 @@ fn main() {
                                 bases = matches.0;
                                 let mut arr: [u8; 8] = [0; 8];
                                 arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-                                arr[4..8].copy_from_slice(&(matches.0 as u32).to_ne_bytes());
+                                arr[4..6].copy_from_slice(&(matches.0 as u16).to_ne_bytes());
+
+                                // TODO this adds ~1M to the compressed size; too much..
+                                arr[6..8].copy_from_slice(&(read_start).to_ne_bytes());
+
                                 u64_encoding.push(u64::from_ne_bytes(arr));
+                                if read_start == 1 { read_start = 0 };
                             }
                             bases -= 1;
                         });
@@ -309,6 +315,8 @@ fn main() {
             let _ = conn.read_exact(&mut header_bytes);
             let file_header: HeaderPlaceholder = decode_from_slice(&mut header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
 
+            let mut i = 1;
+
             while let Ok(_) = conn.read_exact(&mut header_bytes) {
                 let header: BlockHeader = decode_from_slice(&mut header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
                 let mut bytes: Vec<u8> = Vec::new();
@@ -348,39 +356,40 @@ fn main() {
                 }).collect();
 
                 info!("Decoding u64 encoded (MS, colex interval) pairs...");
-                let decoded: Vec<(u8, u32)> = encoded.iter().map(|x| {
+                let decoded: Vec<(u16, u32, bool)> = encoded.iter().map(|x| {
                     let arr: [u8; 8] = x.to_ne_bytes();
                     let mut arr1: [u8; 4] = [0; 4];
-                    let mut arr2: [u8; 4] = [0; 4];
+                    let mut arr2: [u8; 2] = [0; 2];
+                    let mut arr3: [u8; 2] = [0; 2];
                     arr1.copy_from_slice(&arr[0..4]);
-                    arr2.copy_from_slice(&arr[4..8]);
+                    arr2.copy_from_slice(&arr[4..6]);
+                    arr3.copy_from_slice(&arr[6..8]);
                     let colex_rank = u32::from_ne_bytes(arr1);
-                    let ms = u32::from_ne_bytes(arr2) as u8;
-                    (ms, colex_rank)
+                    let ms = u16::from_ne_bytes(arr2) as u16;
+                    (ms, colex_rank, u16::from_ne_bytes(arr3) == 1)
                 }).collect();
 
-                // info!("Decoding encoded data...");
-                // match sbwt {
-                //     SbwtIndexVariant::SubsetMatrix(sbwt) => {
-                //         let k = sbwt.k();
+                info!("Decoding encoded data...");
+                match sbwt {
+                    SbwtIndexVariant::SubsetMatrix(ref sbwt) => {
+                        let k = sbwt.k();
 
-                //         let mut i = 1;
-                //         decoded.iter().for_each(|encoding| {
-                //             let mut nucleotides: Vec<u8> = Vec::new();
-
-                //             encoding.iter().for_each(|(suffix_len, colex)| {
-                //                 let kmer = sbwt.access_kmer(*colex);
-                //                 nucleotides.extend(kmer[(k - (*suffix_len as usize))..k].iter().rev());
-                //             });
-
-                //             let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
-                //             let _ = writeln!(&mut stdout.lock(),
-                //                              "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
-
-                //             i += 1;
-                //         });
-                //     },
-                // }
+                        let mut nucleotides: Vec<u8> = Vec::new();
+                        let mut first: bool = true;
+                        decoded.iter().for_each(|(suffix_len, colex_rank, read_start)| {
+                            if *read_start && !first {
+                                let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
+                                let _ = writeln!(&mut stdout.lock(),
+                                                 "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
+                                nucleotides.clear();
+                                i += 1;
+                            }
+                            let kmer = sbwt.access_kmer(*colex_rank as usize);
+                            nucleotides.extend(kmer[(k - (*suffix_len as usize))..k].iter().rev());
+                            first = false;
+                        });
+                    },
+                }
             }
         },
         None => {},
