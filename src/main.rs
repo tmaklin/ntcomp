@@ -275,7 +275,7 @@ fn main() {
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         let seqrec = rec.normalize(true);
                         let res: Vec<(usize, Range<usize>)> = index.matching_statistics(&seqrec);
-                        let mut read_start: u16 = 1;
+                        let mut read_start: u8 = 1;
                         num_records += 1;
 
                         let mut bases = 0;
@@ -284,10 +284,8 @@ fn main() {
                                 bases = matches.0;
                                 let mut arr: [u8; 8] = [0; 8];
                                 arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-                                arr[4..6].copy_from_slice(&(matches.0 as u16).to_ne_bytes());
-
-                                // TODO this adds ~1M to the compressed size; too much..
-                                arr[6..8].copy_from_slice(&(read_start).to_ne_bytes());
+                                arr[4..5].copy_from_slice(&(matches.0 as u8).to_ne_bytes());
+                                arr[5..6].copy_from_slice(&(read_start).to_ne_bytes());
 
                                 u64_encoding.push(u64::from_ne_bytes(arr));
                                 if read_start == 1 { read_start = 0 };
@@ -367,17 +365,17 @@ fn main() {
                 }).collect();
 
                 info!("Decoding u64 encoded (MS, colex interval) pairs...");
-                let decoded: Vec<(u16, u32, bool)> = encoded.iter().map(|x| {
+                let decoded: Vec<(u8, u32, bool)> = encoded.iter().map(|x| {
                     let arr: [u8; 8] = x.to_ne_bytes();
                     let mut arr1: [u8; 4] = [0; 4];
-                    let mut arr2: [u8; 2] = [0; 2];
-                    let mut arr3: [u8; 2] = [0; 2];
+                    let mut arr2: [u8; 1] = [0; 1];
+                    let mut arr3: [u8; 1] = [0; 1];
                     arr1.copy_from_slice(&arr[0..4]);
-                    arr2.copy_from_slice(&arr[4..6]);
-                    arr3.copy_from_slice(&arr[6..8]);
+                    arr2.copy_from_slice(&arr[4..5]);
+                    arr3.copy_from_slice(&arr[5..6]);
                     let colex_rank = u32::from_ne_bytes(arr1);
-                    let ms = u16::from_ne_bytes(arr2) as u16;
-                    (ms, colex_rank, u16::from_ne_bytes(arr3) == 1)
+                    let ms = u8::from_ne_bytes(arr2);
+                    (ms, colex_rank, u8::from_ne_bytes(arr3) == 1)
                 }).collect();
 
                 info!("Decoding encoded data...");
