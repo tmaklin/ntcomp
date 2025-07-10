@@ -399,6 +399,11 @@ fn main() {
                             nucleotides.extend(kmer[(k - (*suffix_len as usize))..k].iter().rev());
                             first = false;
                         });
+                        let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
+                        let _ = writeln!(&mut stdout.lock(),
+                                         "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
+                        nucleotides.clear();
+                        i += 1;
                     },
                 }
             }
