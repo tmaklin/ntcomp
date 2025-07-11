@@ -12,7 +12,7 @@ The built binary is located at `target/release/ntcomp`.
 ## Usage
 ### Setup example data
 ``` sh
-https://a3s.fi/maklinto-2006181-pub/ntcomp-test.tar
+wget https://a3s.fi/maklinto-2006181-pub/ntcomp-test.tar
 tar -xf ntcomp-test.tar
 ```
 
