@@ -22,7 +22,7 @@ bitpacking = "0.9"
 clap = { version = "4", features = ["derive"]}
 csv = "1"
 dsi-bitstream = "0.5"
-flate2 = "1.1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 kbo = "0.5"
 log = "0.4"
 needletail = "0.6"

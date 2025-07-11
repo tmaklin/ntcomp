@@ -21,6 +21,9 @@ use bincode::decode_from_std_read;
 use bincode::decode_from_slice;
 use bincode::{Encode, Decode};
 use clap::Parser;
+use flate2::write::GzEncoder;
+use flate2::write::GzDecoder;
+use flate2::Compression;
 use log::info;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
@@ -170,7 +173,12 @@ fn encode_block(
         bitpacked.append(&mut compressed);
     });
 
-    let block_header = BlockHeader{ block_size: bitpacked.len() as u32,
+    let mut deflated: Vec<u8> = Vec::with_capacity(bitpacked.len());
+    let mut encoder = GzEncoder::new(&mut deflated, Compression::default());
+    encoder.write_all(&bitpacked).unwrap();
+    encoder.finish().unwrap();
+
+    let block_header = BlockHeader{ block_size: deflated.len() as u32,
                                     num_records: num_records as u32,
                                     num_u64: u64_encoding.len() as u32,
                                     encoded_size: compressed_data.len() as u32,
@@ -179,7 +187,7 @@ fn encode_block(
                                     placeholder1: 0, placeholder2: 0, placeholder3: 0,
     };
 
-    let mut block: Vec<u8> = Vec::with_capacity(32 + bitpacked.len()/8);
+    let mut block: Vec<u8> = Vec::with_capacity(32 + deflated.len()/8);
 
     let nbytes = encode_into_std_write(
         &block_header,
@@ -187,7 +195,7 @@ fn encode_block(
         bincode::config::standard().with_fixed_int_encoding(),
     );
     assert_eq!(nbytes.unwrap(), 32);
-    block.append(&mut bitpacked);
+    block.append(&mut deflated);
 
     block
 }
@@ -332,6 +340,13 @@ fn main() {
                 bytes.resize(header.block_size as usize, 0_u8);
 
                 let _ = conn.read_exact(&mut bytes);
+
+                info!("Inflating block...");
+                let mut inflated: Vec<u8> = Vec::new();
+                let mut decoder = GzDecoder::new(&mut inflated);
+                decoder.write_all(&bytes).unwrap();
+                inflated = decoder.finish().unwrap().to_vec();
+                bytes = inflated;
 
                 // TODO determine from block header parameters
                 let bitpacker = BitPacker8x::new();
