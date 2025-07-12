@@ -21,34 +21,47 @@ use flate2::write::GzDecoder;
 
 use crate::encode;
 
-pub fn decode_block(
-    block: &[u8],
-    header: &encode::BlockHeader,
-) -> Vec<(u8, u32, bool)> {
-    // info!("Inflating block...");
+fn inflate_bytes(
+    deflated: &[u8],
+) -> Vec<u8> {
     let mut inflated: Vec<u8> = Vec::new();
     let mut decoder = GzDecoder::new(&mut inflated);
-    decoder.write_all(block).unwrap();
+    decoder.write_all(deflated).unwrap();
     inflated = decoder.finish().unwrap().to_vec();
-    let bytes = inflated;
+    inflated
+}
 
-    // info!("Converting u32 to u64...");
+fn rice_decode(
+    encoded: &[u64],
+    n_records: usize,
+    param: usize,
+) -> Vec<u64> {
+    let mut reader = BufBitReader::<BE, _>::new(MemWordReader::new(encoded));
+    let encoded: Vec<u64> = (0..n_records).map(|_| {
+        reader.read_rice(param).unwrap()
+    }).collect();
+    encoded
+}
+
+pub fn decompress_block(
+    block: &[u8],
+    header: &encode::BlockHeader,
+) -> Vec<u64> {
+    let bytes = inflate_bytes(block);
     let rice_encoded: Vec<u64> = bytes.chunks(8).map(|x| {
-        // Convert bytes to Golomb-Rice encoded u64
         let arr: [u8; 8] = [x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7]];
-        // Decode
         u64::from_ne_bytes(arr)
     }).collect();
     assert_eq!(rice_encoded.len(), header.encoded_size as usize);
 
-    // info!("Decoding RiceCodec...");
-    let mut reader = BufBitReader::<BE, _>::new(MemWordReader::new(rice_encoded));
-    let encoded: Vec<u64> = (0..header.num_u64).map(|_| {
-        reader.read_rice(header.rice_param as usize).unwrap()
-    }).collect();
+    let decompressed = rice_decode(&rice_encoded, header.num_u64 as usize, header.rice_param as usize);
+    decompressed
+}
 
-    // info!("Decoding u64 encoded (MS, colex interval) pairs...");
-    let decoded: Vec<(u8, u32, bool)> = encoded.iter().map(|x| {
+pub fn decode_dictionary(
+    encoded: &[u64],
+) -> Vec<(u8, u32, bool)> {
+    let dictionary: Vec<(u8, u32, bool)> = encoded.iter().map(|x| {
         let arr: [u8; 8] = x.to_ne_bytes();
         let mut arr1: [u8; 4] = [0; 4];
         let mut arr2: [u8; 1] = [0; 1];
@@ -61,5 +74,5 @@ pub fn decode_block(
         (ms, colex_rank, u8::from_ne_bytes(arr3) == 1)
     }).collect();
 
-    decoded
+    dictionary
 }

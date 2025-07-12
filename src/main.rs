@@ -177,32 +177,16 @@ fn main() {
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         let seqrec = rec.normalize(true);
                         let res: Vec<(usize, Range<usize>)> = index.matching_statistics(&seqrec);
-                        let mut read_start: u8 = 1;
-                        num_records += 1;
 
-                        let mut bases = 0;
-                        res.iter().rev().for_each(|matches| {
-                            if bases == 0 {
-                                bases = matches.0;
-                                let mut arr: [u8; 8] = [0; 8];
-                                arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-                                arr[4..5].copy_from_slice(&(matches.0 as u8).to_ne_bytes());
-                                arr[5..6].copy_from_slice(&(read_start).to_ne_bytes());
-
-                                u64_encoding.push(u64::from_ne_bytes(arr));
-                                if read_start == 1 { read_start = 0 };
-                            }
-                            bases -= 1;
-                        });
-
+                        u64_encoding.append(&mut encode::encode_dictionary(&res));
                         if u64_encoding.len() > block_size {
-                            let block = encode::encode_block(&u64_encoding, num_records);
+                            let block = encode::compress_block(&u64_encoding, num_records);
                             let _ = stdout.lock().write_all(&block);
                             num_records = 0;
                             u64_encoding.clear();
                         }
                     }
-                    let block = encode::encode_block(&u64_encoding, num_records);
+                    let block = encode::compress_block(&u64_encoding, num_records);
                     let _ = stdout.lock().write_all(&block);
                 },
             };
@@ -234,7 +218,8 @@ fn main() {
 
                 let _ = conn.read_exact(&mut bytes);
 
-                let decoded = decode::decode_block(&bytes, &header);
+                let decompressed = decode::decompress_block(&bytes, &header);
+                let decoded = decode::decode_dictionary(&decompressed);
 
                 info!("Decoding encoded data...");
                 match sbwt {
