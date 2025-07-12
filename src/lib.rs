@@ -15,25 +15,28 @@ use std::ops::Range;
 
 use sbwt::LcsArray;
 use sbwt::StreamingIndex;
-use sbwt::SbwtIndex;
 use sbwt::SbwtIndexVariant;
-use sbwt::SubsetMatrix;
 
 pub mod encode;
 pub mod decode;
 
 pub fn encode_sequence(
     nucleotides: &[u8],
-    index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
+    sbwt: &SbwtIndexVariant,
+    lcs: &LcsArray,
 ) -> Vec<u64> {
-    let dictionary: Vec<(usize, Range<usize>)> = index.matching_statistics(nucleotides);
+    let dictionary: Vec<(usize, Range<usize>)> = match sbwt {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => {
+            let index = StreamingIndex::new(sbwt, lcs);
+            index.matching_statistics(nucleotides)
+        },
+    };
     encode::encode_dictionary(&dictionary)
 }
 
 pub fn decode_sequence(
     dictionary: &[(u8, u32, bool)],
     sbwt: &SbwtIndexVariant,
-//    sbwt: &SbwtIndex<SubsetMatrix>,
     mut pointer: usize,
 ) -> (Vec<u8>, usize) {
     assert!(dictionary[pointer].2);

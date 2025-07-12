@@ -21,8 +21,6 @@ use clap::Parser;
 use log::info;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
-use sbwt::SbwtIndexVariant;
-use sbwt::StreamingIndex;
 
 use ntcomp::decode;
 use ntcomp::encode;
@@ -169,31 +167,25 @@ fn main() {
             assert_eq!(nbytes.unwrap(), 32);
 
             info!("Encoding fastX data...");
-            match sbwt {
-                SbwtIndexVariant::SubsetMatrix(sbwt) => {
-                    let index = StreamingIndex::new(&sbwt, &lcs);
+            let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
+            let mut u64_encoding: Vec<u64> = Vec::new();
+            let mut num_records = 0;
 
-                    let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
-                    let mut u64_encoding: Vec<u64> = Vec::new();
-                    let mut num_records = 0;
+            while let Some(rec) = read_from_fastx_parser(&mut *reader) {
+                let seqrec = rec.normalize(true);
+                num_records += 1;
+                let mut encoding = encode_sequence(&seqrec, &sbwt, &lcs);
+                u64_encoding.append(&mut encoding);
 
-                    while let Some(rec) = read_from_fastx_parser(&mut *reader) {
-                        let seqrec = rec.normalize(true);
-                        num_records += 1;
-                        let mut encoding = encode_sequence(&seqrec, &index);
-                        u64_encoding.append(&mut encoding);
-
-                        if u64_encoding.len() > block_size {
-                            let block = encode::compress_block(&u64_encoding, num_records);
-                            let _ = stdout.lock().write_all(&block);
-                            num_records = 0;
-                            u64_encoding.clear();
-                        }
-                    }
+                if u64_encoding.len() > block_size {
                     let block = encode::compress_block(&u64_encoding, num_records);
                     let _ = stdout.lock().write_all(&block);
-                },
-            };
+                    num_records = 0;
+                    u64_encoding.clear();
+                }
+            }
+            let block = encode::compress_block(&u64_encoding, num_records);
+            let _ = stdout.lock().write_all(&block);
             // TODO rewind back to start and fill file header
         },
 
