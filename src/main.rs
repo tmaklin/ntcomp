@@ -15,8 +15,6 @@ use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use bincode::encode_into_std_write;
-use bincode::decode_from_slice;
 use clap::Parser;
 use log::info;
 use needletail::Sequence;
@@ -24,6 +22,9 @@ use needletail::parser::SequenceRecord;
 
 use ntcomp::decode;
 use ntcomp::encode;
+use ntcomp::encode_file_header;
+use ntcomp::decode_file_header;
+use ntcomp::decode_block_header;
 use ntcomp::decode_sequence;
 use ntcomp::encode_sequence;
 
@@ -150,7 +151,7 @@ fn main() {
             index_prefix,
         }) => {
             init_log(2);
-            let stdout = std::io::stdout();
+            let mut stdout = BufWriter::new(std::io::stdout());
             info!("Loading SBWT index...");
 
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
@@ -158,13 +159,8 @@ fn main() {
             // TODO should use MB here
             let block_size = 65536;
 
-            let header_placeholder = encode::HeaderPlaceholder{ ph1: 0, ph2: 0, ph3: 0, ph4: 0 };
-            let nbytes = encode_into_std_write(
-                &header_placeholder,
-                &mut stdout.lock(),
-                bincode::config::standard().with_fixed_int_encoding(),
-            );
-            assert_eq!(nbytes.unwrap(), 32);
+            let header_bytes = encode_file_header(0,0,0,0);
+            let _ = stdout.write_all(&header_bytes);
 
             info!("Encoding fastX data...");
             let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
@@ -179,13 +175,14 @@ fn main() {
 
                 if u64_encoding.len() > block_size {
                     let block = encode::compress_block(&u64_encoding, num_records);
-                    let _ = stdout.lock().write_all(&block);
+                    let _ = stdout.write_all(&block);
                     num_records = 0;
                     u64_encoding.clear();
                 }
             }
             let block = encode::compress_block(&u64_encoding, num_records);
-            let _ = stdout.lock().write_all(&block);
+            let _ = stdout.write_all(&block);
+            let _ = stdout.flush();
             // TODO rewind back to start and fill file header
         },
 
@@ -204,11 +201,11 @@ fn main() {
             // File header
             let mut header_bytes: [u8; 32] = [0_u8; 32];
             let _ = conn.read_exact(&mut header_bytes);
-            let _file_header: encode::HeaderPlaceholder = decode_from_slice(&header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
+            let _file_header = decode_file_header(&header_bytes);
 
             let mut i = 1;
             while conn.read_exact(&mut header_bytes).is_ok() {
-                let header: encode::BlockHeader = decode_from_slice(& header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
+                let header = decode_block_header(&header_bytes);
                 let mut bytes: Vec<u8> = vec![0; header.block_size as usize];
 
                 let _ = conn.read_exact(&mut bytes);

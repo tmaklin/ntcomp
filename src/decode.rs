@@ -19,7 +19,7 @@ use dsi_bitstream::prelude::BufBitReader;
 use dsi_bitstream::codes::RiceRead;
 use flate2::write::GzDecoder;
 
-use crate::encode;
+use crate::BlockHeader;
 
 fn inflate_bytes(
     deflated: &[u8],
@@ -45,7 +45,7 @@ fn rice_decode(
 
 pub fn decompress_block(
     block: &[u8],
-    header: &encode::BlockHeader,
+    header: &BlockHeader,
 ) -> Vec<u64> {
     let bytes = inflate_bytes(block);
     let rice_encoded: Vec<u64> = bytes.chunks(8).map(|x| {

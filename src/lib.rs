@@ -13,12 +13,82 @@
 //
 use std::ops::Range;
 
+use bincode::{Encode, Decode};
+use bincode::encode_into_std_write;
+use bincode::decode_from_slice;
+
 use sbwt::LcsArray;
 use sbwt::StreamingIndex;
 use sbwt::SbwtIndexVariant;
 
 pub mod encode;
 pub mod decode;
+
+
+#[derive(Encode, Decode)]
+pub struct HeaderPlaceholder {
+    pub ph1: u64,
+    pub ph2: u64,
+    pub ph3: u64,
+    pub ph4: u64,
+}
+
+#[derive(Encode, Decode)]
+pub struct BlockHeader {
+    pub block_size: u32,
+    pub num_records: u32,
+    pub num_u64: u32,
+    pub encoded_size: u32,
+    pub rice_param: u8,
+    pub bitpacker_exponent: u8,
+    pub placeholder1: u64,
+    pub placeholder2: u32,
+    pub placeholder3: u16,
+    // TODO should store the used codec so others can be used
+    // TODO store total number of bases?
+}
+
+pub fn encode_file_header(
+    ph1: u64,
+    ph2: u64,
+    ph3: u64,
+    ph4: u64
+) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let header_placeholder = HeaderPlaceholder{ ph1, ph2, ph3, ph4 };
+    let nbytes = encode_into_std_write(
+        &header_placeholder,
+        &mut bytes,
+        bincode::config::standard().with_fixed_int_encoding(),
+    );
+    assert_eq!(nbytes.unwrap(), 32);
+    bytes
+}
+
+pub fn decode_file_header(
+    header_bytes: &[u8],
+) -> HeaderPlaceholder {
+    decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0
+}
+
+pub fn encode_block_header(
+    header: &BlockHeader,
+) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let nbytes = encode_into_std_write(
+        header,
+        &mut bytes,
+        bincode::config::standard().with_fixed_int_encoding(),
+    );
+    assert_eq!(nbytes.unwrap(), 32);
+    bytes
+}
+
+pub fn decode_block_header(
+    header_bytes: &[u8],
+) -> BlockHeader {
+    decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0
+}
 
 pub fn encode_sequence(
     nucleotides: &[u8],

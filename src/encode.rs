@@ -13,8 +13,6 @@
 //
 use std::io::Write;
 
-use bincode::encode_into_std_write;
-use bincode::{Encode, Decode};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
@@ -23,28 +21,8 @@ use dsi_bitstream::impls::BufBitWriter;
 use dsi_bitstream::traits::BE;
 use dsi_bitstream::codes::RiceWrite;
 
-#[derive(Encode, Decode)]
-pub struct HeaderPlaceholder {
-    pub ph1: u64,
-    pub ph2: u64,
-    pub ph3: u64,
-    pub ph4: u64,
-}
-
-#[derive(Encode, Decode)]
-pub struct BlockHeader {
-    pub block_size: u32,
-    pub num_records: u32,
-    pub num_u64: u32,
-    pub encoded_size: u32,
-    pub rice_param: u8,
-    pub bitpacker_exponent: u8,
-    pub placeholder1: u64,
-    pub placeholder2: u32,
-    pub placeholder3: u16,
-    // TODO should store the used codec so others can be used
-    // TODO store total number of bases?
-}
+use crate::BlockHeader;
+use crate::encode_block_header;
 
 fn deflate_bytes(
     bytes: &[u8],
@@ -93,15 +71,7 @@ pub fn compress_block(
                                     placeholder1: 0, placeholder2: 0, placeholder3: 0,
     };
 
-    let mut block: Vec<u8> = Vec::with_capacity(32 + deflated.len()/8);
-
-    let nbytes = encode_into_std_write(
-        &block_header,
-        &mut block,
-        bincode::config::standard().with_fixed_int_encoding(),
-    );
-    assert_eq!(nbytes.unwrap(), 32);
-
+    let mut block: Vec<u8> = encode_block_header(&block_header);
     block.extend(deflated.iter());
     block.shrink_to_fit();
 
