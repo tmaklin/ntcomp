@@ -54,8 +54,7 @@ pub fn decompress_block(
     }).collect();
     assert_eq!(rice_encoded.len(), header.encoded_size as usize);
 
-    let decompressed = rice_decode(&rice_encoded, header.num_u64 as usize, header.rice_param as usize);
-    decompressed
+    rice_decode(&rice_encoded, header.num_u64 as usize, header.rice_param as usize)
 }
 
 pub fn decode_dictionary(

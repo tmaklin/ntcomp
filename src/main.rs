@@ -11,8 +11,8 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
+use std::io::BufWriter;
 use std::io::{Read, Write};
-use std::ops::Range;
 use std::path::PathBuf;
 
 use bincode::encode_into_std_write;
@@ -24,9 +24,12 @@ use needletail::parser::SequenceRecord;
 use sbwt::SbwtIndexVariant;
 use sbwt::StreamingIndex;
 
+use ntcomp::decode;
+use ntcomp::encode;
+use ntcomp::decode_sequence;
+use ntcomp::encode_sequence;
+
 mod cli;
-mod encode;
-mod decode;
 
 /// Initializes the logger with verbosity given in `log_max_level`.
 fn init_log(log_max_level: usize) {
@@ -176,9 +179,10 @@ fn main() {
 
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         let seqrec = rec.normalize(true);
-                        let res: Vec<(usize, Range<usize>)> = index.matching_statistics(&seqrec);
+                        num_records += 1;
+                        let mut encoding = encode_sequence(&seqrec, &index);
+                        u64_encoding.append(&mut encoding);
 
-                        u64_encoding.append(&mut encode::encode_dictionary(&res));
                         if u64_encoding.len() > block_size {
                             let block = encode::compress_block(&u64_encoding, num_records);
                             let _ = stdout.lock().write_all(&block);
@@ -198,7 +202,7 @@ fn main() {
             index_prefix,
         }) => {
             init_log(2);
-            let stdout = std::io::stdout();
+            let mut stdout = BufWriter::new(std::io::stdout());
             // info!("Loading SBWT index...");
             let (sbwt, _) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
@@ -211,7 +215,6 @@ fn main() {
             let _file_header: encode::HeaderPlaceholder = decode_from_slice(&header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
 
             let mut i = 1;
-
             while conn.read_exact(&mut header_bytes).is_ok() {
                 let header: encode::BlockHeader = decode_from_slice(& header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0;
                 let mut bytes: Vec<u8> = vec![0; header.block_size as usize];
@@ -222,31 +225,16 @@ fn main() {
                 let decoded = decode::decode_dictionary(&decompressed);
 
                 info!("Decoding encoded data...");
-                match sbwt {
-                    SbwtIndexVariant::SubsetMatrix(ref sbwt) => {
-                        let k = sbwt.k();
-
-                        let mut nucleotides: Vec<u8> = Vec::new();
-                        let mut first: bool = true;
-                        decoded.iter().for_each(|(suffix_len, colex_rank, read_start)| {
-                            if *read_start && !first {
-                                let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
-                                let _ = writeln!(&mut stdout.lock(),
-                                                 "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
-                                nucleotides.clear();
-                                i += 1;
-                            }
-                            let kmer = sbwt.access_kmer(*colex_rank as usize);
-                            nucleotides.extend(kmer[(k - (*suffix_len as usize))..k].iter().rev());
-                            first = false;
-                        });
-                        let _ = writeln!(&mut stdout.lock(), ">seq.{}", i);
-                        let _ = writeln!(&mut stdout.lock(),
-                                         "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
-                        nucleotides.clear();
-                        i += 1;
-                    },
+                let mut pointer = 0;
+                while pointer < decoded.len() {
+                    let (nucleotides, new_pointer) = decode_sequence(&decoded, &sbwt, pointer);
+                    pointer = new_pointer;
+                    let _ = writeln!(&mut stdout, ">seq.{}", i);
+                    let _ = writeln!(&mut stdout,
+                                     "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
+                    i += 1;
                 }
+                let _ = stdout.flush();
             }
         },
         None => {},
