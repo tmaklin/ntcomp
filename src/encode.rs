@@ -13,7 +13,6 @@
 //
 use std::io::Write;
 
-use bitpacking::{BitPacker8x, BitPacker};
 use bincode::encode_into_std_write;
 use bincode::{Encode, Decode};
 use flate2::write::GzEncoder;
@@ -60,45 +59,21 @@ pub fn encode_block(
 
     u64_encoding.iter().for_each(|n| { writer.write_rice(*n, param).unwrap(); } );
     let _ = writer.flush();
-    let compressed_data = writer.into_inner().unwrap().into_inner();
+    let rice_encoded = writer.into_inner().unwrap().into_inner();
 
-    let mut bits = compressed_data.iter().flat_map(|x| {
-        let arr: [u8; 8] = x.to_ne_bytes();
-        let mut arr1: [u8; 4] = [0; 4];
-        let mut arr2: [u8; 4] = [0; 4];
-        arr1[0..4].copy_from_slice(&(arr[0..4]));
-        arr2[0..4].copy_from_slice(&(arr[4..8]));
-        [u32::from_ne_bytes(arr1), u32::from_ne_bytes(arr2)]
-    }).collect::<Vec<u32>>();
+    let bytes = rice_encoded.iter().flat_map(|x| {
+        x.to_ne_bytes()
+    }).collect::<Vec<u8>>();
 
-    let mut bitpacked: Vec<u8> = Vec::new();
-
-    let bitpacker = BitPacker8x::new();
-    let block_size = 256;
-
-    if block_size - bits.len() % block_size != 0 {
-        bits.resize(bits.len() + (block_size - bits.len() % block_size), 0);
-    }
-    bits.chunks(block_size).for_each(|chunk| {
-        let num_bits: u8 = bitpacker.num_bits(chunk);
-        let mut compressed = vec![0u8; 4 * BitPacker8x::BLOCK_LEN];
-        let clen = bitpacker.compress(chunk, &mut compressed[..], num_bits);
-
-        assert_eq!(clen, 1024);
-        assert_eq!(num_bits, 32);
-
-        bitpacked.append(&mut compressed);
-    });
-
-    let mut deflated: Vec<u8> = Vec::with_capacity(bitpacked.len());
+    let mut deflated: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut encoder = GzEncoder::new(&mut deflated, Compression::default());
-    encoder.write_all(&bitpacked).unwrap();
+    encoder.write_all(&bytes).unwrap();
     encoder.finish().unwrap();
 
     let block_header = BlockHeader{ block_size: deflated.len() as u32,
                                     num_records: num_records as u32,
                                     num_u64: u64_encoding.len() as u32,
-                                    encoded_size: compressed_data.len() as u32,
+                                    encoded_size: rice_encoded.len() as u32,
                                     rice_param: param as u8,
                                     bitpacker_exponent: 8_u8,
                                     placeholder1: 0, placeholder2: 0, placeholder3: 0,
@@ -113,6 +88,7 @@ pub fn encode_block(
     );
     assert_eq!(nbytes.unwrap(), 32);
     block.append(&mut deflated);
+    block.shrink_to_fit();
 
     block
 }
