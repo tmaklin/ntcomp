@@ -46,29 +46,43 @@ pub struct BlockHeader {
     // TODO store total number of bases?
 }
 
-pub fn encode_block(
-    u64_encoding: &[u64],
-    num_records: usize,
+fn deflate_bytes(
+    bytes: &[u8],
 ) -> Vec<u8> {
-    // Best: Rice
-    let inv_mean: f64 = ((u64_encoding.len() as f64).ln() - (u64_encoding.iter().sum::<u64>() as f64).ln()).exp();
-    let param = dsi_bitstream::codes::rice::log2_b(inv_mean);
+    let mut deflated: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut encoder = GzEncoder::new(&mut deflated, Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap();
+    deflated
+}
+
+fn rice_encode(
+    ints: &[u64],
+) -> (Vec<u64>, usize) {
+    let inv_mean: f64 = ((ints.len() as f64).ln() - (ints.iter().sum::<u64>() as f64).ln()).exp();
+    let param: usize = dsi_bitstream::codes::rice::log2_b(inv_mean);
 
     let word_write = MemWordWriterVec::new(Vec::<u64>::new());
     let mut writer = BufBitWriter::<BE, _>::new(word_write);
 
-    u64_encoding.iter().for_each(|n| { writer.write_rice(*n, param).unwrap(); } );
+    ints.iter().for_each(|n| { writer.write_rice(*n, param).unwrap(); } );
     let _ = writer.flush();
-    let rice_encoded = writer.into_inner().unwrap().into_inner();
+
+    (writer.into_inner().unwrap().into_inner(), param)
+}
+
+pub fn encode_block(
+    u64_encoding: &[u64],
+    num_records: usize,
+) -> Vec<u8> {
+
+    let (rice_encoded, param) = rice_encode(u64_encoding);
 
     let bytes = rice_encoded.iter().flat_map(|x| {
         x.to_ne_bytes()
     }).collect::<Vec<u8>>();
 
-    let mut deflated: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut encoder = GzEncoder::new(&mut deflated, Compression::default());
-    encoder.write_all(&bytes).unwrap();
-    encoder.finish().unwrap();
+    let deflated: Vec<u8> = deflate_bytes(&bytes);
 
     let block_header = BlockHeader{ block_size: deflated.len() as u32,
                                     num_records: num_records as u32,
@@ -87,7 +101,8 @@ pub fn encode_block(
         bincode::config::standard().with_fixed_int_encoding(),
     );
     assert_eq!(nbytes.unwrap(), 32);
-    block.append(&mut deflated);
+
+    block.extend(deflated.iter());
     block.shrink_to_fit();
 
     block
