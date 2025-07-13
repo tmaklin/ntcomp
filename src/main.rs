@@ -255,7 +255,6 @@ fn main() {
                     let key_2 = y.to_ne_bytes()[0];
                     let key_3 = y.to_ne_bytes()[1];
                     arr[0..4].copy_from_slice(&key_1[0..4]);
-                    eprintln!("{:?}", arr[0..4].to_vec());
                     arr[4..5].copy_from_slice(&[key_2]);
                     arr[5..6].copy_from_slice(&[key_3]);
                     u64::from_ne_bytes(arr)

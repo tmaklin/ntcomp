@@ -110,7 +110,6 @@ pub fn encode_dictionary(
             bases = matches.0;
             let mut arr: [u8; 8] = [0; 8];
             arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-            eprintln!("{:?}", arr[0..4].to_vec());
             arr[4..5].copy_from_slice(&(matches.0 as u8).to_ne_bytes());
             arr[5..6].copy_from_slice(&(first as u8).to_ne_bytes());
 
