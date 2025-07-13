@@ -174,14 +174,44 @@ fn main() {
                 u64_encoding.append(&mut encoding);
 
                 if u64_encoding.len() > block_size {
-                    let block = encode::compress_block(&u64_encoding, num_records);
-                    let _ = stdout.write_all(&block);
+                    let data_1: Vec<u64> = u64_encoding.iter().map(|x| {
+                        let mut arr: [u8; 8] = [0; 8];
+                        let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
+                        arr[0..4].copy_from_slice(&key);
+                        u64::from_ne_bytes(arr)
+                    }).collect();
+                    let data_2: Vec<u64> = u64_encoding.iter().map(|x| {
+                        let mut arr: [u8; 8] = [0; 8];
+                        let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
+                        arr[0..4].copy_from_slice(&key);
+                        u64::from_ne_bytes(arr)
+                    }).collect();
+
+                    let block_1 = encode::compress_block(&data_1, num_records, true);
+                    let block_2 = encode::compress_block(&data_2, num_records, true);
+                    let _ = stdout.write_all(&block_1);
+                    let _ = stdout.write_all(&block_2);
                     num_records = 0;
                     u64_encoding.clear();
                 }
             }
-            let block = encode::compress_block(&u64_encoding, num_records);
-            let _ = stdout.write_all(&block);
+            let data_1: Vec<u64> = u64_encoding.iter().map(|x| {
+                let mut arr: [u8; 8] = [0; 8];
+                let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
+                arr[0..4].copy_from_slice(&key);
+                u64::from_ne_bytes(arr)
+            }).collect();
+            let data_2: Vec<u64> = u64_encoding.iter().map(|x| {
+                let mut arr: [u8; 8] = [0; 8];
+                let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
+                arr[0..4].copy_from_slice(&key);
+                u64::from_ne_bytes(arr)
+            }).collect();
+
+            let block_1 = encode::compress_block(&data_1, num_records, true);
+            let block_2 = encode::compress_block(&data_2, num_records, true);
+            let _ = stdout.write_all(&block_1);
+            let _ = stdout.write_all(&block_2);
             let _ = stdout.flush();
             // TODO rewind back to start and fill file header
         },
@@ -206,11 +236,31 @@ fn main() {
             let mut i = 1;
             while conn.read_exact(&mut header_bytes).is_ok() {
                 let header = decode_block_header(&header_bytes);
-                let mut bytes: Vec<u8> = vec![0; header.block_size as usize];
+                let mut bytes_1: Vec<u8> = vec![0; header.block_size as usize];
+                let _ = conn.read_exact(&mut bytes_1);
 
-                let _ = conn.read_exact(&mut bytes);
+                let mut header_bytes_2: [u8; 32] = [0; 32];
+                let _ = conn.read_exact(&mut header_bytes_2);
+                let header_2 = decode_block_header(&header_bytes_2);
+                let mut bytes_2: Vec<u8> = vec![0; header_2.block_size as usize];
+                let _ = conn.read_exact(&mut bytes_2);
 
-                let decompressed = decode::decompress_block(&bytes, &header);
+                let decompressed_1 = decode::decompress_block(&bytes_1, &header, true);
+                let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, true);
+
+                assert_eq!(decompressed_1.len(), decompressed_2.len());
+                let decompressed: Vec<u64> = decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
+                    let mut arr: [u8; 8] = [0; 8];
+                    let key_1 = x.to_ne_bytes();
+                    let key_2 = y.to_ne_bytes()[0];
+                    let key_3 = y.to_ne_bytes()[1];
+                    arr[0..4].copy_from_slice(&key_1[0..4]);
+                    eprintln!("{:?}", arr[0..4].to_vec());
+                    arr[4..5].copy_from_slice(&[key_2]);
+                    arr[5..6].copy_from_slice(&[key_3]);
+                    u64::from_ne_bytes(arr)
+                }).collect();
+
                 let decoded = decode::decode_dictionary(&decompressed);
 
                 info!("Decoding encoded data...");

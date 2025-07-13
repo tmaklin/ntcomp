@@ -20,6 +20,7 @@ use dsi_bitstream::impls::MemWordWriterVec;
 use dsi_bitstream::impls::BufBitWriter;
 use dsi_bitstream::traits::BE;
 use dsi_bitstream::codes::RiceWrite;
+use dsi_bitstream::codes::MinimalBinaryWrite;
 
 use crate::BlockHeader;
 use crate::encode_block_header;
@@ -49,12 +50,31 @@ fn rice_encode(
     (writer.into_inner().unwrap().into_inner(), param)
 }
 
+fn minimal_binary_encode(
+    ints: &[u64],
+) -> (Vec<u64>, usize) {
+    let param = ints.iter().max().unwrap();
+
+    let word_write = MemWordWriterVec::new(Vec::<u64>::new());
+    let mut writer = BufBitWriter::<BE, _>::new(word_write);
+
+    ints.iter().for_each(|n| { writer.write_minimal_binary(*n, *param).unwrap(); } );
+    let _ = writer.flush();
+
+    (writer.into_inner().unwrap().into_inner(), *param as usize)
+}
+
 pub fn compress_block(
     u64_encoding: &[u64],
     num_records: usize,
+    codec: bool,
 ) -> Vec<u8> {
 
-    let (rice_encoded, param) = rice_encode(u64_encoding);
+    let (rice_encoded, param) = if codec {
+        rice_encode(u64_encoding)
+    } else {
+        minimal_binary_encode(u64_encoding)
+    };
 
     let bytes = rice_encoded.iter().flat_map(|x| {
         x.to_ne_bytes()
@@ -90,6 +110,7 @@ pub fn encode_dictionary(
             bases = matches.0;
             let mut arr: [u8; 8] = [0; 8];
             arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
+            eprintln!("{:?}", arr[0..4].to_vec());
             arr[4..5].copy_from_slice(&(matches.0 as u8).to_ne_bytes());
             arr[5..6].copy_from_slice(&(first as u8).to_ne_bytes());
 

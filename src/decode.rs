@@ -17,6 +17,7 @@ use dsi_bitstream::traits::BE;
 use dsi_bitstream::prelude::MemWordReader;
 use dsi_bitstream::prelude::BufBitReader;
 use dsi_bitstream::codes::RiceRead;
+use dsi_bitstream::codes::MinimalBinaryRead;
 use flate2::write::GzDecoder;
 
 use crate::BlockHeader;
@@ -43,18 +44,35 @@ fn rice_decode(
     encoded
 }
 
+fn minimal_binary_decode(
+    encoded: &[u64],
+    n_records: usize,
+    param: u64,
+) -> Vec<u64> {
+    let mut reader = BufBitReader::<BE, _>::new(MemWordReader::new(encoded));
+    let encoded: Vec<u64> = (0..n_records).map(|_| {
+        reader.read_minimal_binary(param).unwrap()
+    }).collect();
+    encoded
+}
+
 pub fn decompress_block(
     block: &[u8],
     header: &BlockHeader,
+    codec: bool,
 ) -> Vec<u64> {
     let bytes = inflate_bytes(block);
-    let rice_encoded: Vec<u64> = bytes.chunks(8).map(|x| {
+    let encoded: Vec<u64> = bytes.chunks(8).map(|x| {
         let arr: [u8; 8] = [x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7]];
         u64::from_ne_bytes(arr)
     }).collect();
-    assert_eq!(rice_encoded.len(), header.encoded_size as usize);
+    assert_eq!(encoded.len(), header.encoded_size as usize);
 
-    rice_decode(&rice_encoded, header.num_u64 as usize, header.rice_param as usize)
+    if codec {
+        rice_decode(&encoded, header.num_u64 as usize, header.rice_param as usize)
+    } else {
+        minimal_binary_decode(&encoded, header.num_u64 as usize, header.rice_param as u64)
+    }
 }
 
 pub fn decode_dictionary(
