@@ -101,24 +101,19 @@ pub fn compress_block(
 pub fn encode_dictionary(
     dictionary: &[(usize, std::ops::Range<usize>)],
 ) -> Vec<u64> {
-    // TODO Should preprocess the dictionary so that the overlapping elements are removed
     let mut first: bool = true;
-    let mut bases = 0;
     let mut u64_encoding: Vec<u64> = Vec::with_capacity(dictionary.len());
     dictionary.iter().rev().for_each(|matches| {
-        if bases == 0 {
-            bases = matches.0;
-            let mut arr: [u8; 8] = [0; 8];
-            arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-            arr[4..5].copy_from_slice(&(matches.0 as u8).to_ne_bytes());
-            arr[5..6].copy_from_slice(&(first as u8).to_ne_bytes());
+        let mut arr: [u8; 8] = [0; 8];
+        arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
+        arr[4..7].copy_from_slice(&(matches.0 as u32).to_ne_bytes()[0..3]);
+        arr[7..8].copy_from_slice(&(first as u8).to_ne_bytes());
 
-            u64_encoding.push(u64::from_ne_bytes(arr));
-            if first { first = false };
-        }
-        bases -= 1;
+        u64_encoding.push(u64::from_ne_bytes(arr));
+        if first { first = false };
     });
 
+    dictionary.iter().for_each(|x| eprintln!("{:?}", x));
     u64_encoding.shrink_to_fit();
     u64_encoding
 }

@@ -77,19 +77,27 @@ pub fn decompress_block(
 
 pub fn decode_dictionary(
     encoded: &[u64],
-) -> Vec<(u8, u32, bool)> {
-    let dictionary: Vec<(u8, u32, bool)> = encoded.iter().map(|x| {
+) -> Vec<(u32, u32, bool)> {
+    let mut dictionary: Vec<(u32, u32, bool)> = Vec::new();
+    let mut temp: Vec<(u32, u32, bool)> = Vec::new();
+    encoded.iter().rev().for_each(|x| {
         let arr: [u8; 8] = x.to_ne_bytes();
         let mut arr1: [u8; 4] = [0; 4];
-        let mut arr2: [u8; 1] = [0; 1];
+        let mut arr2: [u8; 4] = [0; 4];
         let mut arr3: [u8; 1] = [0; 1];
         arr1.copy_from_slice(&arr[0..4]);
-        arr2.copy_from_slice(&arr[4..5]);
-        arr3.copy_from_slice(&arr[5..6]);
+        arr2[0..3].copy_from_slice(&arr[4..7]);
+        arr3.copy_from_slice(&arr[7..8]);
         let colex_rank = u32::from_ne_bytes(arr1);
-        let ms = u8::from_ne_bytes(arr2);
-        (ms, colex_rank, u8::from_ne_bytes(arr3) == 1)
-    }).collect();
+        let ms = u32::from_ne_bytes(arr2);
+        temp.push((ms, colex_rank, u8::from_ne_bytes(arr3) == 1));
+        if u8::from_ne_bytes(arr3) == 1 {
+            dictionary.extend(temp.iter().rev());
+            temp.clear();
+        }
+    });
 
-    dictionary
+    // dictionary.iter().rev().for_each(|x| eprintln!("{:?}", x));
+    dictionary.into_iter().rev().collect()
+    // dictionary
 }

@@ -90,22 +90,125 @@ pub fn decode_block_header(
     decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0
 }
 
+pub fn left_extend_kmer(
+    kmer_start: &[u8],
+    ref_nts: &[u8],
+    sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
+    max_extension_len: usize,
+) -> Vec<u8> {
+    assert!(!kmer_start.is_empty());
+    assert!(!ref_nts.is_empty());
+
+    let mut left_extension_len = 0;
+    let mut kmer = kmer_start.to_vec();
+    while left_extension_len < max_extension_len {
+        let new_kmers: Vec<(Vec<u8>, Range<usize>)> = sbwt.alphabet().iter().filter_map(|c| {
+            let new_kmer: Vec<u8> = [&[*c], &kmer[0..(kmer.len() - (left_extension_len + 1))]].concat();
+            let res = sbwt.search(&new_kmer);
+            if res.as_ref().is_some() {
+                Some((new_kmer, res.unwrap()))
+            } else {
+                None
+            }
+        }).collect();
+        if !new_kmers.is_empty() {
+            let seq_matches = new_kmers[0].0[0] == ref_nts[ref_nts.len() - kmer.len() - 1];
+            if seq_matches && new_kmers.len() == 1 && new_kmers[0].1.end - new_kmers[0].1.start == 1 {
+                kmer = [&[new_kmers[0].0[0]], kmer.as_slice()].concat();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+        left_extension_len += 1;
+    }
+    kmer
+}
+
 pub fn encode_sequence(
     nucleotides: &[u8],
     sbwt: &SbwtIndexVariant,
     lcs: &LcsArray,
 ) -> Vec<u64> {
+    let n = nucleotides.len();
     let dictionary: Vec<(usize, Range<usize>)> = match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
+            let k = sbwt.k();
             let index = StreamingIndex::new(sbwt, lcs);
-            index.matching_statistics(nucleotides)
+            let mut res = index.matching_statistics(nucleotides);
+
+            let mut i = n;
+            let mut kept: Vec<usize> = Vec::new();
+            let mut max_save = 0;
+            while i > 0 {
+                let mut saved = 0;
+                let colex_int = res[i - 1].1.clone();
+
+                if res[i - 1].0 == k && i > 255*2 {
+                    let kmer = sbwt.access_kmer(colex_int.start);
+                    let seq = nucleotides[(i - kmer.len())..i].to_vec();
+                    assert_eq!(kmer, seq);
+
+                    let ref_nts = &nucleotides[0..i];
+                    let new_kmer = left_extend_kmer(&kmer, &ref_nts, sbwt, i - k - 1);
+                    let new_seq = nucleotides[(i - new_kmer.len())..i].to_vec();
+                    assert_eq!(new_kmer.len(), new_seq.len());
+
+                    let extended = new_kmer.len();
+                    for j in 0..(extended - 1) {
+                        let idx = extended - j - 1;
+                        let is_same = new_kmer[idx] == new_seq[idx];
+                        saved += is_same as usize;
+                        if !is_same { break; }
+                    }
+                    let new_ms = saved;
+
+                    if saved > 0 && saved > k {
+                        let old_i = i;
+                        loop {
+                            if res[i - 1 - 1].0 < saved {
+                                let old_ms = res[i - 1 - 1].0;
+                                i -= old_ms;
+                                saved -= old_ms;
+                            } else {
+                                max_save = if new_ms > max_save { new_ms } else { max_save };
+                                res[old_i - 1].0 = new_ms;
+                                kept.push(old_i - 1);
+                                break;
+                            }
+                        }
+                    } else {
+                        kept.push(i - 1);
+                        if i >= res[i - 1].0 {
+                            i -= res[i - 1].0;
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    kept.push(i - 1);
+                    if i >= res[i - 1].0 {
+                        i -= res[i - 1].0;
+                    } else {
+                        break;
+                    }
+                }
+
+                if i > 0 {
+                    i -= 1;
+                } else {
+                    break;
+                }
+            }
+            kept.iter().map(|x| res[*x].clone()).collect()
         },
     };
     encode::encode_dictionary(&dictionary)
 }
 
 pub fn decode_sequence(
-    dictionary: &[(u8, u32, bool)],
+    dictionary: &[(u32, u32, bool)],
     sbwt: &SbwtIndexVariant,
     mut pointer: usize,
 ) -> (Vec<u8>, usize) {
@@ -117,10 +220,15 @@ pub fn decode_sequence(
             let k = sbwt.k();
             loop {
                 let (suffix_len, colex_rank, _) = dictionary[pointer];
-                let kmer = sbwt.access_kmer(colex_rank as usize);
-                sequence.extend(kmer[(k - (suffix_len as usize))..k].iter().rev());
-                pointer += 1;
-                if pointer == dictionary.len() || dictionary[pointer].2 {
+                let mut kmer = sbwt.access_kmer(colex_rank as usize);
+                if suffix_len > sbwt.k() as u32 {
+                    let new_kmer = kbo::gap_filling::left_extend_kmer(&kmer, sbwt, (suffix_len - sbwt.k() as u32) as usize);
+                    assert_eq!(new_kmer.len(), suffix_len as usize);
+                    kmer = new_kmer;
+                }
+                sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter().rev());
+                pointer -= 1;
+                if pointer == 0 || dictionary[pointer].2 {
                     break;
                 }
             }

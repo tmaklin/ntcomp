@@ -252,19 +252,19 @@ fn main() {
                 let decompressed: Vec<u64> = decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
                     let mut arr: [u8; 8] = [0; 8];
                     let key_1 = x.to_ne_bytes();
-                    let key_2 = y.to_ne_bytes()[0];
-                    let key_3 = y.to_ne_bytes()[1];
+                    let key_2 = [y.to_ne_bytes()[0..3].to_vec(), [0_u8].to_vec()].concat();
+                    let key_3 = y.to_ne_bytes()[3];
                     arr[0..4].copy_from_slice(&key_1[0..4]);
-                    arr[4..5].copy_from_slice(&[key_2]);
-                    arr[5..6].copy_from_slice(&[key_3]);
+                    arr[4..7].copy_from_slice(&key_2[0..3]);
+                    arr[7..8].copy_from_slice(&[key_3]);
                     u64::from_ne_bytes(arr)
                 }).collect();
 
                 let decoded = decode::decode_dictionary(&decompressed);
 
                 info!("Decoding encoded data...");
-                let mut pointer = 0;
-                while pointer < decoded.len() {
+                let mut pointer = decoded.len() - 1;
+                while pointer > 0 {
                     let (nucleotides, new_pointer) = decode_sequence(&decoded, &sbwt, pointer);
                     pointer = new_pointer;
                     let _ = writeln!(&mut stdout, ">seq.{}", i);
