@@ -233,7 +233,9 @@ fn main() {
             let _ = conn.read_exact(&mut header_bytes);
             let _file_header = decode_file_header(&header_bytes);
 
-            let mut i = 1;
+            // TODO sort out the ordering so we don't have to store these just to reverse their order
+            let mut sequences: Vec<Vec<u8>>  = Vec::new();
+
             while conn.read_exact(&mut header_bytes).is_ok() {
                 let header = decode_block_header(&header_bytes);
                 let mut bytes_1: Vec<u8> = vec![0; header.block_size as usize];
@@ -263,17 +265,21 @@ fn main() {
                 let decoded = decode::decode_dictionary(&decompressed);
 
                 info!("Decoding encoded data...");
-                let mut pointer = decoded.len() - 1;
+                let mut pointer = decoded.len();
                 while pointer > 0 {
                     let (nucleotides, new_pointer) = decode_sequence(&decoded, &sbwt, pointer);
                     pointer = new_pointer;
-                    let _ = writeln!(&mut stdout, ">seq.{}", i);
-                    let _ = writeln!(&mut stdout,
-                                     "{}", nucleotides.iter().rev().map(|x| *x as char).collect::<String>());
-                    i += 1;
+                    sequences.push(nucleotides);
                 }
                 let _ = stdout.flush();
             }
+
+            sequences.iter().rev().enumerate().for_each(|(i, nucleotides)| {
+                let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
+                let _ = writeln!(&mut stdout,
+                                 "{}", nucleotides.iter().map(|x| *x as char).collect::<String>());
+
+            });
         },
         None => {},
     }

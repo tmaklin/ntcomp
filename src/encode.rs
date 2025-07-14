@@ -103,7 +103,7 @@ pub fn encode_dictionary(
 ) -> Vec<u64> {
     let mut first: bool = true;
     let mut u64_encoding: Vec<u64> = Vec::with_capacity(dictionary.len());
-    dictionary.iter().rev().for_each(|matches| {
+    dictionary.iter().for_each(|matches| {
         let mut arr: [u8; 8] = [0; 8];
         arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
         arr[4..7].copy_from_slice(&(matches.0 as u32).to_ne_bytes()[0..3]);
@@ -113,7 +113,6 @@ pub fn encode_dictionary(
         if first { first = false };
     });
 
-    dictionary.iter().for_each(|x| eprintln!("{:?}", x));
     u64_encoding.shrink_to_fit();
     u64_encoding
 }
