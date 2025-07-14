@@ -176,7 +176,7 @@ pub fn encode_sequence(
             while i > 0 {
                 let colex_int = res[i - 1].1.clone();
 
-                if res[i - 1].0 == k && i > 255*2 {
+                if res[i - 1].0 == k && i > k + 1 {
                     let kmer = sbwt.access_kmer(colex_int.start);
                     let seq = nucleotides[(i - kmer.len())..i].to_vec();
                     assert_eq!(kmer, seq);
@@ -221,7 +221,8 @@ pub fn encode_sequence(
 
     let dictionary_bases = dictionary.iter().map(|x| x.0).sum::<usize>();
     let dictionary_max = dictionary.iter().map(|x| x.0).max().unwrap();
-    assert!(dictionary_max < 16777216);
+
+    assert!(dictionary_max < 16777216); // Match lengths are coded as 24 bit unsigned integers
     assert_eq!(dictionary_bases, nucleotides.len());
 
     encode::encode_dictionary(&dictionary)
