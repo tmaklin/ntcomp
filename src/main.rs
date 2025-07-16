@@ -233,9 +233,7 @@ fn main() {
             let _ = conn.read_exact(&mut header_bytes);
             let _file_header = decode_file_header(&header_bytes);
 
-            // TODO sort out the ordering so we don't have to store these just to reverse their order
-            let mut sequences: Vec<Vec<u8>>  = Vec::new();
-
+            let mut i = 0;
             while conn.read_exact(&mut header_bytes).is_ok() {
                 let header = decode_block_header(&header_bytes);
                 let mut bytes_1: Vec<u8> = vec![0; header.block_size as usize];
@@ -263,23 +261,26 @@ fn main() {
                 }).collect();
 
                 let decoded = decode::decode_dictionary(&decompressed);
+                let mut dictionary: Vec<Vec<(u32, u32, bool)>> = Vec::new();
+                decoded.iter().rev().for_each(|record| {
+                    let n = dictionary.len();
+                    if record.2 {
+                        dictionary.push(vec![*record]);
+                    } else {
+                        dictionary[n - 1].push(*record);
+                    }
+                });
 
                 info!("Decoding encoded data...");
-                let mut pointer = decoded.len();
-                while pointer > 0 {
-                    let (nucleotides, new_pointer) = decode_sequence(&decoded, &sbwt, pointer);
-                    pointer = new_pointer;
-                    sequences.push(nucleotides);
-                }
-                let _ = stdout.flush();
+                dictionary.iter().rev().for_each(|record| {
+                    let nucleotides = decode_sequence(record, &sbwt);
+                    let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
+                    let _ = writeln!(&mut stdout,
+                                     "{}", nucleotides.iter().map(|x| *x as char).collect::<String>());
+                    let _ = stdout.flush();
+                    i += 1;
+                });
             }
-
-            sequences.iter().rev().enumerate().for_each(|(i, nucleotides)| {
-                let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
-                let _ = writeln!(&mut stdout,
-                                 "{}", nucleotides.iter().map(|x| *x as char).collect::<String>());
-
-            });
         },
         None => {},
     }

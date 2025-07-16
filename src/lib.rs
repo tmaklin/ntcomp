@@ -231,17 +231,13 @@ pub fn encode_sequence(
 pub fn decode_sequence(
     dictionary: &[(u32, u32, bool)],
     sbwt: &SbwtIndexVariant,
-    mut pointer: usize,
-) -> (Vec<u8>, usize) {
-    assert!(dictionary[pointer - 1].2);
-    pointer -= 1;
-
+) -> Vec<u8> {
     let mut sequence: Vec<u8> = Vec::new();
     match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
             let k = sbwt.k();
-            loop {
-                let (suffix_len, colex_rank, _) = dictionary[pointer];
+            dictionary.iter().for_each(|record| {
+                let (suffix_len, colex_rank, _) = *record;
                 let kmer = if suffix_len > k as u32 {
                     let kmer = sbwt.access_kmer(colex_rank as usize);
                     let new_kmer = left_extend_kmer2(&kmer, sbwt, (suffix_len - k as u32) as usize);
@@ -251,15 +247,8 @@ pub fn decode_sequence(
                     sbwt.access_kmer(colex_rank as usize)
                 };
                 sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter().rev());
-                if pointer == 0 {
-                    break;
-                }
-                if dictionary[pointer - 1].2 {
-                    break;
-                }
-                pointer -= 1;
-            }
+            });
         },
     }
-    (sequence.into_iter().rev().collect(), pointer)
+    sequence.into_iter().rev().collect()
 }
