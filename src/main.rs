@@ -247,29 +247,9 @@ fn main() {
 
                 let decompressed_1 = decode::decompress_block(&bytes_1, &header, true);
                 let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, true);
+                let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2);
 
-                assert_eq!(decompressed_1.len(), decompressed_2.len());
-                let decompressed: Vec<u64> = decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
-                    let mut arr: [u8; 8] = [0; 8];
-                    let key_1 = x.to_ne_bytes();
-                    let key_2 = [y.to_ne_bytes()[0..3].to_vec(), [0_u8].to_vec()].concat();
-                    let key_3 = y.to_ne_bytes()[3];
-                    arr[0..4].copy_from_slice(&key_1[0..4]);
-                    arr[4..7].copy_from_slice(&key_2[0..3]);
-                    arr[7..8].copy_from_slice(&[key_3]);
-                    u64::from_ne_bytes(arr)
-                }).collect();
-
-                let decoded = decode::decode_dictionary(&decompressed);
-                let mut dictionary: Vec<Vec<(u32, u32, bool)>> = Vec::new();
-                decoded.iter().rev().for_each(|record| {
-                    let n = dictionary.len();
-                    if record.2 {
-                        dictionary.push(vec![*record]);
-                    } else {
-                        dictionary[n - 1].push(*record);
-                    }
-                });
+                let dictionary = decode::decode_dictionary(&decompressed);
 
                 info!("Decoding encoded data...");
                 dictionary.iter().rev().for_each(|record| {

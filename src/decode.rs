@@ -75,9 +75,27 @@ pub fn decompress_block(
     }
 }
 
+pub fn zip_block_contents(
+    decompressed_1: &[u64],
+    decompressed_2: &[u64],
+) -> Vec<u64> {
+    assert_eq!(decompressed_1.len(), decompressed_2.len());
+
+    decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
+        let mut arr: [u8; 8] = [0; 8];
+        let key_1 = x.to_ne_bytes();
+        let key_2 = [y.to_ne_bytes()[0..3].to_vec(), [0_u8].to_vec()].concat();
+        let key_3 = y.to_ne_bytes()[3];
+        arr[0..4].copy_from_slice(&key_1[0..4]);
+        arr[4..7].copy_from_slice(&key_2[0..3]);
+        arr[7..8].copy_from_slice(&[key_3]);
+        u64::from_ne_bytes(arr)
+    }).collect()
+}
+
 pub fn decode_dictionary(
     encoded: &[u64],
-) -> Vec<(u32, u32, bool)> {
+) -> Vec<Vec<(u32, u32, bool)>> {
     let mut dictionary: Vec<(u32, u32, bool)> = Vec::new();
     let mut temp: Vec<(u32, u32, bool)> = Vec::new();
     encoded.iter().rev().for_each(|x| {
@@ -97,7 +115,15 @@ pub fn decode_dictionary(
         }
     });
 
-    // dictionary.iter().rev().for_each(|x| eprintln!("{:?}", x));
-    dictionary.into_iter().rev().collect()
-    // dictionary
+    let mut dictionaries: Vec<Vec<(u32, u32, bool)>> = Vec::new();
+
+    dictionary.iter().for_each(|record| {
+        let n = dictionaries.len();
+        if record.2 {
+            dictionaries.push(vec![*record]);
+        } else {
+            dictionaries[n - 1].push(*record);
+        }
+    });
+    dictionaries
 }
