@@ -116,3 +116,22 @@ pub fn encode_dictionary(
     u64_encoding.shrink_to_fit();
     u64_encoding
 }
+
+pub fn split_encoded_dictionary(
+    encoding: &[u64],
+) -> (Vec<u64>, Vec<u64>) {
+    let data_1: Vec<u64> = encoding.iter().map(|x| {
+        let mut arr: [u8; 8] = [0; 8];
+        let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
+        arr[0..4].copy_from_slice(&key);
+        u64::from_ne_bytes(arr)
+    }).collect();
+    let data_2: Vec<u64> = encoding.iter().map(|x| {
+        let mut arr: [u8; 8] = [0; 8];
+        let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
+        arr[0..4].copy_from_slice(&key);
+        u64::from_ne_bytes(arr)
+    }).collect();
+
+    (data_1, data_2)
+}

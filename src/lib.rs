@@ -228,31 +228,12 @@ pub fn encode_sequence(
     encode::encode_dictionary(&dictionary)
 }
 
-pub fn split_for_writing(
-    encoding: &[u64],
-) -> (Vec<u64>, Vec<u64>) {
-    let data_1: Vec<u64> = encoding.iter().map(|x| {
-        let mut arr: [u8; 8] = [0; 8];
-        let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
-        arr[0..4].copy_from_slice(&key);
-        u64::from_ne_bytes(arr)
-    }).collect();
-    let data_2: Vec<u64> = encoding.iter().map(|x| {
-        let mut arr: [u8; 8] = [0; 8];
-        let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
-        arr[0..4].copy_from_slice(&key);
-        u64::from_ne_bytes(arr)
-    }).collect();
-
-    (data_1, data_2)
-}
-
 pub fn write_block_to<W: std::io::Write>(
     u64_encoding: &[u64],
     num_records: usize,
     sink: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (data_1, data_2) = split_for_writing(u64_encoding);
+    let (data_1, data_2) = encode::split_encoded_dictionary(u64_encoding);
     let block_1 = encode::compress_block(&data_1, num_records, true);
     let block_2 = encode::compress_block(&data_2, num_records, true);
 
