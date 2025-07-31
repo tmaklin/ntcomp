@@ -21,6 +21,7 @@ use dsi_bitstream::codes::MinimalBinaryRead;
 use flate2::write::GzDecoder;
 
 use crate::BlockHeader;
+use crate::encode::Codec;
 
 type E = Box<dyn std::error::Error>;
 
@@ -82,7 +83,7 @@ fn minimal_binary_decode(
 pub fn decompress_block(
     block: &[u8],
     header: &BlockHeader,
-    codec: bool,
+    codec: Codec,
 ) -> Result<Vec<u64>, E> {
     let bytes = inflate_bytes(block)?;
     let encoded: Vec<u64> = bytes.chunks(8).map(|x| {
@@ -91,10 +92,9 @@ pub fn decompress_block(
     }).collect();
     assert_eq!(encoded.len(), header.encoded_size as usize);
 
-    let res = if codec {
-        rice_decode(&encoded, header.num_u64 as usize, header.rice_param as usize)?
-    } else {
-        minimal_binary_decode(&encoded, header.num_u64 as usize, header.rice_param as u64)?
+    let res = match codec {
+        Codec::Rice => rice_decode(&encoded, header.num_u64 as usize, header.rice_param as usize)?,
+        Codec::MinimalBinary => minimal_binary_decode(&encoded, header.num_u64 as usize, header.rice_param as u64)?,
     };
 
     Ok(res)

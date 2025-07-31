@@ -214,8 +214,8 @@ fn main() {
                 let mut bytes_2: Vec<u8> = vec![0; header_2.block_size as usize];
                 let _ = conn.read_exact(&mut bytes_2);
 
-                let decompressed_1 = decode::decompress_block(&bytes_1, &header, true).unwrap();
-                let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, true).unwrap();
+                let decompressed_1 = decode::decompress_block(&bytes_1, &header, ntcomp::encode::Codec::Rice).unwrap();
+                let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, ntcomp::encode::Codec::Rice).unwrap();
                 let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2);
 
                 let dictionary = decode::decode_dictionary(&decompressed);
