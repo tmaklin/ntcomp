@@ -247,6 +247,20 @@ pub fn split_for_writing(
     (data_1, data_2)
 }
 
+pub fn write_block_to<W: std::io::Write>(
+    u64_encoding: &[u64],
+    num_records: usize,
+    sink: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (data_1, data_2) = split_for_writing(u64_encoding);
+    let block_1 = encode::compress_block(&data_1, num_records, true);
+    let block_2 = encode::compress_block(&data_2, num_records, true);
+
+    sink.write_all(&block_1)?;
+    sink.write_all(&block_2)?;
+    Ok(())
+}
+
 pub fn decode_sequence(
     dictionary: &[(u32, u32, bool)],
     sbwt: &SbwtIndexVariant,

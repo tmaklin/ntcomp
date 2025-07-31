@@ -21,7 +21,6 @@ use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 
 use ntcomp::decode;
-use ntcomp::encode;
 use ntcomp::encode_file_header;
 use ntcomp::decode_file_header;
 use ntcomp::decode_block_header;
@@ -171,27 +170,15 @@ fn main() {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                let mut encoding = encode_sequence(&seqrec, &sbwt, &lcs);
-                u64_encoding.append(&mut encoding);
+                u64_encoding.append(&mut encode_sequence(&seqrec, &sbwt, &lcs));
 
                 if num_records % block_size == 0 {
-                    let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
-                    let block_1 = encode::compress_block(&data_1, block_size, true);
-                    let block_2 = encode::compress_block(&data_2, block_size, true);
-
-                    let _ = stdout.write_all(&block_1);
-                    let _ = stdout.write_all(&block_2);
-
+                    let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut stdout);
                     u64_encoding.clear();
                 }
             }
             if num_records % block_size != 0 {
-                let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
-                let block_1 = encode::compress_block(&data_1, num_records % block_size, true);
-                let block_2 = encode::compress_block(&data_2, num_records % block_size, true);
-
-                let _ = stdout.write_all(&block_1);
-                let _ = stdout.write_all(&block_2);
+                let _ = ntcomp::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
             }
 
             let _ = stdout.flush();
