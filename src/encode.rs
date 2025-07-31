@@ -25,6 +25,12 @@ use dsi_bitstream::codes::MinimalBinaryWrite;
 use crate::BlockHeader;
 use crate::encode_block_header;
 
+#[non_exhaustive]
+pub enum Codec {
+    Rice,
+    MinimalBinary
+}
+
 fn deflate_bytes(
     bytes: &[u8],
 ) -> Vec<u8> {
@@ -67,16 +73,15 @@ fn minimal_binary_encode(
 pub fn compress_block(
     u64_encoding: &[u64],
     num_records: usize,
-    codec: bool,
+    codec: Codec,
 ) -> Vec<u8> {
 
-    let (rice_encoded, param) = if codec {
-        rice_encode(u64_encoding)
-    } else {
-        minimal_binary_encode(u64_encoding)
+    let (encoded_data, param) = match codec {
+        Codec::Rice => rice_encode(u64_encoding),
+        Codec::MinimalBinary => minimal_binary_encode(u64_encoding),
     };
 
-    let bytes = rice_encoded.iter().flat_map(|x| {
+    let bytes = encoded_data.iter().flat_map(|x| {
         x.to_ne_bytes()
     }).collect::<Vec<u8>>();
 
@@ -85,7 +90,7 @@ pub fn compress_block(
     let block_header = BlockHeader{ block_size: deflated.len() as u32,
                                     num_records: num_records as u32,
                                     num_u64: u64_encoding.len() as u32,
-                                    encoded_size: rice_encoded.len() as u32,
+                                    encoded_size: encoded_data.len() as u32,
                                     rice_param: param as u8,
                                     bitpacker_exponent: 8_u8,
                                     placeholder1: 0, placeholder2: 0, placeholder3: 0,

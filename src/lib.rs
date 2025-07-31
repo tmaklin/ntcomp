@@ -234,8 +234,9 @@ pub fn write_block_to<W: std::io::Write>(
     sink: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (data_1, data_2) = encode::split_encoded_dictionary(u64_encoding);
-    let block_1 = encode::compress_block(&data_1, num_records, true);
-    let block_2 = encode::compress_block(&data_2, num_records, true);
+
+    let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::Rice);
+    let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice);
 
     sink.write_all(&block_1)?;
     sink.write_all(&block_2)?;
