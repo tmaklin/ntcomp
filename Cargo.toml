@@ -28,5 +28,8 @@ needletail = "0.6"
 sbwt = "0.3"
 stderrlog = "0.6"
 
+[dev-dependencies]
+random = "0.14"
+
 [profile.release]
 debug = true
