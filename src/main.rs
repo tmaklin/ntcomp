@@ -156,7 +156,7 @@ fn main() {
 
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
-            // TODO should use MB here
+            // Number of records to store in each block
             let block_size = 65536;
 
             let header_bytes = encode_file_header(0,0,0,0);
@@ -170,27 +170,29 @@ fn main() {
             while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
+
                 let mut encoding = encode_sequence(&seqrec, &sbwt, &lcs);
                 u64_encoding.append(&mut encoding);
 
-                if u64_encoding.len() > block_size {
+                if num_records % block_size == 0 {
                     let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
-                    let block_1 = encode::compress_block(&data_1, num_records, true);
-                    let block_2 = encode::compress_block(&data_2, num_records, true);
+                    let block_1 = encode::compress_block(&data_1, block_size, true);
+                    let block_2 = encode::compress_block(&data_2, block_size, true);
 
                     let _ = stdout.write_all(&block_1);
                     let _ = stdout.write_all(&block_2);
 
-                    num_records = 0;
                     u64_encoding.clear();
                 }
             }
-            let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
-            let block_1 = encode::compress_block(&data_1, num_records, true);
-            let block_2 = encode::compress_block(&data_2, num_records, true);
+            if num_records % block_size != 0 {
+                let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
+                let block_1 = encode::compress_block(&data_1, num_records % block_size, true);
+                let block_2 = encode::compress_block(&data_2, num_records % block_size, true);
 
-            let _ = stdout.write_all(&block_1);
-            let _ = stdout.write_all(&block_2);
+                let _ = stdout.write_all(&block_1);
+                let _ = stdout.write_all(&block_2);
+            }
 
             let _ = stdout.flush();
             // TODO rewind back to start and fill file header
