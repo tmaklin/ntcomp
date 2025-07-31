@@ -216,7 +216,7 @@ fn main() {
 
                 let decompressed_1 = decode::decompress_block(&bytes_1, &header, ntcomp::encode::Codec::Rice).unwrap();
                 let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, ntcomp::encode::Codec::Rice).unwrap();
-                let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2);
+                let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2).unwrap();
 
                 let dictionary = decode::decode_dictionary(&decompressed);
 

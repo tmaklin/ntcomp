@@ -25,18 +25,14 @@ use crate::encode::Codec;
 
 type E = Box<dyn std::error::Error>;
 
-#[non_exhaustive]
-pub enum Codec {
-    Rice,
-    MinimalBinary
-}
-
 #[derive(Debug, Clone)]
-struct DecodeError;
+struct DecodeError {
+    message: String,
+}
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "invalid input to encode")
+        write!(f, "ntx decoder error: {}", self.message)
     }
 }
 
@@ -90,7 +86,10 @@ pub fn decompress_block(
         let arr: [u8; 8] = [x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7]];
         u64::from_ne_bytes(arr)
     }).collect();
-    assert_eq!(encoded.len(), header.encoded_size as usize);
+
+    if encoded.len() != header.encoded_size as usize {
+        return Err(Box::new(DecodeError{ message: "encoded.len() != header.encoded_size".to_owned() }));
+    }
 
     let res = match codec {
         Codec::Rice => rice_decode(&encoded, header.num_u64 as usize, header.rice_param as usize)?,
@@ -103,10 +102,12 @@ pub fn decompress_block(
 pub fn zip_block_contents(
     decompressed_1: &[u64],
     decompressed_2: &[u64],
-) -> Vec<u64> {
-    assert_eq!(decompressed_1.len(), decompressed_2.len());
+) -> Result<Vec<u64>, E> {
+    if decompressed_1.len() != decompressed_2.len() {
+        return Err(Box::new(DecodeError{ message: "decompressed_1.len() != decompressed_2.len()".to_owned() }));
+    }
 
-    decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
+    let res = decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
         let mut arr: [u8; 8] = [0; 8];
         let key_1 = x.to_ne_bytes();
         let key_2 = [y.to_ne_bytes()[0..3].to_vec(), [0_u8].to_vec()].concat();
@@ -115,7 +116,9 @@ pub fn zip_block_contents(
         arr[4..7].copy_from_slice(&key_2[0..3]);
         arr[7..8].copy_from_slice(&[key_3]);
         u64::from_ne_bytes(arr)
-    }).collect()
+    }).collect();
+
+    Ok(res)
 }
 
 pub fn decode_dictionary(
