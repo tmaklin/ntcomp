@@ -43,55 +43,61 @@ impl std::error::Error for DecodeError {}
 
 fn inflate_bytes(
     deflated: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, E> {
     let mut inflated: Vec<u8> = Vec::new();
     let mut decoder = GzDecoder::new(&mut inflated);
-    decoder.write_all(deflated).unwrap();
-    decoder.finish().unwrap();
-    inflated
+    decoder.write_all(deflated)?;
+    decoder.finish()?;
+    Ok(inflated)
 }
 
 fn rice_decode(
     encoded: &[u64],
     n_records: usize,
     param: usize,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, E> {
     let mut reader = BufBitReader::<BE, _>::new(MemWordReader::new(encoded));
-    let encoded: Vec<u64> = (0..n_records).map(|_| {
-        reader.read_rice(param).unwrap()
-    }).collect();
-    encoded
+
+    let mut decoded: Vec<u64> = vec![0; n_records];
+    for i in 0..n_records {
+        decoded[i] = reader.read_rice(param)?;
+    }
+    Ok(decoded)
 }
 
 fn minimal_binary_decode(
     encoded: &[u64],
     n_records: usize,
     param: u64,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, E> {
     let mut reader = BufBitReader::<BE, _>::new(MemWordReader::new(encoded));
-    let encoded: Vec<u64> = (0..n_records).map(|_| {
-        reader.read_minimal_binary(param).unwrap()
-    }).collect();
-    encoded
+
+    let mut decoded: Vec<u64> = vec![0; n_records];
+    for i in 0..n_records {
+        decoded[i] = reader.read_minimal_binary(param)?;
+    }
+    Ok(decoded)
 }
 
 pub fn decompress_block(
     block: &[u8],
     header: &BlockHeader,
     codec: bool,
-) -> Vec<u64> {
-    let bytes = inflate_bytes(block);
+) -> Result<Vec<u64>, E> {
+    let bytes = inflate_bytes(block)?;
     let encoded: Vec<u64> = bytes.chunks(8).map(|x| {
         let arr: [u8; 8] = [x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7]];
         u64::from_ne_bytes(arr)
     }).collect();
     assert_eq!(encoded.len(), header.encoded_size as usize);
 
-    if codec {
-        rice_decode(&encoded, header.num_u64 as usize, header.rice_param as usize)
+    let res = if codec {
+        rice_decode(&encoded, header.num_u64 as usize, header.rice_param as usize)?
     } else {
-        minimal_binary_decode(&encoded, header.num_u64 as usize, header.rice_param as u64)
-    }
+        minimal_binary_decode(&encoded, header.num_u64 as usize, header.rice_param as u64)?
+    };
+
+    Ok(res)
 }
 
 pub fn zip_block_contents(
