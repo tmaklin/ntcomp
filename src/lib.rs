@@ -228,6 +228,25 @@ pub fn encode_sequence(
     encode::encode_dictionary(&dictionary)
 }
 
+pub fn split_for_writing(
+    encoding: &[u64],
+) -> (Vec<u64>, Vec<u64>) {
+    let data_1: Vec<u64> = encoding.iter().map(|x| {
+        let mut arr: [u8; 8] = [0; 8];
+        let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
+        arr[0..4].copy_from_slice(&key);
+        u64::from_ne_bytes(arr)
+    }).collect();
+    let data_2: Vec<u64> = encoding.iter().map(|x| {
+        let mut arr: [u8; 8] = [0; 8];
+        let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
+        arr[0..4].copy_from_slice(&key);
+        u64::from_ne_bytes(arr)
+    }).collect();
+
+    (data_1, data_2)
+}
+
 pub fn decode_sequence(
     dictionary: &[(u32, u32, bool)],
     sbwt: &SbwtIndexVariant,

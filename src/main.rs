@@ -174,44 +174,24 @@ fn main() {
                 u64_encoding.append(&mut encoding);
 
                 if u64_encoding.len() > block_size {
-                    let data_1: Vec<u64> = u64_encoding.iter().map(|x| {
-                        let mut arr: [u8; 8] = [0; 8];
-                        let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
-                        arr[0..4].copy_from_slice(&key);
-                        u64::from_ne_bytes(arr)
-                    }).collect();
-                    let data_2: Vec<u64> = u64_encoding.iter().map(|x| {
-                        let mut arr: [u8; 8] = [0; 8];
-                        let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
-                        arr[0..4].copy_from_slice(&key);
-                        u64::from_ne_bytes(arr)
-                    }).collect();
-
+                    let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
                     let block_1 = encode::compress_block(&data_1, num_records, true);
                     let block_2 = encode::compress_block(&data_2, num_records, true);
+
                     let _ = stdout.write_all(&block_1);
                     let _ = stdout.write_all(&block_2);
+
                     num_records = 0;
                     u64_encoding.clear();
                 }
             }
-            let data_1: Vec<u64> = u64_encoding.iter().map(|x| {
-                let mut arr: [u8; 8] = [0; 8];
-                let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
-                arr[0..4].copy_from_slice(&key);
-                u64::from_ne_bytes(arr)
-            }).collect();
-            let data_2: Vec<u64> = u64_encoding.iter().map(|x| {
-                let mut arr: [u8; 8] = [0; 8];
-                let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
-                arr[0..4].copy_from_slice(&key);
-                u64::from_ne_bytes(arr)
-            }).collect();
-
+            let (data_1, data_2) = ntcomp::split_for_writing(&u64_encoding);
             let block_1 = encode::compress_block(&data_1, num_records, true);
             let block_2 = encode::compress_block(&data_2, num_records, true);
+
             let _ = stdout.write_all(&block_1);
             let _ = stdout.write_all(&block_2);
+
             let _ = stdout.flush();
             // TODO rewind back to start and fill file header
         },
