@@ -22,13 +22,32 @@ use flate2::write::GzDecoder;
 
 use crate::BlockHeader;
 
+type E = Box<dyn std::error::Error>;
+
+#[non_exhaustive]
+pub enum Codec {
+    Rice,
+    MinimalBinary
+}
+
+#[derive(Debug, Clone)]
+struct DecodeError;
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "invalid input to encode")
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
 fn inflate_bytes(
     deflated: &[u8],
 ) -> Vec<u8> {
     let mut inflated: Vec<u8> = Vec::new();
     let mut decoder = GzDecoder::new(&mut inflated);
     decoder.write_all(deflated).unwrap();
-    inflated = decoder.finish().unwrap().to_vec();
+    decoder.finish().unwrap();
     inflated
 }
 
