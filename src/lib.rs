@@ -53,16 +53,16 @@ pub fn encode_file_header(
     ph2: u64,
     ph3: u64,
     ph4: u64
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut bytes: Vec<u8> = Vec::new();
     let header_placeholder = HeaderPlaceholder{ ph1, ph2, ph3, ph4 };
     let nbytes = encode_into_std_write(
         &header_placeholder,
         &mut bytes,
         bincode::config::standard().with_fixed_int_encoding(),
-    );
-    assert_eq!(nbytes.unwrap(), 32);
-    bytes
+    )?;
+    assert_eq!(nbytes, 32);
+    Ok(bytes)
 }
 
 pub fn decode_file_header(
@@ -73,15 +73,15 @@ pub fn decode_file_header(
 
 pub fn encode_block_header(
     header: &BlockHeader,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut bytes: Vec<u8> = Vec::new();
     let nbytes = encode_into_std_write(
         header,
         &mut bytes,
         bincode::config::standard().with_fixed_int_encoding(),
-    );
-    assert_eq!(nbytes.unwrap(), 32);
-    bytes
+    )?;
+    assert_eq!(nbytes, 32);
+    Ok(bytes)
 }
 
 pub fn decode_block_header(
@@ -235,8 +235,8 @@ pub fn write_block_to<W: std::io::Write>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (data_1, data_2) = encode::split_encoded_dictionary(u64_encoding);
 
-    let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::Rice);
-    let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice);
+    let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::Rice)?;
+    let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice)?;
 
     sink.write_all(&block_1)?;
     sink.write_all(&block_2)?;

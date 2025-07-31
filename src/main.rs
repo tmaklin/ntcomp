@@ -158,7 +158,7 @@ fn main() {
             // Number of records to store in each block
             let block_size = 65536;
 
-            let header_bytes = encode_file_header(0,0,0,0);
+            let header_bytes = encode_file_header(0,0,0,0).unwrap();
             let _ = stdout.write_all(&header_bytes);
 
             info!("Encoding fastX data...");

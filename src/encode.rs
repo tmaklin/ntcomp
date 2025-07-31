@@ -25,67 +25,86 @@ use dsi_bitstream::codes::MinimalBinaryWrite;
 use crate::BlockHeader;
 use crate::encode_block_header;
 
+type E = Box<dyn std::error::Error>;
+
 #[non_exhaustive]
 pub enum Codec {
     Rice,
     MinimalBinary
 }
 
+#[derive(Debug, Clone)]
+struct EncodeError;
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "invalid input to encode")
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
 fn deflate_bytes(
     bytes: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, E> {
     let mut deflated: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut encoder = GzEncoder::new(&mut deflated, Compression::default());
-    encoder.write_all(bytes).unwrap();
-    encoder.finish().unwrap();
-    deflated
+    encoder.write_all(bytes)?;
+    encoder.finish()?;
+    Ok(deflated)
 }
 
 fn rice_encode(
     ints: &[u64],
-) -> (Vec<u64>, usize) {
+) -> Result<(Vec<u64>, usize), E> {
     let inv_mean: f64 = ((ints.len() as f64).ln() - (ints.iter().sum::<u64>() as f64).ln()).exp();
     let param: usize = dsi_bitstream::codes::rice::log2_b(inv_mean);
 
     let word_write = MemWordWriterVec::new(Vec::<u64>::new());
     let mut writer = BufBitWriter::<BE, _>::new(word_write);
 
-    ints.iter().for_each(|n| { writer.write_rice(*n, param).unwrap(); } );
-    let _ = writer.flush();
+    for n in ints {
+        writer.write_rice(*n, param)?;
+    }
 
-    (writer.into_inner().unwrap().into_inner(), param)
+    writer.flush()?;
+
+    Ok((writer.into_inner()?.into_inner(), param))
 }
 
 fn minimal_binary_encode(
     ints: &[u64],
-) -> (Vec<u64>, usize) {
-    let param = ints.iter().max().unwrap();
+) -> Result<(Vec<u64>, usize), E> {
+    let param: u64 = *ints.iter().max().ok_or(EncodeError)?;
 
     let word_write = MemWordWriterVec::new(Vec::<u64>::new());
     let mut writer = BufBitWriter::<BE, _>::new(word_write);
 
-    ints.iter().for_each(|n| { writer.write_minimal_binary(*n, *param).unwrap(); } );
-    let _ = writer.flush();
+    for n in ints {
+        writer.write_minimal_binary(*n, param)?;
+    }
 
-    (writer.into_inner().unwrap().into_inner(), *param as usize)
+    writer.flush()?;
+
+    Ok((writer.into_inner()?.into_inner(), param as usize))
 }
 
 pub fn compress_block(
     u64_encoding: &[u64],
     num_records: usize,
     codec: Codec,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, E> {
 
     let (encoded_data, param) = match codec {
-        Codec::Rice => rice_encode(u64_encoding),
-        Codec::MinimalBinary => minimal_binary_encode(u64_encoding),
+        Codec::Rice => rice_encode(u64_encoding)?,
+        Codec::MinimalBinary => minimal_binary_encode(u64_encoding)?,
     };
 
     let bytes = encoded_data.iter().flat_map(|x| {
         x.to_ne_bytes()
     }).collect::<Vec<u8>>();
 
-    let deflated: Vec<u8> = deflate_bytes(&bytes);
+    let deflated: Vec<u8> = deflate_bytes(&bytes)?;
 
     let block_header = BlockHeader{ block_size: deflated.len() as u32,
                                     num_records: num_records as u32,
@@ -96,11 +115,11 @@ pub fn compress_block(
                                     placeholder1: 0, placeholder2: 0, placeholder3: 0,
     };
 
-    let mut block: Vec<u8> = encode_block_header(&block_header);
+    let mut block: Vec<u8> = encode_block_header(&block_header)?;
     block.extend(deflated.iter());
     block.shrink_to_fit();
 
-    block
+    Ok(block)
 }
 
 pub fn encode_dictionary(
