@@ -267,3 +267,38 @@ pub fn decode_sequence(
     }
     sequence.into_iter().rev().collect()
 }
+
+pub fn decode_block<R: std::io::Read>(
+    _file_header: &HeaderPlaceholder,
+    sbwt: &SbwtIndexVariant,
+    conn: &mut R,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    // Colex ranks
+    let mut header_bytes_1: [u8; 32] = [0_u8; 32];
+    conn.read_exact(&mut header_bytes_1)?;
+    let header_1 = decode_block_header(&header_bytes_1);
+
+    let mut bytes_1: Vec<u8> = vec![0; header_1.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_1);
+
+    // Match lengths
+    let mut header_bytes_2: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_2);
+    let header_2 = decode_block_header(&header_bytes_2);
+
+    let mut bytes_2: Vec<u8> = vec![0; header_2.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_2);
+
+    // Decompress
+    let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::Rice)?;
+    let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
+    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2)?;
+
+    let dictionary = decode::decode_dictionary(&decompressed);
+
+    let decoded: Vec<Vec<u8>> = dictionary.iter().rev().map(|item| {
+        decode_sequence(item, sbwt)
+    }).collect();
+
+    Ok(decoded)
+}

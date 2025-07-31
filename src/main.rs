@@ -202,27 +202,10 @@ fn main() {
             let _ = conn.read_exact(&mut header_bytes);
             let _file_header = decode_file_header(&header_bytes);
 
+            info!("Decoding encoded data...");
             let mut i = 0;
-            while conn.read_exact(&mut header_bytes).is_ok() {
-                let header = decode_block_header(&header_bytes);
-                let mut bytes_1: Vec<u8> = vec![0; header.block_size as usize];
-                let _ = conn.read_exact(&mut bytes_1);
-
-                let mut header_bytes_2: [u8; 32] = [0; 32];
-                let _ = conn.read_exact(&mut header_bytes_2);
-                let header_2 = decode_block_header(&header_bytes_2);
-                let mut bytes_2: Vec<u8> = vec![0; header_2.block_size as usize];
-                let _ = conn.read_exact(&mut bytes_2);
-
-                let decompressed_1 = decode::decompress_block(&bytes_1, &header, ntcomp::encode::Codec::Rice).unwrap();
-                let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, ntcomp::encode::Codec::Rice).unwrap();
-                let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2).unwrap();
-
-                let dictionary = decode::decode_dictionary(&decompressed);
-
-                info!("Decoding encoded data...");
-                dictionary.iter().rev().for_each(|record| {
-                    let nucleotides = decode_sequence(record, &sbwt);
+            while let Ok(records) = ntcomp::decode_block(&_file_header, &sbwt, &mut conn) {
+                records.iter().for_each(|nucleotides| {
                     let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
                     let _ = writeln!(&mut stdout,
                                      "{}", nucleotides.iter().map(|x| *x as char).collect::<String>());
