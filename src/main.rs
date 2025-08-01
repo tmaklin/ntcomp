@@ -163,7 +163,7 @@ fn main() {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                u64_encoding.append(&mut ntcomp::encode_sequence(&seqrec, &sbwt, &lcs));
+                u64_encoding.append(&mut ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap());
 
                 if num_records % block_size == 0 {
                     let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut stdout);
@@ -193,7 +193,7 @@ fn main() {
             // File header
             let mut header_bytes: [u8; 32] = [0_u8; 32];
             let _ = conn.read_exact(&mut header_bytes);
-            let _file_header = ntcomp::decode_file_header(&header_bytes);
+            let _file_header = ntcomp::decode_file_header(&header_bytes).unwrap();
 
             info!("Decoding encoded data...");
             let mut i = 0;

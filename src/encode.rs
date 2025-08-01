@@ -34,7 +34,7 @@ pub enum Codec {
 }
 
 #[derive(Debug, Clone)]
-struct EncodeError;
+pub struct EncodeError;
 
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

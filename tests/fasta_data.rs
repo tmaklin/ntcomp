@@ -67,7 +67,7 @@ fn random_fasta_data() {
     let mut num_records = 0;
     contigs.iter().for_each(|nucleotides| {
         num_records += 1;
-        u64_encoding.append(&mut encode_sequence(&nucleotides, &sbwt, &lcs));
+        u64_encoding.append(&mut encode_sequence(&nucleotides, &sbwt, &lcs).unwrap());
 
         if num_records % block_size == 0 {
             let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut buf);
@@ -82,7 +82,7 @@ fn random_fasta_data() {
     // File header
     let mut header_bytes: [u8; 32] = [0_u8; 32];
     let _ = buf.read_exact(&mut header_bytes);
-    let _file_header = decode_file_header(&header_bytes);
+    let _file_header = decode_file_header(&header_bytes).unwrap();
 
     let mut i = 0;
     let mut total_bases = 0;

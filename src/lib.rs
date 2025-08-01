@@ -24,6 +24,7 @@ use sbwt::SbwtIndexVariant;
 pub mod encode;
 pub mod decode;
 
+type E = Box<dyn std::error::Error>;
 
 #[derive(Encode, Decode)]
 pub struct HeaderPlaceholder {
@@ -53,7 +54,7 @@ pub fn encode_file_header(
     ph2: u64,
     ph3: u64,
     ph4: u64
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, E> {
     let mut bytes: Vec<u8> = Vec::new();
     let header_placeholder = HeaderPlaceholder{ ph1, ph2, ph3, ph4 };
     let nbytes = encode_into_std_write(
@@ -67,13 +68,13 @@ pub fn encode_file_header(
 
 pub fn decode_file_header(
     header_bytes: &[u8],
-) -> HeaderPlaceholder {
-    decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0
+) -> Result<HeaderPlaceholder, E> {
+    Ok(decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding())?.0)
 }
 
 pub fn encode_block_header(
     header: &BlockHeader,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, E> {
     let mut bytes: Vec<u8> = Vec::new();
     let nbytes = encode_into_std_write(
         header,
@@ -86,8 +87,8 @@ pub fn encode_block_header(
 
 pub fn decode_block_header(
     header_bytes: &[u8],
-) -> BlockHeader {
-    decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding()).unwrap().0
+) -> Result<BlockHeader, E> {
+    Ok(decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding())?.0)
 }
 
 pub fn left_extend_kmer(
@@ -163,7 +164,7 @@ pub fn encode_sequence(
     nucleotides: &[u8],
     sbwt: &SbwtIndexVariant,
     lcs: &LcsArray,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, E> {
     let n = nucleotides.len();
     let dictionary: Vec<(usize, Range<usize>)> = match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
@@ -220,20 +221,21 @@ pub fn encode_sequence(
     };
 
     let dictionary_bases = dictionary.iter().map(|x| x.0).sum::<usize>();
-    let dictionary_max = dictionary.iter().map(|x| x.0).max().unwrap();
+    let dictionary_max = dictionary.iter().map(|x| x.0).max().ok_or(encode::EncodeError{})?;
 
     assert!(dictionary_max < 16777216); // Match lengths are coded as 24 bit unsigned integers
     assert_eq!(dictionary_bases, nucleotides.len());
 
-    encode::encode_dictionary(&dictionary)
+    let res = encode::encode_dictionary(&dictionary)?;
+    Ok(res)
 }
 
 pub fn write_block_to<W: std::io::Write>(
     u64_encoding: &[u64],
     num_records: usize,
     sink: &mut W,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (data_1, data_2) = encode::split_encoded_dictionary(u64_encoding);
+) -> Result<(), E> {
+    let (data_1, data_2) = encode::split_encoded_dictionary(u64_encoding)?;
 
     let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::Rice)?;
     let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice)?;
@@ -247,6 +249,8 @@ pub fn decode_sequence(
     dictionary: &[(u32, u32, bool)],
     sbwt: &SbwtIndexVariant,
 ) -> Vec<u8> {
+    // TODO this needs to check if the sbwt has select support
+
     let mut sequence: Vec<u8> = Vec::new();
     match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
@@ -272,11 +276,11 @@ pub fn decode_block<R: std::io::Read>(
     _file_header: &HeaderPlaceholder,
     sbwt: &SbwtIndexVariant,
     conn: &mut R,
-) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Vec<u8>>, E> {
     // Colex ranks
     let mut header_bytes_1: [u8; 32] = [0_u8; 32];
     conn.read_exact(&mut header_bytes_1)?;
-    let header_1 = decode_block_header(&header_bytes_1);
+    let header_1 = decode_block_header(&header_bytes_1)?;
 
     let mut bytes_1: Vec<u8> = vec![0; header_1.block_size as usize];
     let _ = conn.read_exact(&mut bytes_1);
@@ -284,7 +288,7 @@ pub fn decode_block<R: std::io::Read>(
     // Match lengths
     let mut header_bytes_2: [u8; 32] = [0; 32];
     let _ = conn.read_exact(&mut header_bytes_2);
-    let header_2 = decode_block_header(&header_bytes_2);
+    let header_2 = decode_block_header(&header_bytes_2)?;
 
     let mut bytes_2: Vec<u8> = vec![0; header_2.block_size as usize];
     let _ = conn.read_exact(&mut bytes_2);
