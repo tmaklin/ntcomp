@@ -100,24 +100,38 @@ pub fn decompress_block(
 }
 
 pub fn zip_block_contents(
-    decompressed_1: &[u64],
-    decompressed_2: &[u64],
-    decompressed_3: &[u64],
+    colex_ranks: &[u64],
+    match_lengths: &[u64],
+    flags: &[u64],
+    bitnuc_codings: &[u64],
 ) -> Result<Vec<u64>, E> {
-    if decompressed_1.len() != decompressed_2.len() {
-        return Err(Box::new(DecodeError{ message: "decompressed_1.len() != decompressed_2.len()".to_owned() }));
+    if colex_ranks.len() != match_lengths.len() {
+        return Err(Box::new(DecodeError{ message: "1".to_owned() }));
+    }
+    if flags.len() - colex_ranks.len() != bitnuc_codings.len() {
+        return Err(Box::new(DecodeError{ message: "2".to_owned() }));
     }
 
-    let res = decompressed_1.iter().zip(decompressed_2.iter()).zip(decompressed_3.iter()).map(|((x, y), z)| {
+    let mut i = 0;
+    let mut j = 0;
+    let res = flags.iter().map(|x| {
+        let flag_bytes = x.to_ne_bytes()[0];
         let mut arr: [u8; 8] = [0; 8];
-        let key_1 = x.to_ne_bytes();
-        let key_2 = [y.to_ne_bytes()[0..3].to_vec(), [0_u8].to_vec()].concat();
-        let key_3 = z.to_ne_bytes()[0];
-        arr[0..4].copy_from_slice(&key_1[0..4]);
-        arr[4..7].copy_from_slice(&key_2[0..3]);
-        arr[7..8].copy_from_slice(&[key_3]);
+        let flag = u8::from_ne_bytes([flag_bytes]);
+        if flag & 0b00000010 == 0b00000000 {
+            let colex_bytes: Vec<u8> = colex_ranks[i].to_ne_bytes()[0..4].to_vec();
+            let matchlen_bytes: Vec<u8> = match_lengths[i].to_ne_bytes()[0..7].to_vec();
+            arr[0..4].copy_from_slice(&colex_bytes[0..4]);
+            arr[4..7].copy_from_slice(&matchlen_bytes[0..3]);
+            i += 1;
+        } else {
+            let bitnuc_bytes: Vec<u8> = bitnuc_codings[j].to_ne_bytes()[0..7].to_vec();
+            arr[0..7].copy_from_slice(&bitnuc_bytes[0..7]);
+            j += 1;
+        }
+        arr[7..8].copy_from_slice(&[flag_bytes]);
         u64::from_ne_bytes(arr)
-    }).collect();
+    }).collect::<Vec<u64>>();
 
     Ok(res)
 }
