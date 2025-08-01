@@ -40,9 +40,9 @@ pub struct BlockHeader {
     pub num_records: u32,
     pub num_u64: u32,
     pub encoded_size: u32,
-    pub rice_param: u8,
+    pub rice_param: u64,
     pub bitpacker_exponent: u8,
-    pub placeholder1: u64,
+    pub placeholder1: u8,
     pub placeholder2: u32,
     pub placeholder3: u16,
     // TODO should store the used codec so others can be used
@@ -237,7 +237,7 @@ pub fn write_block_to<W: std::io::Write>(
 ) -> Result<(), E> {
     let (data_1, data_2, data_3) = encode::split_encoded_dictionary(u64_encoding)?;
 
-    let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::Rice)?;
+    let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::MinimalBinary)?;
     let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice)?;
     let block_3 = encode::compress_block(&data_3, num_records, encode::Codec::Rice)?;
 
@@ -304,7 +304,7 @@ pub fn decode_block<R: std::io::Read>(
     let _ = conn.read_exact(&mut bytes_3);
 
     // Decompress
-    let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::Rice)?;
+    let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::MinimalBinary)?;
     let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
     let decompressed_3 = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
     let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3)?;

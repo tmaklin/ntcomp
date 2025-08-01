@@ -56,7 +56,7 @@ fn deflate_bytes(
 
 fn rice_encode(
     ints: &[u64],
-) -> Result<(Vec<u64>, usize), E> {
+) -> Result<(Vec<u64>, u64), E> {
     let inv_mean: f64 = ((ints.len() as f64).ln() - (ints.iter().sum::<u64>() as f64).ln()).exp();
     let param: usize = dsi_bitstream::codes::rice::log2_b(inv_mean);
 
@@ -69,12 +69,12 @@ fn rice_encode(
 
     writer.flush()?;
 
-    Ok((writer.into_inner()?.into_inner(), param))
+    Ok((writer.into_inner()?.into_inner(), param as u64))
 }
 
 fn minimal_binary_encode(
     ints: &[u64],
-) -> Result<(Vec<u64>, usize), E> {
+) -> Result<(Vec<u64>, u64), E> {
     let param: u64 = *ints.iter().max().ok_or(EncodeError)? + 1;
 
     let word_write = MemWordWriterVec::new(Vec::<u64>::new());
@@ -86,7 +86,7 @@ fn minimal_binary_encode(
 
     writer.flush()?;
 
-    Ok((writer.into_inner()?.into_inner(), param as usize))
+    Ok((writer.into_inner()?.into_inner(), param))
 }
 
 pub fn compress_block(
@@ -110,7 +110,7 @@ pub fn compress_block(
                                     num_records: num_records as u32,
                                     num_u64: u64_encoding.len() as u32,
                                     encoded_size: encoded_data.len() as u32,
-                                    rice_param: param as u8,
+                                    rice_param: param,
                                     bitpacker_exponent: 8_u8,
                                     placeholder1: 0, placeholder2: 0, placeholder3: 0,
     };
