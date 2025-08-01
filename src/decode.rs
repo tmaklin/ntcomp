@@ -102,16 +102,17 @@ pub fn decompress_block(
 pub fn zip_block_contents(
     decompressed_1: &[u64],
     decompressed_2: &[u64],
+    decompressed_3: &[u64],
 ) -> Result<Vec<u64>, E> {
     if decompressed_1.len() != decompressed_2.len() {
         return Err(Box::new(DecodeError{ message: "decompressed_1.len() != decompressed_2.len()".to_owned() }));
     }
 
-    let res = decompressed_1.iter().zip(decompressed_2.iter()).map(|(x, y)| {
+    let res = decompressed_1.iter().zip(decompressed_2.iter()).zip(decompressed_3.iter()).map(|((x, y), z)| {
         let mut arr: [u8; 8] = [0; 8];
         let key_1 = x.to_ne_bytes();
         let key_2 = [y.to_ne_bytes()[0..3].to_vec(), [0_u8].to_vec()].concat();
-        let key_3 = y.to_ne_bytes()[3];
+        let key_3 = z.to_ne_bytes()[0];
         arr[0..4].copy_from_slice(&key_1[0..4]);
         arr[4..7].copy_from_slice(&key_2[0..3]);
         arr[7..8].copy_from_slice(&[key_3]);

@@ -147,7 +147,7 @@ pub fn encode_dictionary(
 
 pub fn split_encoded_dictionary(
     encoding: &[u64],
-) -> Result<(Vec<u64>, Vec<u64>), E> {
+) -> Result<(Vec<u64>, Vec<u64>, Vec<u64>), E> {
     if encoding.is_empty() {
         return Err(Box::new(EncodeError{}));
     }
@@ -160,10 +160,16 @@ pub fn split_encoded_dictionary(
     }).collect();
     let data_2: Vec<u64> = encoding.iter().map(|x| {
         let mut arr: [u8; 8] = [0; 8];
-        let key: Vec<u8> = x.to_ne_bytes()[4..8].to_vec();
-        arr[0..4].copy_from_slice(&key);
+        let key: Vec<u8> = x.to_ne_bytes()[4..7].to_vec();
+        arr[0..3].copy_from_slice(&key);
+        u64::from_ne_bytes(arr)
+    }).collect();
+    let data_3: Vec<u64> = encoding.iter().map(|x| {
+        let mut arr: [u8; 8] = [0; 8];
+        let key: Vec<u8> = x.to_ne_bytes()[7..8].to_vec();
+        arr[0..1].copy_from_slice(&key);
         u64::from_ne_bytes(arr)
     }).collect();
 
-    Ok((data_1, data_2))
+    Ok((data_1, data_2, data_3))
 }

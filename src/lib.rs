@@ -235,13 +235,15 @@ pub fn write_block_to<W: std::io::Write>(
     num_records: usize,
     sink: &mut W,
 ) -> Result<(), E> {
-    let (data_1, data_2) = encode::split_encoded_dictionary(u64_encoding)?;
+    let (data_1, data_2, data_3) = encode::split_encoded_dictionary(u64_encoding)?;
 
     let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::Rice)?;
     let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice)?;
+    let block_3 = encode::compress_block(&data_3, num_records, encode::Codec::Rice)?;
 
     sink.write_all(&block_1)?;
     sink.write_all(&block_2)?;
+    sink.write_all(&block_3)?;
     Ok(())
 }
 
@@ -293,10 +295,19 @@ pub fn decode_block<R: std::io::Read>(
     let mut bytes_2: Vec<u8> = vec![0; header_2.block_size as usize];
     let _ = conn.read_exact(&mut bytes_2);
 
+    // Flags
+    let mut header_bytes_3: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_3);
+    let header_3 = decode_block_header(&header_bytes_3)?;
+
+    let mut bytes_3: Vec<u8> = vec![0; header_3.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_3);
+
     // Decompress
     let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::Rice)?;
     let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
-    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2)?;
+    let decompressed_3 = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
+    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3)?;
 
     let dictionary = decode::decode_dictionary(&decompressed);
 
