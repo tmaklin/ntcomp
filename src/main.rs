@@ -156,21 +156,23 @@ fn main() {
 
             info!("Encoding fastX data...");
             let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
-            let mut u64_encoding: Vec<u64> = Vec::new();
+            let mut dictionaries: Vec<Vec<(usize, std::ops::Range<usize>)>> = Vec::new();
             let mut num_records = 0;
 
             while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                u64_encoding.append(&mut ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap());
+                dictionaries.push(ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap());
 
                 if num_records % block_size == 0 {
+                    let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
                     let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut stdout);
-                    u64_encoding.clear();
+                    dictionaries.clear();
                 }
             }
             if num_records % block_size != 0 {
+                let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
                 let _ = ntcomp::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
             }
 

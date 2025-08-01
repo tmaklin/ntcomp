@@ -164,7 +164,7 @@ pub fn encode_sequence(
     nucleotides: &[u8],
     sbwt: &SbwtIndexVariant,
     lcs: &LcsArray,
-) -> Result<Vec<u64>, E> {
+) -> Result<Vec<(usize, Range<usize>)>, E> {
     let n = nucleotides.len();
     let dictionary: Vec<(usize, Range<usize>)> = match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
@@ -226,8 +226,7 @@ pub fn encode_sequence(
     assert!(dictionary_max < 16777216); // Match lengths are coded as 24 bit unsigned integers
     assert_eq!(dictionary_bases, nucleotides.len());
 
-    let res = encode::encode_dictionary(&dictionary)?;
-    Ok(res)
+    Ok(dictionary)
 }
 
 pub fn write_block_to<W: std::io::Write>(

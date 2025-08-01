@@ -63,18 +63,20 @@ fn random_fasta_data() {
     let header_bytes = encode_file_header(0,0,0,0).unwrap();
     let _ = buf.write_all(&header_bytes);
 
-    let mut u64_encoding: Vec<u64> = Vec::new();
+    let mut dictionaries: Vec<Vec<(usize, std::ops::Range<usize>)>> = Vec::new();
     let mut num_records = 0;
     contigs.iter().for_each(|nucleotides| {
         num_records += 1;
-        u64_encoding.append(&mut encode_sequence(&nucleotides, &sbwt, &lcs).unwrap());
+        dictionaries.push(ntcomp::encode_sequence(&nucleotides, &sbwt, &lcs).unwrap());
 
         if num_records % block_size == 0 {
+            let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
             let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut buf);
-            u64_encoding.clear();
+            dictionaries.clear();
         }
     });
-    if !u64_encoding.is_empty() {
+    if !dictionaries.is_empty() {
+        let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
         let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut buf);
     }
     let _ = buf.rewind();
