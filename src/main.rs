@@ -20,13 +20,6 @@ use log::info;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 
-use ntcomp::decode;
-use ntcomp::encode_file_header;
-use ntcomp::decode_file_header;
-use ntcomp::decode_block_header;
-use ntcomp::decode_sequence;
-use ntcomp::encode_sequence;
-
 mod cli;
 
 /// Initializes the logger with verbosity given in `log_max_level`.
@@ -158,7 +151,7 @@ fn main() {
             // Number of records to store in each block
             let block_size = 65536;
 
-            let header_bytes = encode_file_header(0,0,0,0).unwrap();
+            let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
             let _ = stdout.write_all(&header_bytes);
 
             info!("Encoding fastX data...");
@@ -170,7 +163,7 @@ fn main() {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                u64_encoding.append(&mut encode_sequence(&seqrec, &sbwt, &lcs));
+                u64_encoding.append(&mut ntcomp::encode_sequence(&seqrec, &sbwt, &lcs));
 
                 if num_records % block_size == 0 {
                     let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut stdout);
@@ -200,7 +193,7 @@ fn main() {
             // File header
             let mut header_bytes: [u8; 32] = [0_u8; 32];
             let _ = conn.read_exact(&mut header_bytes);
-            let _file_header = decode_file_header(&header_bytes);
+            let _file_header = ntcomp::decode_file_header(&header_bytes);
 
             info!("Decoding encoded data...");
             let mut i = 0;
