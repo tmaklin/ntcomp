@@ -22,6 +22,8 @@ use dsi_bitstream::traits::BE;
 use dsi_bitstream::codes::RiceWrite;
 use dsi_bitstream::codes::MinimalBinaryWrite;
 
+use sbwt::SbwtIndexVariant;
+
 use crate::BlockHeader;
 use crate::encode_block_header;
 
@@ -124,22 +126,38 @@ pub fn compress_block(
 
 pub fn encode_dictionary(
     dictionary: &[(usize, std::ops::Range<usize>)],
+    sbwt: &SbwtIndexVariant,
 ) -> Result<Vec<u64>, E> {
     if dictionary.is_empty() {
         return Err(Box::new(EncodeError{}));
     }
 
+    let bitnuc_threshold = 11;
+
     let mut first: bool = true;
     let mut u64_encoding: Vec<u64> = Vec::with_capacity(dictionary.len());
+    match sbwt {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => {
+    let k = sbwt.k();
     dictionary.iter().for_each(|matches| {
         let mut arr: [u8; 8] = [0; 8];
-        arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-        arr[4..7].copy_from_slice(&(matches.0 as u32).to_ne_bytes()[0..3]);
-        arr[7..8].copy_from_slice(&(first as u8).to_ne_bytes());
+        if matches.0 > bitnuc_threshold {
+            arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
+            arr[4..7].copy_from_slice(&(matches.0 as u32).to_ne_bytes()[0..3]);
+            arr[7..8].copy_from_slice(&(first as u8).to_ne_bytes());
+        } else {
+            let kmer = sbwt.access_kmer(matches.1.start);
+            let seq = kmer[(k - matches.0)..k].to_vec();
+            let len = seq.len() as u8;
+            arr[0..7].copy_from_slice(&bitnuc::as_2bit(&seq).unwrap().to_ne_bytes()[0..7]);
+            arr[7..8].copy_from_slice(&((first as u8 + 2) | len << 2).to_ne_bytes());
+        }
 
         u64_encoding.push(u64::from_ne_bytes(arr));
         if first { first = false };
     });
+        },
+    }
 
     u64_encoding.shrink_to_fit();
     Ok(u64_encoding)
@@ -147,29 +165,54 @@ pub fn encode_dictionary(
 
 pub fn split_encoded_dictionary(
     encoding: &[u64],
-) -> Result<(Vec<u64>, Vec<u64>, Vec<u64>), E> {
+) -> Result<(Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>), E> {
     if encoding.is_empty() {
         return Err(Box::new(EncodeError{}));
     }
 
-    let data_1: Vec<u64> = encoding.iter().map(|x| {
+    let data_1: Vec<u64> = encoding.iter().filter_map(|x| {
         let mut arr: [u8; 8] = [0; 8];
-        let key: Vec<u8> = x.to_ne_bytes()[0..4].to_vec();
-        arr[0..4].copy_from_slice(&key);
-        u64::from_ne_bytes(arr)
+        let bytes = x.to_ne_bytes();
+        if bytes[7] & 0b00000010 == 0b00000000 {
+            let key: Vec<u8> = bytes[0..4].to_vec();
+            arr[0..4].copy_from_slice(&key);
+            Some(u64::from_ne_bytes(arr))
+        } else {
+            None
+        }
     }).collect();
-    let data_2: Vec<u64> = encoding.iter().map(|x| {
+
+    let data_2: Vec<u64> = encoding.iter().filter_map(|x| {
         let mut arr: [u8; 8] = [0; 8];
-        let key: Vec<u8> = x.to_ne_bytes()[4..7].to_vec();
-        arr[0..3].copy_from_slice(&key);
-        u64::from_ne_bytes(arr)
+        let bytes = x.to_ne_bytes();
+        if bytes[7] & 0b00000010 == 0b00000000 {
+            let key: Vec<u8> = bytes[4..7].to_vec();
+            arr[0..3].copy_from_slice(&key);
+            Some(u64::from_ne_bytes(arr))
+        } else {
+            None
+        }
     }).collect();
+
     let data_3: Vec<u64> = encoding.iter().map(|x| {
+        let bytes = x.to_ne_bytes();
         let mut arr: [u8; 8] = [0; 8];
-        let key: Vec<u8> = x.to_ne_bytes()[7..8].to_vec();
+        let key: Vec<u8> = bytes[7..8].to_vec();
         arr[0..1].copy_from_slice(&key);
         u64::from_ne_bytes(arr)
     }).collect();
 
-    Ok((data_1, data_2, data_3))
+    let data_4: Vec<u64> = encoding.iter().filter_map(|x| {
+        let mut arr: [u8; 8] = [0; 8];
+        let bytes = x.to_ne_bytes();
+        if bytes[7] & 0b00000010 == 0b00000010 {
+            let key: Vec<u8> = bytes[0..7].to_vec();
+            arr[0..7].copy_from_slice(&key);
+            Some(u64::from_ne_bytes(arr))
+        } else {
+            None
+        }
+    }).collect();
+
+    Ok((data_1, data_2, data_3, data_4))
 }

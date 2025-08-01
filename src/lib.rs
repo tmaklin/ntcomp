@@ -234,43 +234,88 @@ pub fn write_block_to<W: std::io::Write>(
     num_records: usize,
     sink: &mut W,
 ) -> Result<(), E> {
-    let (data_1, data_2, data_3) = encode::split_encoded_dictionary(u64_encoding)?;
+    let (data_1, data_2, data_3, data_4) = encode::split_encoded_dictionary(u64_encoding)?;
+
+    assert_eq!(data_1.len(), data_2.len());
+    assert_eq!(data_3.len(), u64_encoding.len());
+    assert_eq!(u64_encoding.len() - data_1.len(), data_4.len());
 
     let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::MinimalBinary)?;
     let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice)?;
     let block_3 = encode::compress_block(&data_3, num_records, encode::Codec::Rice)?;
+    let block_4 = encode::compress_block(&data_4, num_records, encode::Codec::Rice)?;
 
     sink.write_all(&block_1)?;
     sink.write_all(&block_2)?;
     sink.write_all(&block_3)?;
+    sink.write_all(&block_4)?;
     Ok(())
 }
 
 pub fn decode_sequence(
-    dictionary: &[(u32, u32, bool)],
+    encoding: &[u64],
     sbwt: &SbwtIndexVariant,
-) -> Vec<u8> {
+) -> Vec<Vec<u8>> {
     // TODO this needs to check if the sbwt has select support
 
+    let mut sequences: Vec<Vec<u8>> = Vec::new();
     let mut sequence: Vec<u8> = Vec::new();
     match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
             let k = sbwt.k();
-            dictionary.iter().for_each(|record| {
-                let (suffix_len, colex_rank, _) = *record;
-                let kmer = if suffix_len > k as u32 {
-                    let kmer = sbwt.access_kmer(colex_rank as usize);
-                    let new_kmer = left_extend_kmer2(&kmer, sbwt, (suffix_len - k as u32) as usize);
-                    assert_eq!(new_kmer.len(), suffix_len as usize);
-                    new_kmer
+            let mut bases: usize = 0;
+            encoding.iter().rev().for_each(|record| {
+                let bytes: Vec<u8> = record.to_ne_bytes()[0..8].to_vec();
+                let mut arr: [u8; 8] = [0; 8];
+                arr[0..8].copy_from_slice(&bytes);
+                let flags = bytes[7];
+                let flag = u8::from_ne_bytes([flags]);
+                let first: bool = (flag & 0b00000001) == 0b00000001;
+                if flag & 0b00000010 == 0b00000000 {
+                    let mut arr1: [u8; 4] = [0; 4];
+                    let mut arr2: [u8; 4] = [0; 4];
+                    let mut arr3: [u8; 1] = [0; 1];
+
+                    arr1.copy_from_slice(&arr[0..4]);
+                    arr2[0..3].copy_from_slice(&arr[4..7]);
+                    arr3.copy_from_slice(&arr[7..8]);
+                    let colex_rank = u32::from_ne_bytes(arr1);
+                    let suffix_len = u32::from_ne_bytes(arr2);
+                    bases += suffix_len as usize;
+
+                    let kmer = if suffix_len > k as u32 {
+                        let kmer = sbwt.access_kmer(colex_rank as usize);
+                        let new_kmer = left_extend_kmer2(&kmer, sbwt, (suffix_len - k as u32) as usize);
+                        assert_eq!(new_kmer.len(), suffix_len as usize);
+                        new_kmer
+                    } else {
+                        sbwt.access_kmer(colex_rank as usize)
+                    };
+
+                    sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter());
                 } else {
-                    sbwt.access_kmer(colex_rank as usize)
-                };
-                sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter().rev());
+                    let length: usize = ((flag & 0b11111100) >> 2) as usize;
+
+                    let mut arr1: [u8; 8] = [0; 8];
+                    arr1[0..7].copy_from_slice(&bytes[0..7]);
+
+                    let bitnucs = u64::from_ne_bytes(arr1);
+                    let mut kmer: Vec<u8> = Vec::new();
+                    let _ = bitnuc::from_2bit(bitnucs, length, &mut kmer);
+                    bases += kmer.len();
+                    sequence.extend(kmer.iter());
+                }
+
+                if first {
+                    bases = 0;
+                    sequences.push(sequence.clone());
+                    sequence.clear();
+                }
             });
         },
     }
-    sequence.into_iter().rev().collect()
+
+    sequences.into_iter().rev().collect()
 }
 
 pub fn decode_block<R: std::io::Read>(
@@ -302,17 +347,22 @@ pub fn decode_block<R: std::io::Read>(
     let mut bytes_3: Vec<u8> = vec![0; header_3.block_size as usize];
     let _ = conn.read_exact(&mut bytes_3);
 
+    // Bitnuc coded data
+    let mut header_bytes_4: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_4);
+    let header_4 = decode_block_header(&header_bytes_4)?;
+
+    let mut bytes_4: Vec<u8> = vec![0; header_4.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_4);
+
     // Decompress
     let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::MinimalBinary)?;
     let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
     let decompressed_3 = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
-    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3)?;
+    let decompressed_4 = decode::decompress_block(&bytes_4, &header_4, crate::encode::Codec::Rice)?;
+    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3, &decompressed_4)?;
 
-    let dictionary = decode::decode_dictionary(&decompressed);
-
-    let decoded: Vec<Vec<u8>> = dictionary.iter().rev().map(|item| {
-        decode_sequence(item, sbwt)
-    }).collect();
+    let decoded = decode_sequence(&decompressed, sbwt);
 
     Ok(decoded)
 }

@@ -31,7 +31,6 @@ fn random_fasta_data() {
     use std::io::Read;
     use std::io::Seek;
     use std::io::Write;
-    use ntcomp::encode_sequence;
     use ntcomp::encode_file_header;
     use ntcomp::decode_file_header;
 
@@ -70,15 +69,16 @@ fn random_fasta_data() {
         dictionaries.push(ntcomp::encode_sequence(&nucleotides, &sbwt, &lcs).unwrap());
 
         if num_records % block_size == 0 {
-            let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
-            let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut buf);
+            let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
+            let _ = ntcomp::write_block_to(&u64_encoding, block_size, &mut buf);
             dictionaries.clear();
         }
     });
     if !dictionaries.is_empty() {
-        let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
-        let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut buf);
+        let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
+        let _ = ntcomp::write_block_to(&u64_encoding, num_records % block_size, &mut buf);
     }
+    let _ = buf.flush();
     let _ = buf.rewind();
 
     // File header
@@ -90,7 +90,6 @@ fn random_fasta_data() {
     let mut total_bases = 0;
     while let Ok(records) = ntcomp::decode_block(&_file_header, &sbwt, &mut buf) {
         records.iter().for_each(|nucleotides| {
-            eprintln!("{},{},{}", nucleotides.len(), contigs[i].len(), i);
             assert_eq!(*nucleotides, contigs[i]);
             total_bases += nucleotides.len();
             i += 1;

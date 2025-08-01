@@ -166,13 +166,13 @@ fn main() {
                 dictionaries.push(ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap());
 
                 if num_records % block_size == 0 {
-                    let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
-                    let _ = ntcomp::write_block_to(&u64_encoding, num_records, &mut stdout);
+                    let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
+                    let _ = ntcomp::write_block_to(&u64_encoding, block_size, &mut stdout);
                     dictionaries.clear();
                 }
             }
             if num_records % block_size != 0 {
-                let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x).unwrap()).collect::<Vec<u64>>();
+                let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
                 let _ = ntcomp::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
             }
 
