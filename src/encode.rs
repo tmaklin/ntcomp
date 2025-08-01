@@ -75,7 +75,7 @@ fn rice_encode(
 fn minimal_binary_encode(
     ints: &[u64],
 ) -> Result<(Vec<u64>, usize), E> {
-    let param: u64 = *ints.iter().max().ok_or(EncodeError)?;
+    let param: u64 = *ints.iter().max().ok_or(EncodeError)? + 1;
 
     let word_write = MemWordWriterVec::new(Vec::<u64>::new());
     let mut writer = BufBitWriter::<BE, _>::new(word_write);
