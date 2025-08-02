@@ -71,7 +71,7 @@ fn minimal_binary_decode(
 
     let mut decoded: Vec<u64> = vec![0; n_records];
     for i in 0..n_records {
-        decoded[i] = reader.read_minimal_binary(param)?;
+        decoded[i] = reader.read_minimal_binary(param)? - 1;
     }
     Ok(decoded)
 }
@@ -108,9 +108,18 @@ pub fn zip_block_contents(
     if colex_ranks.len() != match_lengths.len() {
         return Err(Box::new(DecodeError{ message: "1".to_owned() }));
     }
-    if flags.len() - colex_ranks.len() != bitnuc_codings.len() {
-        return Err(Box::new(DecodeError{ message: "2".to_owned() }));
-    }
+
+    let bitnuc_len: u64 = flags.iter().map(|x| ((x.to_ne_bytes()[0] & 0b11111100) >> 2) as u64).sum();
+    let bitnuc_vals: Vec<u8> = bitnuc_codings.iter().enumerate().flat_map(|(idx, bitnucs)| {
+        let len = if idx + 1 == bitnuc_codings.len() {
+            bitnuc_len % 31
+        } else {
+            31
+        };
+        let mut kmer: Vec<u8> = Vec::new();
+        bitnuc::from_2bit(*bitnucs, len as usize, &mut kmer).unwrap();
+        kmer
+    }).collect();
 
     let mut i = 0;
     let mut j = 0;
@@ -125,9 +134,12 @@ pub fn zip_block_contents(
             arr[4..7].copy_from_slice(&matchlen_bytes[0..3]);
             i += 1;
         } else {
-            let bitnuc_bytes: Vec<u8> = bitnuc_codings[j].to_ne_bytes()[0..7].to_vec();
+            let length: usize = ((flag & 0b11111100) >> 2) as usize;
+            let seq: Vec<u8> = bitnuc_vals[j..(j + length)].to_vec();
+            j += length;
+            let bytes = bitnuc::as_2bit(&seq).unwrap();
+            let bitnuc_bytes = bytes.to_ne_bytes();
             arr[0..7].copy_from_slice(&bitnuc_bytes[0..7]);
-            j += 1;
         }
         arr[7..8].copy_from_slice(&[flag_bytes]);
         u64::from_ne_bytes(arr)

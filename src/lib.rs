@@ -238,12 +238,11 @@ pub fn write_block_to<W: std::io::Write>(
 
     assert_eq!(data_1.len(), data_2.len());
     assert_eq!(data_3.len(), u64_encoding.len());
-    assert_eq!(u64_encoding.len() - data_1.len(), data_4.len());
 
     let block_1 = encode::compress_block(&data_1, num_records, encode::Codec::MinimalBinary)?;
     let block_2 = encode::compress_block(&data_2, num_records, encode::Codec::Rice)?;
     let block_3 = encode::compress_block(&data_3, num_records, encode::Codec::Rice)?;
-    let block_4 = encode::compress_block(&data_4, num_records, encode::Codec::Rice)?;
+    let block_4 = encode::compress_block(&data_4, num_records, encode::Codec::MinimalBinary)?;
 
     sink.write_all(&block_1)?;
     sink.write_all(&block_2)?;
@@ -359,7 +358,8 @@ pub fn decode_block<R: std::io::Read>(
     let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::MinimalBinary)?;
     let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
     let decompressed_3 = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
-    let decompressed_4 = decode::decompress_block(&bytes_4, &header_4, crate::encode::Codec::Rice)?;
+    let decompressed_4 = decode::decompress_block(&bytes_4, &header_4, crate::encode::Codec::MinimalBinary)?;
+
     let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3, &decompressed_4)?;
 
     let decoded = decode_sequence(&decompressed, sbwt);

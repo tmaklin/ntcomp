@@ -77,13 +77,15 @@ fn rice_encode(
 fn minimal_binary_encode(
     ints: &[u64],
 ) -> Result<(Vec<u64>, u64), E> {
-    let param: u64 = *ints.iter().max().ok_or(EncodeError)? + 1;
+    let param: u64 = *ints.iter().max().ok_or(EncodeError)?;
+    assert!(param < u64::MAX - 2);
+    let param = if param > u64::MAX - 2 { u64::MAX } else { param + 2 };
 
     let word_write = MemWordWriterVec::new(Vec::<u64>::new());
     let mut writer = BufBitWriter::<BE, _>::new(word_write);
 
     for n in ints {
-        writer.write_minimal_binary(*n, param)?;
+        writer.write_minimal_binary(*n + 1, param)?;
     }
 
     writer.flush()?;
@@ -202,16 +204,25 @@ pub fn split_encoded_dictionary(
         u64::from_ne_bytes(arr)
     }).collect();
 
-    let data_4: Vec<u64> = encoding.iter().filter_map(|x| {
-        let mut arr: [u8; 8] = [0; 8];
+    let mut tmp: Vec<u8> = Vec::new();
+    let mut checksum = 0;
+    encoding.iter().for_each(|x| {
         let bytes = x.to_ne_bytes();
         if bytes[7] & 0b00000010 == 0b00000010 {
-            let key: Vec<u8> = bytes[0..7].to_vec();
-            arr[0..7].copy_from_slice(&key);
-            Some(u64::from_ne_bytes(arr))
-        } else {
-            None
+            let length: usize = ((bytes[7] & 0b11111100) >> 2) as usize;
+            checksum += length;
+
+            let mut arr1: [u8; 8] = [0; 8];
+            arr1[0..7].copy_from_slice(&bytes[0..7]);
+
+            let bitnucs = u64::from_ne_bytes(arr1);
+            let mut kmer: Vec<u8> = Vec::new();
+            bitnuc::from_2bit(bitnucs, length, &mut kmer).unwrap();
+            tmp.extend(kmer[0..length].iter());
         }
+    });
+    let data_4: Vec<u64> = tmp.chunks(31).map(|chunk| {
+        bitnuc::as_2bit(chunk).unwrap()
     }).collect();
 
     Ok((data_1, data_2, data_3, data_4))
