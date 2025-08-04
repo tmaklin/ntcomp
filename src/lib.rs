@@ -23,6 +23,7 @@ use sbwt::SbwtIndexVariant;
 
 pub mod encode;
 pub mod decode;
+pub mod delta_encode;
 
 type E = Box<dyn std::error::Error>;
 

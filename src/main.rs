@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use log::info;
+use kbo::variant_calling::Variant;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 
@@ -159,21 +160,35 @@ fn main() {
             let mut dictionaries: Vec<Vec<(usize, std::ops::Range<usize>)>> = Vec::new();
             let mut num_records = 0;
 
+            let mut variants: Vec<Variant> = Vec::new();
             while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                dictionaries.push(ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap());
+                let (edited, mut deltas) = ntcomp::delta_encode::compute_deltas(&seqrec, &sbwt, &lcs);
+                variants.append(&mut deltas);
+
+                dictionaries.push(ntcomp::encode_sequence(&edited, &sbwt, &lcs).unwrap());
 
                 if num_records % block_size == 0 {
                     let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
                     let _ = ntcomp::write_block_to(&u64_encoding, block_size, &mut stdout);
                     dictionaries.clear();
+
+                    let deltas_block = ntcomp::delta_encode::encode(&variants);
+                    let _ = stdout.write_all(&deltas_block);
+
+                    variants.clear()
                 }
             }
             if num_records % block_size != 0 {
                 let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
                 let _ = ntcomp::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
+
+                if !variants.is_empty() {
+                    let deltas_block = ntcomp::delta_encode::encode(&variants);
+                    let _ = stdout.write_all(&deltas_block);
+                }
             }
 
             let _ = stdout.flush();
