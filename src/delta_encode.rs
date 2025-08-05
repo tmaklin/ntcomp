@@ -52,8 +52,30 @@ pub fn encode(
     blocks
 }
 
+pub fn decode(
+    positions: &[u64],
+    q_bitnucs: &[u64],
+    r_lens: &[u64],
+    q_lens: &[u64],
+) -> Vec<Variant> {
+    let bitnuc_len = q_lens.iter().sum::<u64>();
+    let bitnuc_vals: Vec<u8> = q_bitnucs.iter().enumerate().flat_map(|(idx, bitnucs)| {
+        let len = if idx + 1 == q_bitnucs.len() {
+            bitnuc_len % 31
+        } else {
+            31
+        };
+        let mut kmer: Vec<u8> = Vec::new();
+        bitnuc::from_2bit(*bitnucs, len as usize, &mut kmer).unwrap();
+        kmer
+    }).collect();
 
-    block1.extend(block2.iter());
-    block1.extend(block3.iter());
-    block1
+    let mut j = 0;
+    let res: Vec<Variant> = q_lens.iter().enumerate().map(|(idx, length)| {
+        let q_nts: Vec<u8> = bitnuc_vals[j..(j + *length as usize)].to_vec();
+        j += *length as usize;
+        Variant{ query_chars: q_nts, ref_chars: vec![0_u8; r_lens[idx] as usize], query_pos: positions[idx] as usize }
+    }).collect::<Vec<Variant>>();
+
+    res
 }
