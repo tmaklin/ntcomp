@@ -11,6 +11,9 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
+use crate::encode::Codec;
+use crate::encode::compress_block;
+
 use kbo::variant_calling::Variant;
 
 use sbwt::LcsArray;
@@ -34,41 +37,21 @@ pub fn compute_deltas(
 pub fn encode(
     variants: &[Variant],
 ) -> Vec<u8> {
-    // The different lenght variants take a lot of space for some reason
-    let variants: Vec<Variant> = variants.iter().filter_map(|x| {
-        if x.ref_chars.is_empty() || x.query_chars.is_empty() || x.ref_chars.len() == x.query_chars.len() {
-            Some(x.clone())
-        } else {
-            None
-        }
-    }).collect();
-
     let positions: Vec<u64> = variants.iter().map(|x| x.query_pos as u64).collect();
     let q_nts: Vec<u8> = variants.iter().flat_map(|x| x.query_chars.clone()).collect();
     let r_lens: Vec<u64> = variants.iter().map(|x| x.ref_chars.len() as u64).collect();
+    let q_lens: Vec<u64> = variants.iter().map(|x| x.query_chars.len() as u64).collect();
 
-    let enc1 = crate::encode::rice_encode(&positions).unwrap().0;
     let q_bitnucs: Vec<u64> = q_nts.chunks(31).map(|x| bitnuc::as_2bit(x).unwrap()).collect();
-    let enc2 = crate::encode::minimal_binary_encode(&q_bitnucs).unwrap().0;
-    let enc3 = crate::encode::rice_encode(&r_lens).unwrap().0;
 
-    let mut block1: Vec<u8> = crate::encode::deflate_bytes(&enc1.iter().flat_map(|x| {
-        let mut arr: [u8; 8] = [0; 8];
-        arr.copy_from_slice(&x.to_ne_bytes()[0..8]);
-        arr
-    }).collect::<Vec<u8>>()).unwrap();
+    let mut blocks = compress_block(&positions, variants.len(), Codec::Rice).unwrap();
+    blocks.extend(compress_block(&q_bitnucs, variants.len(), Codec::MinimalBinary).unwrap().iter());
+    blocks.extend(compress_block(&r_lens, variants.len(), Codec::Rice).unwrap().iter());
+    blocks.extend(compress_block(&q_lens, variants.len(), Codec::Rice).unwrap().iter());
 
-    let block2: Vec<u8> = crate::encode::deflate_bytes(&enc2.iter().flat_map(|x| {
-        let mut arr: [u8; 8] = [0; 8];
-        arr.copy_from_slice(&x.to_ne_bytes()[0..8]);
-        arr
-    }).collect::<Vec<u8>>()).unwrap();
+    blocks
+}
 
-    let block3: Vec<u8> = crate::encode::deflate_bytes(&enc3.iter().flat_map(|x| {
-        let mut arr: [u8; 8] = [0; 8];
-        arr.copy_from_slice(&x.to_ne_bytes()[0..8]);
-        arr
-    }).collect::<Vec<u8>>()).unwrap();
 
     block1.extend(block2.iter());
     block1.extend(block3.iter());
