@@ -17,6 +17,8 @@ use bincode::{Encode, Decode};
 use bincode::encode_into_std_write;
 use bincode::decode_from_slice;
 
+use kbo::variant_calling::Variant;
+
 use sbwt::LcsArray;
 use sbwt::StreamingIndex;
 use sbwt::SbwtIndexVariant;
@@ -355,15 +357,74 @@ pub fn decode_block<R: std::io::Read>(
     let mut bytes_4: Vec<u8> = vec![0; header_4.block_size as usize];
     let _ = conn.read_exact(&mut bytes_4);
 
+    // Variants
+    // Positions
+    let mut header_bytes_5: [u8; 32] = [0_u8; 32];
+    conn.read_exact(&mut header_bytes_5)?;
+    let header_5 = decode_block_header(&header_bytes_5)?;
+
+    let mut bytes_5: Vec<u8> = vec![0; header_5.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_5);
+
+    // Query chars
+    let mut header_bytes_6: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_6);
+    let header_6 = decode_block_header(&header_bytes_6)?;
+
+    let mut bytes_6: Vec<u8> = vec![0; header_6.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_6);
+
+    // Ref variant lengths
+    let mut header_bytes_7: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_7);
+    let header_7 = decode_block_header(&header_bytes_7)?;
+
+    let mut bytes_7: Vec<u8> = vec![0; header_7.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_7);
+
+    // Query variant lengths
+    let mut header_bytes_8: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_8);
+    let header_8 = decode_block_header(&header_bytes_8)?;
+
+    let mut bytes_8: Vec<u8> = vec![0; header_8.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_8);
+
+    // Num variants per seq record
+    let mut header_bytes_9: [u8; 32] = [0; 32];
+    let _ = conn.read_exact(&mut header_bytes_9);
+    let header_9 = decode_block_header(&header_bytes_9)?;
+
+    let mut bytes_9: Vec<u8> = vec![0; header_9.block_size as usize];
+    let _ = conn.read_exact(&mut bytes_9);
+
+
     // Decompress
     let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::MinimalBinary)?;
     let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
     let decompressed_3 = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
     let decompressed_4 = decode::decompress_block(&bytes_4, &header_4, crate::encode::Codec::MinimalBinary)?;
 
-    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3, &decompressed_4)?;
+    let decompressed_5 = decode::decompress_block(&bytes_5, &header_5, crate::encode::Codec::Rice)?;
+    let decompressed_6 = decode::decompress_block(&bytes_6, &header_6, crate::encode::Codec::MinimalBinary)?;
+    let decompressed_7= decode::decompress_block(&bytes_7, &header_7, crate::encode::Codec::Rice)?;
+    let decompressed_8 = decode::decompress_block(&bytes_8, &header_8, crate::encode::Codec::Rice)?;
+    let decompressed_9 = decode::decompress_block(&bytes_9, &header_9, crate::encode::Codec::Rice)?;
 
-    let decoded = decode_sequence(&decompressed, sbwt);
+    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3, &decompressed_4)?;
+    let variants: Vec<Variant> = delta_encode::decode(&decompressed_5, &decompressed_6, &decompressed_7, &decompressed_8);
+
+    let mut decoded = decode_sequence(&decompressed, sbwt);
+
+    assert_eq!(decoded.len(), decompressed_9.len());
+
+    let mut i: usize = 0;
+    decoded = decompressed_9.iter().enumerate().map(|(idx, num_variants)| {
+        let seq_variants = variants[i..(i + *num_variants as usize)].to_vec();
+        let seq = kbo::variant_calling::revert_edits(&decoded[idx], &seq_variants);
+        i += *num_variants as usize;
+        seq
+    }).collect();
 
     Ok(decoded)
 }
