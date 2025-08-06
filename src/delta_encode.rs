@@ -35,12 +35,14 @@ pub fn compute_deltas(
 }
 
 pub fn encode(
-    variants: &[Variant],
+    variants_v: &[Vec<Variant>],
 ) -> Vec<u8> {
+    let variants: Vec<Variant> = variants_v.iter().cloned().flatten().collect();
     let positions: Vec<u64> = variants.iter().map(|x| x.query_pos as u64).collect();
     let q_nts: Vec<u8> = variants.iter().flat_map(|x| x.query_chars.clone()).collect();
     let r_lens: Vec<u64> = variants.iter().map(|x| x.ref_chars.len() as u64).collect();
     let q_lens: Vec<u64> = variants.iter().map(|x| x.query_chars.len() as u64).collect();
+    let num_records: Vec<u64> = variants_v.iter().map(|x| x.len() as u64).collect();
 
     let q_bitnucs: Vec<u64> = q_nts.chunks(31).map(|x| bitnuc::as_2bit(x).unwrap()).collect();
 
@@ -48,6 +50,7 @@ pub fn encode(
     blocks.extend(compress_block(&q_bitnucs, variants.len(), Codec::MinimalBinary).unwrap().iter());
     blocks.extend(compress_block(&r_lens, variants.len(), Codec::Rice).unwrap().iter());
     blocks.extend(compress_block(&q_lens, variants.len(), Codec::Rice).unwrap().iter());
+    blocks.extend(compress_block(&num_records, num_records.len(), Codec::Rice).unwrap().iter());
 
     blocks
 }

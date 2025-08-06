@@ -160,13 +160,13 @@ fn main() {
             let mut dictionaries: Vec<Vec<(usize, std::ops::Range<usize>)>> = Vec::new();
             let mut num_records = 0;
 
-            let mut variants: Vec<Variant> = Vec::new();
+            let mut variants: Vec<Vec<Variant>> = Vec::new();
             while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
                 let (edited, mut deltas) = ntcomp::delta_encode::compute_deltas(&seqrec, &sbwt, &lcs);
-                variants.append(&mut deltas);
+                variants.push(deltas);
 
                 dictionaries.push(ntcomp::encode_sequence(&edited, &sbwt, &lcs).unwrap());
 
