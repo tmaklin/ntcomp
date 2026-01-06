@@ -7,8 +7,8 @@ authors = [
 ]
 description = "Sequencing data compression using SBWT and k-bounded matching statistics."
 readme = "README.md"
-homepage = "https://github.com/tmaklin/ntcomp"
-repository = "https://github.com/tmaklin/ntcomp"
+## homepage = "https://github.com/tmaklin/ntcomp"
+repository = "https://codeberg.org/themaklin/ntcomp"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
