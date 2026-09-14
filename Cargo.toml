@@ -21,7 +21,7 @@ bincode = "2"
 bitnuc = "0.2"
 clap = { version = "4", features = ["derive"]}
 csv = "1"
-dsi-bitstream = "0.5"
+dsi-bitstream = "0.8"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 kbo = "0.5"
 log = "0.4"
