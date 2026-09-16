@@ -25,7 +25,7 @@ dsi-bitstream = "0.8"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 kbo = "0.5.2"
 log = "0.4"
-needletail = "0.6"
+needletail = { version = "0.6", default-features = false, features = ["flate2"] }
 sbwt = "0.6"
 stderrlog = "0.6"
 
