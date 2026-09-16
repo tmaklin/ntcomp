@@ -22,7 +22,7 @@ use dsi_bitstream::traits::BE;
 use dsi_bitstream::codes::RiceWrite;
 use dsi_bitstream::codes::MinimalBinaryWrite;
 
-use sbwt::SbwtIndexVariant;
+use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 use crate::BlockHeader;
 use crate::encode_block_header;

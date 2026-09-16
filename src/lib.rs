@@ -19,7 +19,7 @@ use bincode::decode_from_slice;
 
 use sbwt::LcsArray;
 use sbwt::StreamingIndex;
-use sbwt::SbwtIndexVariant;
+use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 pub mod encode;
 pub mod decode;
