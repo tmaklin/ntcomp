@@ -26,12 +26,44 @@ pub mod decode;
 
 type E = Box<dyn std::error::Error>;
 
-#[derive(Encode, Decode)]
-pub struct HeaderPlaceholder {
-    pub ph1: u64,
-    pub ph2: u64,
-    pub ph3: u64,
-    pub ph4: u64,
+/// File header for encoded data
+#[derive(Clone, Debug, Decode, Encode, PartialEq)]
+pub struct FileHeader {
+    /// Nlz header, consists of four ASCII bytes spelling "nrlz" and two bytes specifying the version.
+    ///
+    /// First four bytes can be used to check that a binary record is an .nlz record.
+    /// Next two bytes can be used to check which version of nlz was used to generate this file.
+    pub nlz_header: [u8; 6], // = [110, 114, 108, 122, ...];
+
+    /// File format version, indicates (in)compatible versions of the file format.
+    pub file_format: u8,
+
+    /// Compression method used for block contents.
+    pub metadata_compression: u8,
+
+    /// Codec used to encode the colex intervals, see [Codec](encode::codec) for details.
+    pub codec: u8,
+
+    /// Fields that must be present for all block flags fields, currently unused and unimplemented.
+    pub fields_present: u16,
+
+    /// 8 bit placeholder
+    pub ph1: u8,
+
+    /// Number of query sequences encoded, should be greater or equal to the
+    /// number of records in all blocks.
+    ///
+    /// Can be set to 0 if the number is not known in advance.
+    pub n_queries: u32,
+
+    /// How many queries should be stored in each block. Actual number may be different.
+    pub block_size: u32,
+
+    /// Number of bytes in file flags that follow the header bytes.
+    pub flags_len: u64,
+
+    /// 64 bit placeholder
+    pub ph4: u32,
 }
 
 #[derive(Encode, Decode)]
@@ -56,7 +88,18 @@ pub fn encode_file_header(
     ph4: u64
 ) -> Result<Vec<u8>, E> {
     let mut bytes: Vec<u8> = Vec::new();
-    let header_placeholder = HeaderPlaceholder{ ph1, ph2, ph3, ph4 };
+    let header_placeholder = FileHeader{
+        nlz_header: [0_u8; 6],
+        file_format: 0_u8,
+        metadata_compression: 0_u8,
+        codec: 0_u8,
+        fields_present: 0_u16,
+        ph1: 0_u8,
+        n_queries: 0_u32,
+        block_size: 0_u32,
+        flags_len: 0_u64,
+        ph4: 0_u32,
+    };
     let nbytes = encode_into_std_write(
         &header_placeholder,
         &mut bytes,
@@ -68,7 +111,7 @@ pub fn encode_file_header(
 
 pub fn decode_file_header(
     header_bytes: &[u8],
-) -> Result<HeaderPlaceholder, E> {
+) -> Result<FileHeader, E> {
     Ok(decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding())?.0)
 }
 
@@ -318,7 +361,7 @@ pub fn decode_sequence(
 }
 
 pub fn decode_block<R: std::io::Read>(
-    _file_header: &HeaderPlaceholder,
+    _file_header: &FileHeader,
     sbwt: &SbwtIndexVariant,
     conn: &mut R,
 ) -> Result<Vec<Vec<u8>>, E> {
