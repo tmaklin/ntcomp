@@ -398,12 +398,12 @@ pub fn decode_block<R: std::io::Read>(
     let _ = conn.read_exact(&mut bytes_4);
 
     // Decompress
-    let decompressed_1 = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::MinimalBinary)?;
-    let decompressed_2 = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
-    let decompressed_3 = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
-    let decompressed_4 = decode::decompress_block(&bytes_4, &header_4, crate::encode::Codec::MinimalBinary)?;
+    let colex_ranks = decode::decompress_block(&bytes_1, &header_1, crate::encode::Codec::MinimalBinary)?;
+    let match_lengths = decode::decompress_block(&bytes_2, &header_2, crate::encode::Codec::Rice)?;
+    let flags = decode::decompress_block(&bytes_3, &header_3, crate::encode::Codec::Rice)?;
+    let bitnuc_codings = decode::decompress_block(&bytes_4, &header_4, crate::encode::Codec::MinimalBinary)?;
 
-    let decompressed: Vec<u64> = decode::zip_block_contents(&decompressed_1, &decompressed_2, &decompressed_3, &decompressed_4)?;
+    let decompressed: Vec<u64> = decode::zip_block_contents(&colex_ranks, &match_lengths, &flags, &bitnuc_codings)?;
 
     let decoded = decode_sequence(&decompressed, sbwt);
 
