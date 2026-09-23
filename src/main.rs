@@ -199,13 +199,40 @@ fn main() {
 
             info!("Decoding encoded data...");
             let mut i = 0;
-            while let Ok(records) = ntcomp::decode_block(&_file_header, &sbwt, &mut conn) {
+            while let Ok(encoding) = ntcomp::read_block(&_file_header, &sbwt, &mut conn) {
+                let records = ntcomp::decode_sequence(&encoding, &sbwt);
                 records.iter().for_each(|nucleotides| {
                     let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
                     let _ = writeln!(&mut stdout,
                                      "{}", nucleotides.iter().map(|x| *x as char).collect::<String>());
                     let _ = stdout.flush();
                     i += 1;
+                });
+            }
+        },
+        Some(cli::Commands::View {
+            input_path,
+            index_prefix,
+        }) => {
+            init_log(2);
+            let mut stdout = BufWriter::new(std::io::stdout());
+            // info!("Loading SBWT index...");
+            let (sbwt, _) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+
+            // info!("Reading encoded data...");
+            let mut conn = std::fs::File::open(input_path).unwrap();
+
+            // File header
+            let mut header_bytes: [u8; 32] = [0_u8; 32];
+            let _ = conn.read_exact(&mut header_bytes);
+            let _file_header = ntcomp::decode_file_header(&header_bytes).unwrap();
+
+            info!("Decoding encoded data...");
+            while let Ok(encoding) = ntcomp::read_block(&_file_header, &sbwt, &mut conn) {
+                let plaintext = ntcomp::decode_positions(&encoding, &sbwt);
+                plaintext.iter().for_each(|(contig_id, start, end, length, encoding_type, colex)| {
+                    writeln!(&mut stdout, "{}\t{}\t{}\t{}\t{}\t{}", contig_id, start, end, length, encoding_type, colex.unwrap_or(0)).unwrap();
+                    stdout.flush().unwrap();
                 });
             }
         },

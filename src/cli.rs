@@ -90,4 +90,17 @@ pub enum Commands {
         index_prefix: Option<String>,
 
     },
+
+    // Print the encoding in plain text format
+    View {
+        // Inputs
+        // // Input fasta or fastq query file(s)
+        #[arg(group = "input", required = true, help = "File with encoded fastX data.")]
+        input_path: PathBuf,
+
+        // // Prebuilt index
+        #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
+        index_prefix: Option<String>,
+
+    },
 }

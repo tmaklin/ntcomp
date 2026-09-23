@@ -360,11 +360,92 @@ pub fn decode_sequence(
     sequences.into_iter().rev().collect()
 }
 
-pub fn decode_block<R: std::io::Read>(
+pub fn decode_positions(
+    encoding: &[u64],
+    sbwt: &SbwtIndexVariant,
+) -> Vec<(usize, usize, usize, usize, u8, Option<u32>)> {
+    // TODO this needs to check if the sbwt has select support
+
+    let mut sequences: Vec<Vec<u8>> = Vec::new();
+    let mut sequence: Vec<u8> = Vec::new();
+
+    let mut positions: Vec<(usize, usize, usize, usize, u8, Option<u32>)> = Vec::new();
+    match sbwt {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => {
+            let k = sbwt.k();
+            let mut bases: usize = 0;
+            encoding.iter().rev().for_each(|record| {
+                let start = bases;
+                let mut encoding_type: u8;
+                let mut colex = None;
+
+                let bytes: Vec<u8> = record.to_ne_bytes()[0..8].to_vec();
+                let mut arr: [u8; 8] = [0; 8];
+                arr[0..8].copy_from_slice(&bytes);
+                let flags = bytes[7];
+                let flag = u8::from_ne_bytes([flags]);
+                let first: bool = (flag & 0b00000001) == 0b00000001;
+                if flag & 0b00000010 == 0b00000000 {
+                    let mut arr1: [u8; 4] = [0; 4];
+                    let mut arr2: [u8; 4] = [0; 4];
+                    let mut arr3: [u8; 1] = [0; 1];
+
+                    arr1.copy_from_slice(&arr[0..4]);
+                    arr2[0..3].copy_from_slice(&arr[4..7]);
+                    arr3.copy_from_slice(&arr[7..8]);
+                    let colex_rank = u32::from_ne_bytes(arr1);
+                    let suffix_len = u32::from_ne_bytes(arr2);
+                    bases += suffix_len as usize;
+
+                    colex = Some(colex_rank);
+                    let kmer = if suffix_len > k as u32 {
+                        let kmer = sbwt.access_kmer(colex_rank as usize);
+                        let new_kmer = left_extend_kmer2(&kmer, sbwt, (suffix_len - k as u32) as usize);
+                        assert_eq!(new_kmer.len(), suffix_len as usize);
+                        encoding_type = 1;
+                        new_kmer
+                    } else {
+                        encoding_type = 0;
+                        sbwt.access_kmer(colex_rank as usize)
+                    };
+
+                    sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter());
+                } else {
+                    let length: usize = ((flag & 0b11111100) >> 2) as usize;
+
+                    let mut arr1: [u8; 8] = [0; 8];
+                    arr1[0..7].copy_from_slice(&bytes[0..7]);
+
+                    let bitnucs = u64::from_ne_bytes(arr1);
+                    let mut kmer: Vec<u8> = Vec::new();
+                    let _ = bitnuc::from_2bit(bitnucs, length, &mut kmer);
+                    bases += kmer.len();
+                    sequence.extend(kmer.iter());
+                    encoding_type = 3;
+                    colex = None;
+                }
+
+                let end = bases;
+
+                let contig_id = sequences.len();
+                positions.push((contig_id, start, end, end - start, encoding_type, colex));
+                if first {
+                    bases = 0;
+                    sequences.push(sequence.clone());
+                    sequence.clear();
+                }
+            });
+        },
+    }
+
+    positions
+}
+
+pub fn read_block<R: std::io::Read>(
     _file_header: &FileHeader,
     sbwt: &SbwtIndexVariant,
     conn: &mut R,
-) -> Result<Vec<Vec<u8>>, E> {
+) -> Result<Vec<u64>, E> {
     // Colex ranks
     let mut header_bytes_1: [u8; 32] = [0_u8; 32];
     conn.read_exact(&mut header_bytes_1)?;
@@ -405,7 +486,5 @@ pub fn decode_block<R: std::io::Read>(
 
     let decompressed: Vec<u64> = decode::zip_block_contents(&colex_ranks, &match_lengths, &flags, &bitnuc_codings)?;
 
-    let decoded = decode_sequence(&decompressed, sbwt);
-
-    Ok(decoded)
+    Ok(decompressed)
 }
