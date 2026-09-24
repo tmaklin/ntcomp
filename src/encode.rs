@@ -56,7 +56,7 @@ fn deflate_bytes(
     Ok(deflated)
 }
 
-fn rice_encode(
+pub fn rice_encode(
     ints: &[u64],
 ) -> Result<(Vec<u64>, u64), E> {
     let inv_mean: f64 = ((ints.len() as f64).ln() - (ints.iter().sum::<u64>() as f64).ln()).exp();
@@ -74,7 +74,7 @@ fn rice_encode(
     Ok((writer.into_inner()?.into_inner(), param as u64))
 }
 
-fn minimal_binary_encode(
+pub fn minimal_binary_encode(
     ints: &[u64],
 ) -> Result<(Vec<u64>, u64), E> {
     let param: u64 = *ints.iter().max().ok_or(EncodeError)?;
