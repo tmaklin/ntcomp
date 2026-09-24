@@ -15,6 +15,8 @@ use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use indexmap::IndexSet;
+
 use clap::Parser;
 use log::info;
 use needletail::Sequence;
@@ -235,6 +237,50 @@ fn main() {
                     stdout.flush().unwrap();
                 });
             }
+        },
+        Some(cli::Commands::Collection {
+            query_files,
+            index_prefix,
+        }) => {
+            init_log(2);
+            let mut stdout = BufWriter::new(std::io::stdout());
+
+            let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+
+            let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
+            let _ = stdout.write_all(&header_bytes);
+
+            let k = match sbwt {
+                sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(ref sbwt) => {
+                    sbwt.k()
+                },
+            };
+
+            let mut colex_remapping: IndexSet<u32> = IndexSet::new();
+            let mut path_starts: Vec<u32> = Vec::with_capacity(query_files.len());
+            let mut path_lengths: Vec<u32> = Vec::with_capacity(query_files.len());
+            let mut all_lengths: Vec<Vec<u32>> = Vec::with_capacity(query_files.len());
+            for (i, query_file) in query_files.iter().enumerate() {
+                eprintln!("{}/{}", i + 1, query_files.len());
+                let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
+
+                while let Some(rec) = read_from_fastx_parser(&mut *reader) {
+                    let seqrec = rec.normalize(true);
+
+                    let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
+                    let (path, lengths) = ntcomp::collection::remap_dictionary(dictionary, &mut colex_remapping);
+                    let (mut path_start, mut path_length) = ntcomp::collection::get_path_blocks(&path);
+                    path_starts.append(&mut path_start);
+                    path_lengths.append(&mut path_length);
+                    all_lengths.push(lengths);
+                }
+            }
+
+            ntcomp::collection::write_paths(&path_starts, &path_lengths, &mut stdout).unwrap();
+            ntcomp::collection::write_lengths(&all_lengths, &mut stdout).unwrap();
+            ntcomp::collection::write_remapping(&colex_remapping, &mut stdout).unwrap();
+
+            let _ = stdout.flush();
         },
         None => {},
     }

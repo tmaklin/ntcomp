@@ -29,6 +29,8 @@ needletail = { version = "0.6", default-features = false, features = ["flate2"] 
 sbwt = "0.6"
 stderrlog = "0.6"
 
+indexmap = "2.14"
+
 [dev-dependencies]
 random = "0.14"
 
