@@ -24,6 +24,8 @@ use petgraph::graph::{
 };
 use petgraph::visit::EdgeRef;
 
+use sbwt::sbwt_index_variant::SbwtIndexVariant;
+
 type E = Box<dyn std::error::Error>;
 
 #[derive(Debug, serde::Serialize)]
@@ -76,6 +78,31 @@ pub fn insert_edge(
     };
 
     graph.try_add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color }).unwrap();
+}
+
+pub fn decode_path(
+    path: Vec<(u32, u32)>,
+    sbwt: &SbwtIndexVariant,
+) -> Vec<u8> {
+    let mut sequence: Vec<u8> = Vec::new();
+    match sbwt {
+        SbwtIndexVariant::SubsetMatrix(sbwt) => {
+            let k = sbwt.k();
+            path.into_iter().rev().for_each(|(colex_rank, suffix_len)| {
+                let kmer = if suffix_len > k as u32 {
+                    let kmer = sbwt.access_kmer(colex_rank as usize);
+                    let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, (suffix_len - k as u32) as usize);
+                    assert_eq!(new_kmer.len(), suffix_len as usize);
+                    new_kmer
+                } else {
+                    sbwt.access_kmer(colex_rank as usize)
+                };
+                sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter());
+            });
+        },
+    };
+
+    sequence
 }
 
 pub fn write_to<W: Write>(
