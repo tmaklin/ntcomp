@@ -102,6 +102,8 @@ pub enum Commands {
         #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
         index_prefix: Option<String>,
 
+        #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]
+        decompress: bool,
     },
 
     // Decode data written with Encode
@@ -114,7 +116,6 @@ pub enum Commands {
         // // Prebuilt index
         #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
         index_prefix: Option<String>,
-
     },
 
     // Print the encoding in plain text format

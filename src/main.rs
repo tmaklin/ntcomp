@@ -291,60 +291,61 @@ fn main() {
         Some(cli::Commands::Graph {
             query_files,
             index_prefix,
+            decompress,
         }) => {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
 
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
-            let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
-            let _ = stdout.write_all(&header_bytes);
+            if *decompress {
+                unimplemented!("Decompress graph encoded data");
+            } else {
+                let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
+                let _ = stdout.write_all(&header_bytes);
 
-            let mut colex_remapping: IndexSet<u32> = IndexSet::new();
-            let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
+                let mut colex_remapping: IndexSet<u32> = IndexSet::new();
+                let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
 
-            let mut node_indexes: HashSet<u32> = HashSet::new();
+                let mut node_indexes: HashSet<u32> = HashSet::new();
 
-            let mut colors: Vec<u32> = Vec::new();
-            let mut color: u32 = 0;
-            for (file_idx, query_file) in query_files.iter().enumerate() {
-                let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
+                let mut colors: Vec<u32> = Vec::new();
+                let mut color: u32 = 0;
+                for (file_idx, query_file) in query_files.iter().enumerate() {
+                    let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
-                while let Some(rec) = read_from_fastx_parser(&mut *reader) {
-                    colors.push(color);
-                    let seqrec = rec.normalize(true);
+                    while let Some(rec) = read_from_fastx_parser(&mut *reader) {
+                        colors.push(color);
+                        let seqrec = rec.normalize(true);
 
-                    let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
-                    let n_entries = dictionary.len();
-                    for i in 1..n_entries {
+                        let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
+                        let n_entries = dictionary.len();
+                        for i in 1..n_entries {
+                            ntcomp::graph::insert_edge(
+                                &mut graph,
+                                &mut node_indexes,
+                                &mut colex_remapping,
+                                color,
+                                &dictionary[i - 1],
+                                &dictionary[i]
+                            );
+                        }
+                        // Add a self loop back to the first node to denote termination
+                        // TODO should do this in a way that prevents loops
                         ntcomp::graph::insert_edge(
                             &mut graph,
                             &mut node_indexes,
                             &mut colex_remapping,
                             color,
-                            &dictionary[i - 1],
-                            &dictionary[i]
+                            &dictionary[dictionary.len() - 1],
+                            &dictionary[0],
                         );
+                        color +=1 ;
                     }
-                    // Add a self loop back to the first node to denote termination
-                    // TODO should do this in a way that prevents loops
-                    ntcomp::graph::insert_edge(
-                        &mut graph,
-                        &mut node_indexes,
-                        &mut colex_remapping,
-                        color,
-                        &dictionary[dictionary.len() - 1],
-                        &dictionary[0],
-                    );
-                    color +=1 ;
                 }
+
+                ntcomp::graph::write_to(&graph, &mut stdout).unwrap();
             }
-
-            ntcomp::graph::write_to(&graph, &mut stdout).unwrap();
-
-            colors.into_iter().for_each(|color| {
-                let test = ntcomp::graph::extract_path(&graph, color);
-            });
 
             let _ = stdout.flush();
         },
