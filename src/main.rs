@@ -15,7 +15,16 @@ use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use std::collections::{
+    HashMap,
+    HashSet,
+};
+
 use indexmap::IndexSet;
+
+use petgraph::graph::Graph;
+use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
 use clap::Parser;
 use log::info;
@@ -23,6 +32,47 @@ use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 
 mod cli;
+
+#[derive(Debug, serde::Serialize)]
+struct ColexGraphEdge {
+    weight: u32,
+    color: u32,
+}
+
+fn extract_path(
+    graph: &Graph<u32, ColexGraphEdge>,
+    want_color: u32,
+    start_idx: u32,
+) -> Vec<(u32, u32)> {
+    let mut node_index = NodeIndex::from(start_idx);
+    let mut path: Vec<(u32, u32)> = Vec::new();
+    let mut sum = 0;
+    let mut terminate: bool = false;
+    loop {
+        if terminate {
+            break;
+        }
+        let edges = graph.edges_directed(node_index, petgraph::Direction::Outgoing);
+        for edge in edges {
+            let weights = edge.weight();
+            if weights.color == want_color {
+                node_index = edge.target();
+                let remapped_colex = graph[edge.source()];
+                let match_length = weights.weight;
+                sum += match_length;
+                path.push((remapped_colex, match_length));
+                terminate = node_index == NodeIndex::from(start_idx);
+                if terminate {
+                    eprintln!("Terminated at: {:?}", edge.source());
+                }
+                break;
+            }
+        }
+    }
+
+    eprintln!("Sum of weights: {}", sum);
+    path
+}
 
 /// Initializes the logger with verbosity given in `log_max_level`.
 fn init_log(log_max_level: usize) {
@@ -279,6 +329,126 @@ fn main() {
             ntcomp::collection::write_paths(&path_starts, &path_lengths, &mut stdout).unwrap();
             ntcomp::collection::write_lengths(&all_lengths, &mut stdout).unwrap();
             ntcomp::collection::write_remapping(&colex_remapping, &mut stdout).unwrap();
+
+            let _ = stdout.flush();
+        },
+        Some(cli::Commands::Graph {
+            query_files,
+            index_prefix,
+        }) => {
+            init_log(2);
+            let mut stdout = BufWriter::new(std::io::stdout());
+
+            let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+
+            let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
+            let _ = stdout.write_all(&header_bytes);
+
+            let k = match sbwt {
+                sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(ref sbwt) => {
+                    sbwt.k()
+                },
+            };
+
+            let mut colex_remapping: IndexSet<u32> = IndexSet::new();
+            let mut graph: Graph<u32, ColexGraphEdge> = Graph::new();
+
+            let mut node_indexes: HashSet<u32> = HashSet::new();
+
+            let mut start_indexes: Vec<u32> = Vec::new();
+
+            let mut color: u32 = 0;
+            for (file_idx, query_file) in query_files.iter().enumerate() {
+                eprintln!("{}/{}", file_idx + 1, query_files.len());
+                let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
+
+                while let Some(rec) = read_from_fastx_parser(&mut *reader) {
+                    let seqrec = rec.normalize(true);
+
+                    let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
+                    let n_entries = dictionary.len();
+                    eprintln!("Dictionary length for color {}: {}", color, n_entries);
+                    let mut sum_of_weights = 0;
+                    for i in 1..n_entries {
+                        let prev_idx: u32 = dictionary[i - 1].1.start.try_into().unwrap();
+                        let curr_idx: u32 = dictionary[i].1.start.try_into().unwrap();
+                        let weight = dictionary[i - 1].0;
+                        sum_of_weights += weight;
+
+                        colex_remapping.insert(prev_idx);
+                        colex_remapping.insert(curr_idx);
+
+                        let edge_start: u32 = colex_remapping.get_index_of(&prev_idx).unwrap().try_into().unwrap();
+                        let edge_end: u32 = colex_remapping.get_index_of(&curr_idx).unwrap().try_into().unwrap();
+
+                        let from = if node_indexes.contains(&edge_start) {
+                            NodeIndex::from(edge_start)
+                        } else {
+                            node_indexes.insert(edge_start);
+                            graph.add_node(edge_start)
+                        };
+
+                        let to = if node_indexes.contains(&edge_end) {
+                            NodeIndex::from(edge_end)
+                        } else {
+                            node_indexes.insert(edge_end);
+                            graph.add_node(edge_end)
+                        };
+
+                        assert!(edge_start != edge_end);
+                        assert!(from != to);
+
+                        graph.try_add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color }).unwrap();
+                    }
+                    // Add a self loop back to the first node to denote termination
+                    // TODO should do this in a way that prevents loops
+                    {
+                        let prev_idx: u32 = dictionary[dictionary.len() - 1].1.start.try_into().unwrap();
+                        let curr_idx: u32 = dictionary[0].1.start.try_into().unwrap();
+                        let weight = dictionary[dictionary.len() - 1].0;
+                        sum_of_weights += weight;
+
+                        colex_remapping.insert(prev_idx);
+                        colex_remapping.insert(curr_idx);
+
+                        let edge_start: u32 = colex_remapping.get_index_of(&prev_idx).unwrap().try_into().unwrap();
+                        let edge_end: u32 = colex_remapping.get_index_of(&curr_idx).unwrap().try_into().unwrap();
+
+                        let from = if node_indexes.contains(&edge_start) {
+                            NodeIndex::from(edge_start)
+                        } else {
+                            node_indexes.insert(edge_start);
+                            graph.add_node(edge_start)
+                        };
+
+                        let to = if node_indexes.contains(&edge_end) {
+                            NodeIndex::from(edge_end)
+                        } else {
+                            node_indexes.insert(edge_end);
+                            graph.add_node(edge_end)
+                        };
+
+                        graph.add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color });
+                    }
+
+                    eprintln!("Sum of weights for color {}: {}", color, sum_of_weights);
+                    let first_colex: u32 = dictionary[0].1.start.try_into().unwrap();
+                    let start_index: u32 = colex_remapping.get_index_of(&first_colex).unwrap().try_into().unwrap();
+                    start_indexes.push(start_index);
+                    color += 1;
+                }
+            }
+            eprintln!("{:?}", start_indexes);
+
+            eprintln!("Nodes: {}", graph.node_count());
+            let bytes = postcard::to_allocvec(&graph).unwrap();
+
+            stdout.write_all(&bytes).unwrap();
+
+            start_indexes.iter().enumerate().for_each(|(color, start_idx)| {
+                let test = extract_path(&graph, color as u32, *start_idx);
+                eprintln!("Path length for color {}: {}", color, test.len());
+            });
 
             let _ = stdout.flush();
         },
