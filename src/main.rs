@@ -21,6 +21,9 @@ use std::collections::{
 
 use indexmap::IndexSet;
 
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
+
 use petgraph::graph::Graph;
 
 use clap::Parser;
@@ -301,6 +304,11 @@ fn main() {
             if *decompress {
                 unimplemented!("Decompress graph encoded data");
             } else {
+                let n_queries = query_files.len();
+
+                let progress = ProgressBar::new(n_queries as u64);
+                progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
+
                 let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
                 let _ = stdout.write_all(&header_bytes);
 
@@ -311,7 +319,7 @@ fn main() {
 
                 let mut colors: Vec<u32> = Vec::new();
                 let mut color: u32 = 0;
-                for (file_idx, query_file) in query_files.iter().enumerate() {
+                for query_file in query_files.iter() {
                     let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
@@ -340,9 +348,11 @@ fn main() {
                             &dictionary[dictionary.len() - 1],
                             &dictionary[0],
                         );
-                        color +=1 ;
+                        color +=1;
                     }
+                    progress.inc(1_u64);
                 }
+                progress.finish();
 
                 ntcomp::graph::write_to(&graph, &mut stdout).unwrap();
             }
