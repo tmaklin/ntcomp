@@ -308,7 +308,6 @@ fn main() {
             let mut colors: Vec<u32> = Vec::new();
             let mut color: u32 = 0;
             for (file_idx, query_file) in query_files.iter().enumerate() {
-                eprintln!("{}/{}", file_idx + 1, query_files.len());
                 let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
                 while let Some(rec) = read_from_fastx_parser(&mut *reader) {
@@ -317,7 +316,6 @@ fn main() {
 
                     let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
                     let n_entries = dictionary.len();
-                    eprintln!("Dictionary length for color {}: {}", color, n_entries);
                     for i in 1..n_entries {
                         ntcomp::graph::insert_edge(
                             &mut graph,
@@ -342,13 +340,10 @@ fn main() {
                 }
             }
 
-            eprintln!("Nodes: {}", graph.node_count());
             ntcomp::graph::write_to(&graph, &mut stdout).unwrap();
 
             colors.into_iter().for_each(|color| {
                 let test = ntcomp::graph::extract_path(&graph, color);
-                eprintln!("Path length for color {}: {}", color, test.len());
-                eprintln!("Bases for color {}: {}", color, test.iter().map(|x| x.1).sum::<u32>());
             });
 
             let _ = stdout.flush();
