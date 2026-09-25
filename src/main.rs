@@ -42,36 +42,12 @@ struct ColexGraphEdge {
 fn extract_path(
     graph: &Graph<u32, ColexGraphEdge>,
     want_color: u32,
-    start_idx: u32,
 ) -> Vec<(u32, u32)> {
-    let mut node_index = NodeIndex::from(start_idx);
-    let mut path: Vec<(u32, u32)> = Vec::new();
-    let mut sum = 0;
-    let mut terminate: bool = false;
-    loop {
-        if terminate {
-            break;
-        }
-        let edges = graph.edges_directed(node_index, petgraph::Direction::Outgoing);
-        for edge in edges {
-            let weights = edge.weight();
-            if weights.color == want_color {
-                node_index = edge.target();
-                let remapped_colex = graph[edge.source()];
-                let match_length = weights.weight;
-                sum += match_length;
-                path.push((remapped_colex, match_length));
-                terminate = node_index == NodeIndex::from(start_idx);
-                if terminate {
-                    eprintln!("Terminated at: {:?}", edge.source());
-                }
-                break;
-            }
-        }
-    }
-
-    eprintln!("Sum of weights: {}", sum);
-    path
+    graph.edge_references().filter(|x| x.weight().color == want_color).map(|edge| {
+        let remapped_colex = graph[edge.source()];
+        let match_length = edge.weight().weight;
+        (remapped_colex, match_length)
+    }).collect::<Vec<(u32, u32)>>()
 }
 
 /// Initializes the logger with verbosity given in `log_max_level`.
@@ -355,14 +331,14 @@ fn main() {
 
             let mut node_indexes: HashSet<u32> = HashSet::new();
 
-            let mut start_indexes: Vec<u32> = Vec::new();
-
+            let mut colors: Vec<u32> = Vec::new();
             let mut color: u32 = 0;
             for (file_idx, query_file) in query_files.iter().enumerate() {
                 eprintln!("{}/{}", file_idx + 1, query_files.len());
                 let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
                 while let Some(rec) = read_from_fastx_parser(&mut *reader) {
+                    colors.push(color);
                     let seqrec = rec.normalize(true);
 
                     let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
@@ -394,9 +370,6 @@ fn main() {
                             node_indexes.insert(edge_end);
                             graph.add_node(edge_end)
                         };
-
-                        assert!(edge_start != edge_end);
-                        assert!(from != to);
 
                         graph.try_add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color }).unwrap();
                     }
@@ -432,22 +405,19 @@ fn main() {
                     }
 
                     eprintln!("Sum of weights for color {}: {}", color, sum_of_weights);
-                    let first_colex: u32 = dictionary[0].1.start.try_into().unwrap();
-                    let start_index: u32 = colex_remapping.get_index_of(&first_colex).unwrap().try_into().unwrap();
-                    start_indexes.push(start_index);
-                    color += 1;
+                    color +=1 ;
                 }
             }
-            eprintln!("{:?}", start_indexes);
 
             eprintln!("Nodes: {}", graph.node_count());
             let bytes = postcard::to_allocvec(&graph).unwrap();
 
             stdout.write_all(&bytes).unwrap();
 
-            start_indexes.iter().enumerate().for_each(|(color, start_idx)| {
-                let test = extract_path(&graph, color as u32, *start_idx);
+            colors.into_iter().for_each(|color| {
+                let test = extract_path(&graph, color);
                 eprintln!("Path length for color {}: {}", color, test.len());
+                eprintln!("Bases for color {}: {}", color, test.iter().map(|x| x.1).sum::<u32>());
             });
 
             let _ = stdout.flush();
