@@ -24,6 +24,7 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 pub mod encode;
 pub mod decode;
 pub mod collection;
+pub mod graph;
 
 type E = Box<dyn std::error::Error>;
 

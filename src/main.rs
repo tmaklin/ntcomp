@@ -16,15 +16,12 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use std::collections::{
-    HashMap,
     HashSet,
 };
 
 use indexmap::IndexSet;
 
 use petgraph::graph::Graph;
-use petgraph::graph::NodeIndex;
-use petgraph::visit::EdgeRef;
 
 use clap::Parser;
 use log::info;
@@ -32,23 +29,6 @@ use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 
 mod cli;
-
-#[derive(Debug, serde::Serialize)]
-struct ColexGraphEdge {
-    weight: u32,
-    color: u32,
-}
-
-fn extract_path(
-    graph: &Graph<u32, ColexGraphEdge>,
-    want_color: u32,
-) -> Vec<(u32, u32)> {
-    graph.edge_references().filter(|x| x.weight().color == want_color).map(|edge| {
-        let remapped_colex = graph[edge.source()];
-        let match_length = edge.weight().weight;
-        (remapped_colex, match_length)
-    }).collect::<Vec<(u32, u32)>>()
-}
 
 /// Initializes the logger with verbosity given in `log_max_level`.
 fn init_log(log_max_level: usize) {
@@ -320,14 +300,8 @@ fn main() {
             let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
             let _ = stdout.write_all(&header_bytes);
 
-            let k = match sbwt {
-                sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(ref sbwt) => {
-                    sbwt.k()
-                },
-            };
-
             let mut colex_remapping: IndexSet<u32> = IndexSet::new();
-            let mut graph: Graph<u32, ColexGraphEdge> = Graph::new();
+            let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
 
             let mut node_indexes: HashSet<u32> = HashSet::new();
 
@@ -344,78 +318,35 @@ fn main() {
                     let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
                     let n_entries = dictionary.len();
                     eprintln!("Dictionary length for color {}: {}", color, n_entries);
-                    let mut sum_of_weights = 0;
                     for i in 1..n_entries {
-                        let prev_idx: u32 = dictionary[i - 1].1.start.try_into().unwrap();
-                        let curr_idx: u32 = dictionary[i].1.start.try_into().unwrap();
-                        let weight = dictionary[i - 1].0;
-                        sum_of_weights += weight;
-
-                        colex_remapping.insert(prev_idx);
-                        colex_remapping.insert(curr_idx);
-
-                        let edge_start: u32 = colex_remapping.get_index_of(&prev_idx).unwrap().try_into().unwrap();
-                        let edge_end: u32 = colex_remapping.get_index_of(&curr_idx).unwrap().try_into().unwrap();
-
-                        let from = if node_indexes.contains(&edge_start) {
-                            NodeIndex::from(edge_start)
-                        } else {
-                            node_indexes.insert(edge_start);
-                            graph.add_node(edge_start)
-                        };
-
-                        let to = if node_indexes.contains(&edge_end) {
-                            NodeIndex::from(edge_end)
-                        } else {
-                            node_indexes.insert(edge_end);
-                            graph.add_node(edge_end)
-                        };
-
-                        graph.try_add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color }).unwrap();
+                        ntcomp::graph::insert_edge(
+                            &mut graph,
+                            &mut node_indexes,
+                            &mut colex_remapping,
+                            color,
+                            &dictionary[i - 1],
+                            &dictionary[i]
+                        );
                     }
                     // Add a self loop back to the first node to denote termination
                     // TODO should do this in a way that prevents loops
-                    {
-                        let prev_idx: u32 = dictionary[dictionary.len() - 1].1.start.try_into().unwrap();
-                        let curr_idx: u32 = dictionary[0].1.start.try_into().unwrap();
-                        let weight = dictionary[dictionary.len() - 1].0;
-                        sum_of_weights += weight;
-
-                        colex_remapping.insert(prev_idx);
-                        colex_remapping.insert(curr_idx);
-
-                        let edge_start: u32 = colex_remapping.get_index_of(&prev_idx).unwrap().try_into().unwrap();
-                        let edge_end: u32 = colex_remapping.get_index_of(&curr_idx).unwrap().try_into().unwrap();
-
-                        let from = if node_indexes.contains(&edge_start) {
-                            NodeIndex::from(edge_start)
-                        } else {
-                            node_indexes.insert(edge_start);
-                            graph.add_node(edge_start)
-                        };
-
-                        let to = if node_indexes.contains(&edge_end) {
-                            NodeIndex::from(edge_end)
-                        } else {
-                            node_indexes.insert(edge_end);
-                            graph.add_node(edge_end)
-                        };
-
-                        graph.add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color });
-                    }
-
-                    eprintln!("Sum of weights for color {}: {}", color, sum_of_weights);
+                    ntcomp::graph::insert_edge(
+                        &mut graph,
+                        &mut node_indexes,
+                        &mut colex_remapping,
+                        color,
+                        &dictionary[dictionary.len() - 1],
+                        &dictionary[0],
+                    );
                     color +=1 ;
                 }
             }
 
             eprintln!("Nodes: {}", graph.node_count());
-            let bytes = postcard::to_allocvec(&graph).unwrap();
-
-            stdout.write_all(&bytes).unwrap();
+            ntcomp::graph::write_to(&graph, &mut stdout).unwrap();
 
             colors.into_iter().for_each(|color| {
-                let test = extract_path(&graph, color);
+                let test = ntcomp::graph::extract_path(&graph, color);
                 eprintln!("Path length for color {}: {}", color, test.len());
                 eprintln!("Bases for color {}: {}", color, test.iter().map(|x| x.1).sum::<u32>());
             });

@@ -13,95 +13,76 @@
 //
 use core::ops::Range;
 
+use std::collections::HashSet;
 use std::io::Write;
 
 use indexmap::IndexSet;
 
+use petgraph::graph::{
+    Graph,
+    NodeIndex,
+};
+use petgraph::visit::EdgeRef;
+
 type E = Box<dyn std::error::Error>;
 
-pub fn remap_dictionary(
-    dictionary: Vec<(usize, Range<usize>)>,
+#[derive(Debug, serde::Serialize)]
+pub struct ColexGraphEdge {
+    weight: u32,
+    color: u32,
+}
+
+pub fn extract_path(
+    graph: &Graph<u32, ColexGraphEdge>,
+    want_color: u32,
+) -> Vec<(u32, u32)> {
+    graph.edge_references().filter(|x| x.weight().color == want_color).map(|edge| {
+        let remapped_colex = graph[edge.source()];
+        let match_length = edge.weight().weight;
+        (remapped_colex, match_length)
+    }).collect::<Vec<(u32, u32)>>()
+}
+
+pub fn insert_edge(
+    graph: &mut Graph<u32, ColexGraphEdge>,
+    node_indexes: &mut HashSet<u32>,
     colex_remapping: &mut IndexSet<u32>,
-) -> (Vec<u32>, Vec<u32>) {
-    let mut path: Vec<u32> = Vec::new();
-    let mut lengths: Vec<u32> = Vec::new();
-    dictionary.into_iter().for_each(|(length, colex_range)| {
-        let colex_rank: u32 = colex_range.start.try_into().unwrap();
+    color: u32,
+    entry_from: &(usize, Range<usize>),
+    entry_to: &(usize, Range<usize>),
+) {
+    let prev_idx: u32 = entry_from.1.start.try_into().unwrap();
+    let curr_idx: u32 = entry_to.1.start.try_into().unwrap();
+    let weight = entry_from.0;
 
-        colex_remapping.insert(colex_rank);
-        let node_idx: u32 = colex_remapping.get_index_of(&colex_rank).unwrap().try_into().unwrap();
-        path.push(node_idx);
-        lengths.push(length as u32);
-    });
-    (path, lengths)
+    colex_remapping.insert(prev_idx);
+    colex_remapping.insert(curr_idx);
+
+    let edge_start: u32 = colex_remapping.get_index_of(&prev_idx).unwrap().try_into().unwrap();
+    let edge_end: u32 = colex_remapping.get_index_of(&curr_idx).unwrap().try_into().unwrap();
+
+    let from = if node_indexes.contains(&edge_start) {
+        NodeIndex::from(edge_start)
+    } else {
+        node_indexes.insert(edge_start);
+        graph.add_node(edge_start)
+    };
+
+    let to = if node_indexes.contains(&edge_end) {
+        NodeIndex::from(edge_end)
+    } else {
+        node_indexes.insert(edge_end);
+        graph.add_node(edge_end)
+    };
+
+    graph.try_add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), color }).unwrap();
 }
 
-pub fn get_path_blocks(
-    path: &[u32],
-) -> (Vec<u32>, Vec<u32>) {
-    let mut prev: u32 = path[0];
-    let mut starts: Vec<u32> = vec![prev];
-    let mut lengths: Vec<u32> = vec![1];
-    let mut i: usize = 0;
-    path.iter().skip(1).for_each(|node_idx| {
-        if *node_idx == prev + 1 {
-            lengths[i] += 1;
-        } else {
-            starts.push(*node_idx);
-            lengths.push(1);
-            i += 1;
-        }
-        prev = *node_idx;
-    });
-    (starts, lengths)
-}
-
-pub fn write_paths<W: Write>(
-    starts: &[u32],
-    lengths: &[u32],
-    out: &mut W,
+pub fn write_to<W: Write>(
+    graph: &Graph<u32, ColexGraphEdge>,
+    writer: &mut W,
 ) -> Result<(), E> {
-    let _ = bincode::encode_into_std_write(
-        starts,
-        out,
-        bincode::config::standard(),
-    )?;
-
-    let _ = bincode::encode_into_std_write(
-        lengths,
-        out,
-        bincode::config::standard(),
-    )?;
-
-    out.flush()?;
-    Ok(())
-}
-
-pub fn write_lengths<W: Write>(
-    all_lengths: &[Vec<u32>],
-    out: &mut W,
-) -> Result<(), E> {
-    let _ = bincode::encode_into_std_write(
-        all_lengths,
-        out,
-        bincode::config::standard(),
-    )?;
-    out.flush()?;
-    Ok(())
-}
-
-pub fn write_remapping<W: Write>(
-    colex_remapping: &IndexSet<u32>,
-    out: &mut W,
-) -> Result<(), E> {
-    let colex_ranks: Vec<u64> = colex_remapping.iter().map(|colex_rank| *colex_rank as u64).collect::<Vec<u64>>();
-    let colex_bytes = crate::encode::minimal_binary_encode(&colex_ranks)?.0;
-
-    // This is already packed so no need to pass through bincode
-    let remapping_bytes = colex_bytes.iter().flat_map(|x| {
-        x.to_le_bytes()
-    }).collect::<Vec<u8>>();
-    out.write_all(&remapping_bytes)?;
-    out.flush()?;
+    let bytes = postcard::to_allocvec(&graph)?;
+    writer.write_all(&bytes)?;
     Ok(())
 }
