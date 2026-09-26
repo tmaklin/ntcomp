@@ -354,7 +354,8 @@ fn main() {
                 }
                 progress.finish();
 
-                ntcomp::graph::write_to(&graph, &mut stdout).unwrap();
+                stdout.write_all(&postcard::to_allocvec(&colex_remapping.into_iter().collect::<Vec<u32>>()).unwrap()).unwrap();
+                ntcomp::graph::encode_to(graph, &mut stdout).unwrap();
             }
 
             let _ = stdout.flush();

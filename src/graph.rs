@@ -13,7 +13,10 @@
 //
 use core::ops::Range;
 
-use std::collections::HashSet;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 use std::io::Write;
 
 use indexmap::IndexSet;
@@ -28,9 +31,9 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 type E = Box<dyn std::error::Error>;
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct ColexGraphEdge {
-    weight: u32,
+    pub weight: u32,
     color: u32,
 }
 
@@ -111,5 +114,49 @@ pub fn write_to<W: Write>(
 ) -> Result<(), E> {
     let bytes = postcard::to_allocvec(&graph)?;
     writer.write_all(&bytes)?;
+    Ok(())
+}
+
+pub fn encode_to<W: Write>(
+    graph: Graph<u32, ColexGraphEdge>,
+    writer: &mut W,
+) -> Result<(), E> {
+
+    let mut deltas: Vec<i32> = Vec::with_capacity(graph.edge_count());
+    let mut weights: Vec<u32> = Vec::with_capacity(graph.edge_count());
+    let mut color_counts: HashMap<u32, u32> = HashMap::new();
+
+    for e in graph.edge_references() {
+        let from_index: i64 = e.source().index().try_into()?;
+        let to_index: i64 = e.target().index().try_into()?;
+        let delta: i32 = (from_index - to_index).try_into()?;
+        deltas.push(delta);
+
+        let color: u32 = e.weight().color;
+        if color_counts.contains_key(&color) {
+            *color_counts.get_mut(&color).unwrap() += 1;
+        } else {
+            color_counts.insert(color, 1_u32);
+        }
+
+        weights.push(e.weight().weight);
+    }
+
+    eprintln!("Max weight: {}", weights.iter().max().unwrap());
+    // Nodes: encode the count as the node index is always just incremented by 1
+    let node_count = graph.node_count();
+    writer.write_all(&postcard::to_allocvec(&node_count)?)?;
+
+    // Sources and targets: encode as difference?
+    // TODO This requires storing the start index for every contig so we can start using the diffs
+    writer.write_all(&postcard::to_allocvec(&deltas)?)?;
+
+    // Colors: encode as (count, colour) since these are always contiguous
+    let color_rle: Vec<(u32, u32)> = color_counts.into_iter().collect();
+    writer.write_all(&postcard::to_allocvec(&color_rle)?)?;
+
+    // Weights: use lzma
+    writer.write_all(&postcard::to_allocvec(&weights)?)?;
+
     Ok(())
 }
