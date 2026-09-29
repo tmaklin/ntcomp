@@ -23,6 +23,7 @@ use blake3::Hash;
 
 use indexmap::IndexSet;
 
+use petgraph::Direction;
 use petgraph::graph::{
     Graph,
     NodeIndex,
@@ -70,10 +71,10 @@ pub fn decode_sequence(
     sbwt: &SbwtIndexVariant,
 ) -> Vec<u8> {
     let mut path: Vec<(u32, u32)> = Vec::new();
-    for i in 0..nodes.len() {
+    for i in 1..nodes.len() {
         let node_idx = nodes[i];
         let colex_rank = graph[node_idx];
-        let edges = graph.edges_directed(node_idx, petgraph::Direction::Outgoing);
+        let edges = graph.edges_directed(node_idx, Direction::Outgoing);
         let tmp = if i < nodes.len() - 1 { i + 1 } else { 0 };
         let next_node_idx = nodes[tmp];
         for e in edges {
@@ -91,8 +92,7 @@ pub fn decode_sequence(
 pub fn search(
     graph: &Graph<u32, ColexGraphEdge>,
     color: u32,
-    total_weight: u32,
-    hash: Hash,
+    target_hash: Hash,
     sbwt: &SbwtIndexVariant,
     max_visits: u32,
 ) -> Option<Vec<NodeIndex>> {
@@ -108,6 +108,16 @@ pub fn search(
     let first_node = NodeIndex::from(0_u32);
     let last_node = NodeIndex::from(1_u32);
 
+    // Target length is stored in the weight for the first edge
+    let first_edge: Vec<u32> = graph.edges_directed(first_node, Direction::Outgoing)
+        .filter(|e| e.weight().colors.contains(&color))
+        .map(|e| e.weight().weight)
+        .collect();
+    assert!(first_edge.len() == 1);
+
+    // Target weight is multiplied by 2 to account for the first edge's weight
+    let total_weight = first_edge[0] * 2;
+
     stacker::grow(1024 * 1024 * 1024, || {
         backtracking_search(
             graph,
@@ -116,7 +126,7 @@ pub fn search(
             color,
             total_weight,
             nodes_in_path,
-            hash,
+            target_hash,
             &mut HashMap::new(),
             &mut 0_u32,
             &mut Vec::new(),

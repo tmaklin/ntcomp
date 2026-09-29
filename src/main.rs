@@ -38,10 +38,6 @@ use log::info;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
 
-use petgraph::graph::{
-    NodeIndex,
-};
-
 mod cli;
 
 /// Initializes the logger with verbosity given in `log_max_level`.
@@ -321,10 +317,6 @@ fn main() {
                 input.read_exact(&mut hash_bytes).unwrap();
                 let hashes: Vec<Hash> = postcard::from_bytes(&hash_bytes).unwrap();
 
-                let mut lengths_bytes = vec![0_u8; header.lengths_bytes as usize];
-                input.read_exact(&mut lengths_bytes).unwrap();
-                let lengths: Vec<u32> = postcard::from_bytes(&lengths_bytes).unwrap();
-
                 let colors: Vec<u32> = (0..header.n_queries).collect();
 
                 let max_visits = header.max_visits;
@@ -334,7 +326,6 @@ fn main() {
                     let nodes = ntcomp::graph::search(
                         &graph,
                         seq,
-                        lengths[idx],
                         hashes[idx],
                         &sbwt,
                         max_visits,
@@ -368,22 +359,16 @@ fn main() {
                 node_indexes.insert(0);
                 node_indexes.insert(1);
 
-                let mut colors: Vec<u32> = Vec::new();
-                let mut color: u32 = 0;
-
-                let mut expected_lengths: Vec<u32> = Vec::new();
-                let mut expected_seqs: Vec<Vec<u8>> = Vec::new();
-
                 let mut hashes: Vec<Hash> = Vec::new();
 
+                let mut color: u32 = 0;
                 for query_file in query_files.iter() {
                     let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
                     let mut visited: HashSet<u32> = HashSet::new();
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
-                        colors.push(color);
                         let seqrec = rec.normalize(true);
-                        expected_seqs.push(seqrec.to_vec());
+                        let sequence_length = seqrec.len();
 
                         let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
                         let n_entries = dictionary.len();
@@ -391,7 +376,7 @@ fn main() {
                             &mut graph,
                             &mut node_indexes,
                             color,
-                            &(0, 0..0),
+                            &(sequence_length, 0..0),
                             &dictionary[0],
                         );
 
@@ -414,9 +399,8 @@ fn main() {
                             &(0, 1..1),
                         );
 
-                        expected_lengths.push(seqrec.len() as u32);
                         hashes.push(hash(&seqrec));
-                        color +=1;
+                        color += 1;
                     }
                     progress.inc(1_u64);
                 }
@@ -429,16 +413,15 @@ fn main() {
 
                     let graph_bytes = postcard::to_allocvec(&graph).unwrap();
                     let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
-                    let lengths_bytes = postcard::to_allocvec(&expected_lengths).unwrap();
 
                     let header = ntcomp::FileHeader{
                         nlz_header: [0_u8; 6],
                         start_node_bytes: 0,
-                        n_queries: colors.len() as u32,
+                        n_queries: color,
                         colex_bytes: 0_u64,
                         graph_bytes: graph_bytes.len() as u64,
                         hash_bytes: hash_bytes.len().try_into().unwrap(),
-                        lengths_bytes: lengths_bytes.len().try_into().unwrap(),
+                        lengths_bytes: 0,
                         max_visits,
                     };
                     let nbytes = bincode::encode_into_std_write(
@@ -450,7 +433,6 @@ fn main() {
 
                     stdout.write_all(&graph_bytes).unwrap();
                     stdout.write_all(&hash_bytes).unwrap();
-                    stdout.write_all(&lengths_bytes).unwrap();
                 }
 
                 // ntcomp::graph::encode_to(
