@@ -321,10 +321,6 @@ fn main() {
                 input.read_exact(&mut hash_bytes).unwrap();
                 let hashes: Vec<Hash> = postcard::from_bytes(&hash_bytes).unwrap();
 
-                let mut start_node_bytes = vec![0_u8; header.start_node_bytes as usize];
-                input.read_exact(&mut start_node_bytes).unwrap();
-                let start_nodes: Vec<NodeIndex> = postcard::from_bytes(&start_node_bytes).unwrap();
-
                 let mut lengths_bytes = vec![0_u8; header.lengths_bytes as usize];
                 input.read_exact(&mut lengths_bytes).unwrap();
                 let lengths: Vec<u32> = postcard::from_bytes(&lengths_bytes).unwrap();
@@ -337,7 +333,6 @@ fn main() {
                 for (idx, seq) in colors.into_iter().enumerate() {
                     let nodes = ntcomp::graph::search(
                         &graph,
-                        start_nodes[idx],
                         seq,
                         lengths[idx],
                         hashes[idx],
@@ -364,11 +359,17 @@ fn main() {
 
                 let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
                 let mut node_indexes: IndexSet<u32> = IndexSet::new();
+
+                // Dummy nodes to track start and end positions
+                let start_node = graph.add_node(0_u32);
+                let end_node = graph.add_node(0_u32);
+                assert!(start_node.index() == 0);
+                assert!(end_node.index() == 1);
+                node_indexes.insert(0);
+                node_indexes.insert(1);
+
                 let mut colors: Vec<u32> = Vec::new();
                 let mut color: u32 = 0;
-
-                let mut start_nodes: Vec<NodeIndex> = Vec::new();
-                let mut end_nodes: Vec<NodeIndex> = Vec::new();
 
                 let mut expected_lengths: Vec<u32> = Vec::new();
                 let mut expected_seqs: Vec<Vec<u8>> = Vec::new();
@@ -386,6 +387,14 @@ fn main() {
 
                         let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
                         let n_entries = dictionary.len();
+                        ntcomp::graph::insert_edge(
+                            &mut graph,
+                            &mut node_indexes,
+                            color,
+                            &(0, 0..0),
+                            &dictionary[0],
+                        );
+
                         for i in 1..n_entries {
                             visited.insert(dictionary[i - 1].1.start as u32);
                             ntcomp::graph::insert_edge(
@@ -396,19 +405,14 @@ fn main() {
                                 &dictionary[i]
                             );
                         }
-                        // Add a self loop back to the first node to denote termination
-                        // TODO should do this in a way that prev ents loops
                         visited.insert(dictionary[dictionary.len() - 1].1.start as u32);
                         ntcomp::graph::insert_edge(
                             &mut graph,
                             &mut node_indexes,
                             color,
                             &dictionary[dictionary.len() - 1],
-                            &dictionary[0],
+                            &(0, 1..1),
                         );
-
-                        start_nodes.push(NodeIndex::from(node_indexes.get_index_of(&(dictionary[0].1.start as u32)).unwrap() as u32));
-                        end_nodes.push(NodeIndex::from(node_indexes.get_index_of(&(dictionary[dictionary.len() - 1].1.start as u32)).unwrap() as u32));
 
                         expected_lengths.push(seqrec.len() as u32);
                         hashes.push(hash(&seqrec));
@@ -425,12 +429,11 @@ fn main() {
 
                     let graph_bytes = postcard::to_allocvec(&graph).unwrap();
                     let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
-                    let start_node_bytes = postcard::to_allocvec(&start_nodes).unwrap();
                     let lengths_bytes = postcard::to_allocvec(&expected_lengths).unwrap();
 
                     let header = ntcomp::FileHeader{
                         nlz_header: [0_u8; 6],
-                        start_node_bytes: start_node_bytes.len().try_into().unwrap(),
+                        start_node_bytes: 0,
                         n_queries: colors.len() as u32,
                         colex_bytes: 0_u64,
                         graph_bytes: graph_bytes.len() as u64,
@@ -447,7 +450,6 @@ fn main() {
 
                     stdout.write_all(&graph_bytes).unwrap();
                     stdout.write_all(&hash_bytes).unwrap();
-                    stdout.write_all(&start_node_bytes).unwrap();
                     stdout.write_all(&lengths_bytes).unwrap();
                 }
 

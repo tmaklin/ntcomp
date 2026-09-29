@@ -90,7 +90,6 @@ pub fn decode_sequence(
 
 pub fn search(
     graph: &Graph<u32, ColexGraphEdge>,
-    current: NodeIndex,
     color: u32,
     total_weight: u32,
     hash: Hash,
@@ -105,11 +104,15 @@ pub fn search(
         .collect::<Vec<NodeIndex>>()
     ).len();
 
+    // Dummy nodes that denote start/end
+    let first_node = NodeIndex::from(0_u32);
+    let last_node = NodeIndex::from(1_u32);
+
     stacker::grow(1024 * 1024 * 1024, || {
         backtracking_search(
             graph,
-            current,
-            current,
+            first_node,
+            last_node,
             color,
             total_weight,
             nodes_in_path,
@@ -190,8 +193,11 @@ pub fn insert_edge(
     entry_from: &(usize, Range<usize>),
     entry_to: &(usize, Range<usize>),
 ) {
+    // TODO should check that we don't use colex ranks 0 or 1,
+    // iirc these are used for dummy nodes in the SBWT so should be fine
     let source_colex: u32 = entry_from.1.start.try_into().unwrap();
     let target_colex: u32 = entry_to.1.start.try_into().unwrap();
+
     let suffix_len: u32 = entry_from.0.try_into().unwrap();
 
     let from: NodeIndex<u32> = if node_indexes.contains(&source_colex) {
