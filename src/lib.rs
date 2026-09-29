@@ -37,35 +37,19 @@ pub struct FileHeader {
     /// Next two bytes can be used to check which version of nlz was used to generate this file.
     pub nlz_header: [u8; 6], // = [110, 114, 108, 122, ...];
 
-    /// File format version, indicates (in)compatible versions of the file format.
-    pub file_format: u8,
+    pub lengths_bytes: u32,
 
-    /// Compression method used for block contents.
-    pub metadata_compression: u8,
+    pub start_node_bytes: u32,
 
-    /// Codec used to encode the colex intervals, see [Codec](encode::codec) for details.
-    pub codec: u8,
+    pub hash_bytes: u32,
 
-    /// Fields that must be present for all block flags fields, currently unused and unimplemented.
-    pub fields_present: u16,
-
-    /// 8 bit placeholder
-    pub ph1: u8,
-
-    /// Number of query sequences encoded, should be greater or equal to the
-    /// number of records in all blocks.
-    ///
-    /// Can be set to 0 if the number is not known in advance.
     pub n_queries: u32,
 
-    /// How many queries should be stored in each block. Actual number may be different.
-    pub block_size: u32,
+    pub colex_bytes: u64,
 
-    /// Number of bytes in file flags that follow the header bytes.
-    pub flags_len: u64,
+    pub graph_bytes: u64,
 
-    /// 64 bit placeholder
-    pub ph4: u32,
+    pub max_visits: u32,
 }
 
 #[derive(Encode, Decode)]
@@ -84,23 +68,21 @@ pub struct BlockHeader {
 }
 
 pub fn encode_file_header(
-    ph1: u64,
-    ph2: u64,
-    ph3: u64,
-    ph4: u64
+    _ph1: u64,
+    _ph2: u64,
+    _ph3: u64,
+    _ph4: u64
 ) -> Result<Vec<u8>, E> {
     let mut bytes: Vec<u8> = Vec::new();
     let header_placeholder = FileHeader{
         nlz_header: [0_u8; 6],
-        file_format: 0_u8,
-        metadata_compression: 0_u8,
-        codec: 0_u8,
-        fields_present: 0_u16,
-        ph1: 0_u8,
+        start_node_bytes: 0_u32,
         n_queries: 0_u32,
-        block_size: 0_u32,
-        flags_len: 0_u64,
-        ph4: 0_u32,
+        colex_bytes: 0_u64,
+        graph_bytes: 0_u64,
+        hash_bytes: 0_u32,
+        lengths_bytes: 0_u32,
+        max_visits: 0_u32,
     };
     let nbytes = encode_into_std_write(
         &header_placeholder,
@@ -378,8 +360,8 @@ pub fn decode_positions(
             let mut bases: usize = 0;
             encoding.iter().rev().for_each(|record| {
                 let start = bases;
-                let mut encoding_type: u8;
-                let mut colex = None;
+                let encoding_type: u8;
+                let colex: Option<u32>;
 
                 let bytes: Vec<u8> = record.to_ne_bytes()[0..8].to_vec();
                 let mut arr: [u8; 8] = [0; 8];
@@ -445,7 +427,7 @@ pub fn decode_positions(
 
 pub fn read_block<R: std::io::Read>(
     _file_header: &FileHeader,
-    sbwt: &SbwtIndexVariant,
+    _sbwt: &SbwtIndexVariant,
     conn: &mut R,
 ) -> Result<Vec<u64>, E> {
     // Colex ranks

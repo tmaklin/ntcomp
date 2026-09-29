@@ -19,6 +19,13 @@ use std::collections::{
     HashSet,
 };
 
+use std::fs::File;
+
+use blake3::{
+    hash,
+    Hash,
+};
+
 use indexmap::IndexSet;
 
 use indicatif::ProgressBar;
@@ -30,6 +37,10 @@ use clap::Parser;
 use log::info;
 use needletail::Sequence;
 use needletail::parser::SequenceRecord;
+
+use petgraph::graph::{
+    NodeIndex,
+};
 
 mod cli;
 
@@ -47,7 +58,7 @@ fn init_log(log_max_level: usize) {
 // Given a needletail parser, reads the next contig sequence
 fn read_from_fastx_parser(
     reader: &mut dyn needletail::parser::FastxReader,
-) -> Option<SequenceRecord> {
+) -> Option<SequenceRecord<'_>> {
     let rec = reader.next();
     match rec {
         Some(Ok(seqrec)) => {
@@ -259,12 +270,6 @@ fn main() {
             let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
             let _ = stdout.write_all(&header_bytes);
 
-            let k = match sbwt {
-                sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(ref sbwt) => {
-                    sbwt.k()
-                },
-            };
-
             let mut colex_remapping: IndexSet<u32> = IndexSet::new();
             let mut path_starts: Vec<u32> = Vec::with_capacity(query_files.len());
             let mut path_lengths: Vec<u32> = Vec::with_capacity(query_files.len());
@@ -302,33 +307,95 @@ fn main() {
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
             if *decompress {
-                unimplemented!("Decompress graph encoded data");
+                assert!(query_files.len() == 1);
+                let mut input = File::open(&query_files[0]).unwrap();
+                let mut header_bytes: [u8; 42] = [0; 42];
+                input.read_exact(&mut header_bytes).unwrap();
+                let header = ntcomp::decode_file_header(&header_bytes).unwrap();
+
+                let mut graph_bytes = vec![0_u8; header.graph_bytes as usize];
+                input.read_exact(&mut graph_bytes).unwrap();
+                let graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = postcard::from_bytes(&graph_bytes).unwrap();
+
+                let mut colex_bytes = vec![0_u8; header.colex_bytes as usize];
+                input.read_exact(&mut colex_bytes).unwrap();
+                let colex_ranks_used: Vec<u32> = postcard::from_bytes(&colex_bytes).unwrap();
+                let colex_remapping: IndexSet<u32> = IndexSet::from_iter(colex_ranks_used);
+
+                let mut hash_bytes = vec![0_u8; header.hash_bytes as usize];
+                input.read_exact(&mut hash_bytes).unwrap();
+                let hashes: Vec<Hash> = postcard::from_bytes(&hash_bytes).unwrap();
+
+                let mut start_node_bytes = vec![0_u8; header.start_node_bytes as usize];
+                input.read_exact(&mut start_node_bytes).unwrap();
+                let start_nodes: Vec<NodeIndex> = postcard::from_bytes(&start_node_bytes).unwrap();
+
+                let mut lengths_bytes = vec![0_u8; header.lengths_bytes as usize];
+                input.read_exact(&mut lengths_bytes).unwrap();
+                let lengths: Vec<u32> = postcard::from_bytes(&lengths_bytes).unwrap();
+
+                let colors: Vec<u32> = (0..header.n_queries).collect();
+
+                let max_visits = header.max_visits;
+
+                eprintln!("color\tdecoded_len\tpath_found");
+                for (idx, seq) in colors.into_iter().enumerate() {
+                    let nodes = ntcomp::graph::search(
+                        &graph,
+                        start_nodes[idx],
+                        seq,
+                        lengths[idx],
+                        hashes[idx],
+                        &sbwt,
+                        &colex_remapping,
+                        max_visits,
+                    );
+
+                    if let Some(nodes) = nodes {
+                        let sequence = ntcomp::graph::decode_sequence(
+                            &graph,
+                            &nodes,
+                            &colex_remapping,
+                            &sbwt,
+                        );
+                        eprintln!("{seq}\t{}\t{}", sequence.len(), true);
+                    } else {
+                        eprintln!("{seq}\t{}\t{}", 0, false);
+                    }
+                }
             } else {
                 let n_queries = query_files.len();
 
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
-                let _ = stdout.write_all(&header_bytes);
-
                 let mut colex_remapping: IndexSet<u32> = IndexSet::new();
                 let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
-
                 let mut node_indexes: HashSet<u32> = HashSet::new();
-
                 let mut colors: Vec<u32> = Vec::new();
                 let mut color: u32 = 0;
+
+                let mut start_nodes: Vec<NodeIndex> = Vec::new();
+                let mut end_nodes: Vec<NodeIndex> = Vec::new();
+
+                let mut expected_lengths: Vec<u32> = Vec::new();
+                let mut expected_seqs: Vec<Vec<u8>> = Vec::new();
+
+                let mut hashes: Vec<Hash> = Vec::new();
+
                 for query_file in query_files.iter() {
                     let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
+                    let mut visited: HashSet<u32> = HashSet::new();
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         colors.push(color);
                         let seqrec = rec.normalize(true);
+                        expected_seqs.push(seqrec.to_vec());
 
                         let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
                         let n_entries = dictionary.len();
                         for i in 1..n_entries {
+                            visited.insert(dictionary[i - 1].1.start as u32);
                             ntcomp::graph::insert_edge(
                                 &mut graph,
                                 &mut node_indexes,
@@ -339,7 +406,8 @@ fn main() {
                             );
                         }
                         // Add a self loop back to the first node to denote termination
-                        // TODO should do this in a way that prevents loops
+                        // TODO should do this in a way that prev ents loops
+                        visited.insert(dictionary[dictionary.len() - 1].1.start as u32);
                         ntcomp::graph::insert_edge(
                             &mut graph,
                             &mut node_indexes,
@@ -348,14 +416,59 @@ fn main() {
                             &dictionary[dictionary.len() - 1],
                             &dictionary[0],
                         );
+
+                        start_nodes.push(NodeIndex::from(colex_remapping.get_index_of(&(dictionary[0].1.start as u32)).unwrap() as u32));
+                        end_nodes.push(NodeIndex::from(colex_remapping.get_index_of(&(dictionary[dictionary.len() - 1].1.start as u32)).unwrap() as u32));
+
+                        expected_lengths.push(seqrec.len() as u32);
+                        hashes.push(hash(&seqrec));
                         color +=1;
                     }
                     progress.inc(1_u64);
                 }
                 progress.finish();
+                let max_visits = ntcomp::graph::deduplicate_edges(&mut graph);
 
-                stdout.write_all(&postcard::to_allocvec(&colex_remapping.into_iter().collect::<Vec<u32>>()).unwrap()).unwrap();
-                ntcomp::graph::encode_to(graph, &mut stdout).unwrap();
+
+                // TODO move this part to an encoding function
+                {
+                    let colex_ranks_used = colex_remapping.into_iter().collect::<Vec<u32>>();
+
+                    let graph_bytes = postcard::to_allocvec(&graph).unwrap();
+                    let colex_bytes = postcard::to_allocvec(&colex_ranks_used).unwrap();
+                    let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
+                    let start_node_bytes = postcard::to_allocvec(&start_nodes).unwrap();
+                    let lengths_bytes = postcard::to_allocvec(&expected_lengths).unwrap();
+
+                    let header = ntcomp::FileHeader{
+                        nlz_header: [0_u8; 6],
+                        start_node_bytes: start_node_bytes.len().try_into().unwrap(),
+                        n_queries: colors.len() as u32,
+                        colex_bytes: colex_bytes.len() as u64,
+                        graph_bytes: graph_bytes.len() as u64,
+                        hash_bytes: hash_bytes.len().try_into().unwrap(),
+                        lengths_bytes: lengths_bytes.len().try_into().unwrap(),
+                        max_visits,
+                    };
+                    let nbytes = bincode::encode_into_std_write(
+                        &header,
+                        &mut stdout,
+                        bincode::config::standard().with_fixed_int_encoding(),
+                    ).unwrap();
+                    assert_eq!(nbytes, 42);
+
+                    stdout.write_all(&graph_bytes).unwrap();
+                    stdout.write_all(&colex_bytes).unwrap();
+                    stdout.write_all(&hash_bytes).unwrap();
+                    stdout.write_all(&start_node_bytes).unwrap();
+                    stdout.write_all(&lengths_bytes).unwrap();
+                }
+
+                // ntcomp::graph::encode_to(
+                //     &graph,
+                //     &colex_remapping,
+                //     &mut stdout,
+                // ).unwrap();
             }
 
             let _ = stdout.flush();

@@ -32,9 +32,11 @@ stderrlog = "0.6"
 indexmap = "2.14"
 
 ## graph
+blake3 = {version = "1.8", features = ["serde"] }
 petgraph = { version = "0.8", features = ["serde-1"] }
 postcard = { version = "1.1", features = ["alloc"] }
 serde = "1"
+stacker = "0.1"
 
 ## cli
 clap = { version = "4", features = ["derive"]}
