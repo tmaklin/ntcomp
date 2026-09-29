@@ -233,17 +233,28 @@ pub fn deduplicate_edges(
     graph: &mut Graph<u32, ColexGraphEdge>,
 ) -> u32 {
 
-    let mut visit_counts: HashMap<(NodeIndex, NodeIndex, u32), u32> = HashMap::new();
+    let mut visit_counts: HashMap<NodeIndex, Vec<u32>> = HashMap::new();
+
+    let first_node = NodeIndex::from(0_u32);
+    let n_colors: usize = HashSet::<u32>::from_iter(graph.edges_directed(first_node, Direction::Outgoing).flat_map(|e| e.weight().colors.clone()).collect::<Vec<u32>>()).len();
 
     let mut edge_colors: HashMap<(NodeIndex, NodeIndex, u32), Vec<u32>> = HashMap::from_iter(
         graph.edge_references().map(|x| {
-            let key = (x.source(), x.target(), x.weight().weight);
-            visit_counts.entry(key).and_modify(|e| *e += 1).or_insert(1);
+            if x.source().index() > 1 {
+                x.weight().colors.iter().for_each(|color| {
+                    visit_counts.entry(x.source()).and_modify(|e| e[*color as usize] += 1).or_insert( {
+                        let mut counts = vec![0; n_colors];
+                        counts[*color as usize] = 1;
+                        counts
+                    });
+
+                })
+            }
             ((x.source(), x.target(), x.weight().weight), x.weight().colors.clone())
         })
     );
 
-    let max_visits = visit_counts.into_iter().map(|(_, val)| val).max().unwrap();
+    let max_visits = visit_counts.into_values().flatten().max().unwrap();
 
     for e in graph.edge_references() {
         let key = (e.source(), e.target(), e.weight().weight);
