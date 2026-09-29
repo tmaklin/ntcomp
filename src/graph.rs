@@ -67,13 +67,12 @@ pub fn decode_path(
 pub fn decode_sequence(
     graph: &Graph<u32, ColexGraphEdge>,
     nodes: &[NodeIndex],
-    colex_remapping: &IndexSet<u32>,
     sbwt: &SbwtIndexVariant,
 ) -> Vec<u8> {
     let mut path: Vec<(u32, u32)> = Vec::new();
     for i in 0..nodes.len() {
         let node_idx = nodes[i];
-        let colex_rank: u32 = *colex_remapping.get_index(graph[node_idx] as usize).unwrap();
+        let colex_rank = graph[node_idx];
         let edges = graph.edges_directed(node_idx, petgraph::Direction::Outgoing);
         let tmp = if i < nodes.len() - 1 { i + 1 } else { 0 };
         let next_node_idx = nodes[tmp];
@@ -96,7 +95,6 @@ pub fn search(
     total_weight: u32,
     hash: Hash,
     sbwt: &SbwtIndexVariant,
-    colex_remapping: &IndexSet<u32>,
     max_visits: u32,
 ) -> Option<Vec<NodeIndex>> {
 
@@ -120,7 +118,6 @@ pub fn search(
             &mut 0_u32,
             &mut Vec::new(),
             sbwt,
-            colex_remapping,
             max_visits as usize,
         )
     })
@@ -138,7 +135,6 @@ pub fn backtracking_search(
     current_weight: &mut u32,
     path: &mut Vec<NodeIndex>,
     sbwt: &SbwtIndexVariant,
-    colex_remapping: &IndexSet<u32>,
     max_visits: usize,
 ) -> Option<Vec<NodeIndex>> {
     if *current_weight > target_weight || visit_counts.len() > nodes_to_visit {
@@ -149,7 +145,7 @@ pub fn backtracking_search(
     visit_counts.entry(current).and_modify(|e| *e += 1).or_insert(1);
 
     if current == end && *current_weight == target_weight {
-        let nucleotides = decode_sequence(graph, &path.clone(), colex_remapping, sbwt);
+        let nucleotides = decode_sequence(graph, &path.clone(), sbwt);
         let hash_got = blake3::hash(&nucleotides);
         if hash_got == hash {
             return Some(path.to_vec())
@@ -168,7 +164,7 @@ pub fn backtracking_search(
         let is_valid = visit_counts.get(&edge.target()).unwrap_or(&0_usize) <= &max_visits;
 
         if is_valid {
-            if backtracking_search(graph, edge.target(), end, color, target_weight, nodes_to_visit, hash, visit_counts, current_weight, path, sbwt, colex_remapping, max_visits).is_some() {
+            if backtracking_search(graph, edge.target(), end, color, target_weight, nodes_to_visit, hash, visit_counts, current_weight, path, sbwt, max_visits).is_some() {
                 return Some(path.to_vec())
             }
         }
@@ -189,37 +185,32 @@ pub fn backtracking_search(
 
 pub fn insert_edge(
     graph: &mut Graph<u32, ColexGraphEdge>,
-    node_indexes: &mut HashSet<u32>,
-    colex_remapping: &mut IndexSet<u32>,
+    node_indexes: &mut IndexSet<u32>,
     color: u32,
     entry_from: &(usize, Range<usize>),
     entry_to: &(usize, Range<usize>),
 ) {
-    let prev_idx: u32 = entry_from.1.start.try_into().unwrap();
-    let curr_idx: u32 = entry_to.1.start.try_into().unwrap();
-    let weight = entry_from.0;
+    let source_colex: u32 = entry_from.1.start.try_into().unwrap();
+    let target_colex: u32 = entry_to.1.start.try_into().unwrap();
+    let suffix_len: u32 = entry_from.0.try_into().unwrap();
 
-    colex_remapping.insert(prev_idx);
-    colex_remapping.insert(curr_idx);
-
-    let edge_start: u32 = colex_remapping.get_index_of(&prev_idx).unwrap().try_into().unwrap();
-    let edge_end: u32 = colex_remapping.get_index_of(&curr_idx).unwrap().try_into().unwrap();
-
-    let from = if node_indexes.contains(&edge_start) {
-        NodeIndex::from(edge_start)
+    let from: NodeIndex<u32> = if node_indexes.contains(&source_colex) {
+        let source_index = node_indexes.get_index_of(&source_colex).unwrap();
+        NodeIndex::from(source_index as u32)
     } else {
-        node_indexes.insert(edge_start);
-        graph.add_node(edge_start)
+        node_indexes.insert(source_colex);
+        graph.add_node(source_colex)
     };
 
-    let to = if node_indexes.contains(&edge_end) {
-        NodeIndex::from(edge_end)
+    let to = if node_indexes.contains(&target_colex) {
+        let target_index = node_indexes.get_index_of(&target_colex).unwrap();
+        NodeIndex::from(target_index as u32)
     } else {
-        node_indexes.insert(edge_end);
-        graph.add_node(edge_end)
+        node_indexes.insert(target_colex);
+        graph.add_node(target_colex)
     };
 
-    graph.try_add_edge(from, to, ColexGraphEdge { weight: weight.try_into().unwrap(), colors: vec![color] }).unwrap();
+    graph.try_add_edge(from, to, ColexGraphEdge { weight: suffix_len, colors: vec![color] }).unwrap();
 }
 
 pub fn deduplicate_edges(

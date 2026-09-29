@@ -317,11 +317,6 @@ fn main() {
                 input.read_exact(&mut graph_bytes).unwrap();
                 let graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = postcard::from_bytes(&graph_bytes).unwrap();
 
-                let mut colex_bytes = vec![0_u8; header.colex_bytes as usize];
-                input.read_exact(&mut colex_bytes).unwrap();
-                let colex_ranks_used: Vec<u32> = postcard::from_bytes(&colex_bytes).unwrap();
-                let colex_remapping: IndexSet<u32> = IndexSet::from_iter(colex_ranks_used);
-
                 let mut hash_bytes = vec![0_u8; header.hash_bytes as usize];
                 input.read_exact(&mut hash_bytes).unwrap();
                 let hashes: Vec<Hash> = postcard::from_bytes(&hash_bytes).unwrap();
@@ -347,7 +342,6 @@ fn main() {
                         lengths[idx],
                         hashes[idx],
                         &sbwt,
-                        &colex_remapping,
                         max_visits,
                     );
 
@@ -355,7 +349,6 @@ fn main() {
                         let sequence = ntcomp::graph::decode_sequence(
                             &graph,
                             &nodes,
-                            &colex_remapping,
                             &sbwt,
                         );
                         eprintln!("{seq}\t{}\t{}", sequence.len(), true);
@@ -369,9 +362,8 @@ fn main() {
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let mut colex_remapping: IndexSet<u32> = IndexSet::new();
                 let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
-                let mut node_indexes: HashSet<u32> = HashSet::new();
+                let mut node_indexes: IndexSet<u32> = IndexSet::new();
                 let mut colors: Vec<u32> = Vec::new();
                 let mut color: u32 = 0;
 
@@ -399,7 +391,6 @@ fn main() {
                             ntcomp::graph::insert_edge(
                                 &mut graph,
                                 &mut node_indexes,
-                                &mut colex_remapping,
                                 color,
                                 &dictionary[i - 1],
                                 &dictionary[i]
@@ -411,14 +402,13 @@ fn main() {
                         ntcomp::graph::insert_edge(
                             &mut graph,
                             &mut node_indexes,
-                            &mut colex_remapping,
                             color,
                             &dictionary[dictionary.len() - 1],
                             &dictionary[0],
                         );
 
-                        start_nodes.push(NodeIndex::from(colex_remapping.get_index_of(&(dictionary[0].1.start as u32)).unwrap() as u32));
-                        end_nodes.push(NodeIndex::from(colex_remapping.get_index_of(&(dictionary[dictionary.len() - 1].1.start as u32)).unwrap() as u32));
+                        start_nodes.push(NodeIndex::from(node_indexes.get_index_of(&(dictionary[0].1.start as u32)).unwrap() as u32));
+                        end_nodes.push(NodeIndex::from(node_indexes.get_index_of(&(dictionary[dictionary.len() - 1].1.start as u32)).unwrap() as u32));
 
                         expected_lengths.push(seqrec.len() as u32);
                         hashes.push(hash(&seqrec));
@@ -432,10 +422,8 @@ fn main() {
 
                 // TODO move this part to an encoding function
                 {
-                    let colex_ranks_used = colex_remapping.into_iter().collect::<Vec<u32>>();
 
                     let graph_bytes = postcard::to_allocvec(&graph).unwrap();
-                    let colex_bytes = postcard::to_allocvec(&colex_ranks_used).unwrap();
                     let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
                     let start_node_bytes = postcard::to_allocvec(&start_nodes).unwrap();
                     let lengths_bytes = postcard::to_allocvec(&expected_lengths).unwrap();
@@ -444,7 +432,7 @@ fn main() {
                         nlz_header: [0_u8; 6],
                         start_node_bytes: start_node_bytes.len().try_into().unwrap(),
                         n_queries: colors.len() as u32,
-                        colex_bytes: colex_bytes.len() as u64,
+                        colex_bytes: 0_u64,
                         graph_bytes: graph_bytes.len() as u64,
                         hash_bytes: hash_bytes.len().try_into().unwrap(),
                         lengths_bytes: lengths_bytes.len().try_into().unwrap(),
@@ -458,7 +446,6 @@ fn main() {
                     assert_eq!(nbytes, 42);
 
                     stdout.write_all(&graph_bytes).unwrap();
-                    stdout.write_all(&colex_bytes).unwrap();
                     stdout.write_all(&hash_bytes).unwrap();
                     stdout.write_all(&start_node_bytes).unwrap();
                     stdout.write_all(&lengths_bytes).unwrap();
