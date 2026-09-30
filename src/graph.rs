@@ -23,7 +23,10 @@ use blake3::Hash;
 
 use indexmap::IndexSet;
 
-use petgraph::Direction;
+use petgraph::{
+    Direction,
+    EdgeType,
+};
 use petgraph::graph::{
     Graph,
     NodeIndex,
@@ -282,6 +285,93 @@ pub fn deduplicate_edges(
     }
 
     max_visits
+}
+
+/// CSR for storage
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct Csr<N> {
+    pub node_weights: Vec<N>,
+    pub row_ptrs: Vec<u32>,
+    pub column_indices: Vec<u32>,
+    pub suffix_lens: Vec<u32>,
+    pub colorsets: Vec<Vec<u32>>,
+}
+
+impl<N> Csr<N> {
+    pub fn from_petgraph<Ty: EdgeType>(
+        graph: &Graph<N, ColexGraphEdge, Ty>,
+    ) -> Self
+    where
+        N: Copy,
+    {
+        let node_count = graph.node_count();
+        let edge_count = graph.edge_count();
+
+        let mut row_ptrs = Vec::with_capacity(node_count + 1);
+        let mut column_indices = Vec::with_capacity(edge_count);
+        let mut suffix_lens = Vec::with_capacity(edge_count);
+        let mut node_weights = Vec::with_capacity(node_count);
+        let mut colorsets: Vec<Vec<u32>> = Vec::with_capacity(edge_count);
+
+        let mut current_offset = 0;
+        row_ptrs.push(current_offset);
+
+        for node in graph.node_indices() {
+            let edges = graph.edges_directed(node, Direction::Outgoing);
+
+            for edge in edges {
+                column_indices.push(edge.target().index().try_into().unwrap());
+                suffix_lens.push(edge.weight().weight);
+                colorsets.push(edge.weight().colors.clone());
+                current_offset += 1;
+            }
+            node_weights.push(graph[node]);
+            row_ptrs.push(current_offset);
+        }
+
+        Self {
+            node_weights,
+            row_ptrs,
+            column_indices,
+            suffix_lens,
+            colorsets,
+        }
+    }
+
+    pub fn to_petgraph<Ty: EdgeType>(
+        &self,
+    ) -> Graph<N, ColexGraphEdge, Ty>
+    where
+        N: Copy,
+    {
+        let mut graph = Graph::with_capacity(self.node_weights.len(), self.column_indices.len());
+
+        for weight in &self.node_weights {
+            graph.add_node(*weight);
+        }
+
+        for source_idx in 0..self.node_weights.len() {
+            let start = self.row_ptrs[source_idx];
+            let end = self.row_ptrs[source_idx + 1];
+
+            for edge_offset in start..end {
+                let target_idx = self.column_indices[edge_offset as usize] as usize;
+                let suffix_len = &self.suffix_lens[edge_offset as usize];
+                let colorset = &self.colorsets[edge_offset as usize];
+
+                graph.add_edge(
+                    NodeIndex::new(source_idx),
+                    NodeIndex::new(target_idx),
+                    ColexGraphEdge {
+                        weight: *suffix_len,
+                        colors: colorset.to_vec(),
+                    },
+                );
+            }
+        }
+
+        graph
+    }
 }
 
 /// With colex ranks stored in the node

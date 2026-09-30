@@ -311,7 +311,8 @@ fn main() {
 
                 let mut graph_bytes = vec![0_u8; header.graph_bytes as usize];
                 input.read_exact(&mut graph_bytes).unwrap();
-                let graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = postcard::from_bytes(&graph_bytes).unwrap();
+                let csr: ntcomp::graph::Csr<u32> = postcard::from_bytes(&graph_bytes).unwrap();
+                let graph = csr.to_petgraph();
 
                 let mut hash_bytes = vec![0_u8; header.hash_bytes as usize];
                 input.read_exact(&mut hash_bytes).unwrap();
@@ -407,11 +408,11 @@ fn main() {
                 progress.finish();
                 let max_visits = ntcomp::graph::deduplicate_edges(&mut graph);
 
-
                 // TODO move this part to an encoding function
                 {
 
-                    let graph_bytes = postcard::to_allocvec(&graph).unwrap();
+                    let csr = ntcomp::graph::Csr::from_petgraph(&graph);
+                    let graph_bytes = postcard::to_allocvec(&csr).unwrap();
                     let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
 
                     let header = ntcomp::FileHeader{
