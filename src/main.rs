@@ -366,7 +366,6 @@ fn main() {
                 for query_file in query_files.iter() {
                     let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
 
-                    let mut visited: HashSet<u32> = HashSet::new();
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         let seqrec = rec.normalize(true);
                         let sequence_length = seqrec.len();
@@ -382,7 +381,6 @@ fn main() {
                         );
 
                         for i in 1..n_entries {
-                            visited.insert(dictionary[i - 1].1.start as u32);
                             ntcomp::graph::insert_edge(
                                 &mut graph,
                                 &mut node_indexes,
@@ -391,7 +389,6 @@ fn main() {
                                 &dictionary[i]
                             );
                         }
-                        visited.insert(dictionary[dictionary.len() - 1].1.start as u32);
                         ntcomp::graph::insert_edge(
                             &mut graph,
                             &mut node_indexes,
