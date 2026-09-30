@@ -299,7 +299,7 @@ pub struct Csr<N> {
 
 impl<N> Csr<N> {
     pub fn from_petgraph<Ty: EdgeType>(
-        graph: &Graph<N, ColexGraphEdge, Ty>,
+        graph: Graph<N, ColexGraphEdge, Ty>,
     ) -> Self
     where
         N: Copy,
@@ -339,7 +339,7 @@ impl<N> Csr<N> {
     }
 
     pub fn to_petgraph<Ty: EdgeType>(
-        &self,
+        self,
     ) -> Graph<N, ColexGraphEdge, Ty>
     where
         N: Copy,
