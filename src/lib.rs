@@ -37,7 +37,7 @@ pub struct FileHeader {
     /// Next two bytes can be used to check which version of nlz was used to generate this file.
     pub nlz_header: [u8; 6], // = [110, 114, 108, 122, ...];
 
-    pub lengths_bytes: u32,
+    pub file_range_bytes: u32,
 
     pub start_node_bytes: u32,
 
@@ -45,7 +45,7 @@ pub struct FileHeader {
 
     pub n_queries: u32,
 
-    pub colex_bytes: u64,
+    pub contig_name_bytes: u64,
 
     pub graph_bytes: u64,
 
@@ -78,10 +78,10 @@ pub fn encode_file_header(
         nlz_header: [0_u8; 6],
         start_node_bytes: 0_u32,
         n_queries: 0_u32,
-        colex_bytes: 0_u64,
+        contig_name_bytes: 0_u64,
         graph_bytes: 0_u64,
         hash_bytes: 0_u32,
-        lengths_bytes: 0_u32,
+        file_range_bytes: 0_u32,
         max_visits: 0_u32,
     };
     let nbytes = encode_into_std_write(

@@ -309,6 +309,14 @@ fn main() {
                 input.read_exact(&mut header_bytes).unwrap();
                 let header = ntcomp::decode_file_header(&header_bytes).unwrap();
 
+                let mut file_range_bytes = vec![0_u8; header.file_range_bytes as usize];
+                input.read_exact(&mut file_range_bytes).unwrap();
+                let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = postcard::from_bytes(&file_range_bytes).unwrap();
+
+                let mut contig_name_bytes = vec![0_u8; header.contig_name_bytes as usize];
+                input.read_exact(&mut contig_name_bytes).unwrap();
+                let contig_names: Vec<Vec<u8>> = postcard::from_bytes(&contig_name_bytes).unwrap();
+
                 let mut graph_bytes = vec![0_u8; header.graph_bytes as usize];
                 input.read_exact(&mut graph_bytes).unwrap();
                 let csr: ntcomp::graph::Csr<u32> = postcard::from_bytes(&graph_bytes).unwrap();
@@ -322,8 +330,12 @@ fn main() {
 
                 let max_visits = header.max_visits;
 
-                eprintln!("color\tdecoded_len\tpath_found");
+                eprintln!("accession\tcontig\tdecoded_len\tpath_found");
+                let mut file_idx: usize = 0;
                 for (idx, seq) in colors.into_iter().enumerate() {
+                    if idx as u32 == file_ranges[file_idx].1.end {
+                        file_idx += 1;
+                    }
                     let nodes = ntcomp::graph::search(
                         &graph,
                         seq,
@@ -332,15 +344,17 @@ fn main() {
                         max_visits,
                     );
 
+                    let file_name = String::from_utf8(file_ranges[file_idx].0.to_vec()).unwrap_or(file_idx.to_string());
+                    let contig_name = String::from_utf8(contig_names[idx].to_vec()).unwrap_or(seq.to_string());
                     if let Some(nodes) = nodes {
                         let sequence = ntcomp::graph::decode_sequence(
                             &graph,
                             &nodes,
                             &sbwt,
                         );
-                        eprintln!("{seq}\t{}\t{}", sequence.len(), true);
+                        eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, sequence.len(), true);
                     } else {
-                        eprintln!("{seq}\t{}\t{}", 0, false);
+                        eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, 0, false);
                     }
                 }
             } else {
@@ -362,11 +376,16 @@ fn main() {
 
                 let mut hashes: Vec<Hash> = Vec::new();
 
+                let mut contig_names: Vec<Vec<u8>> = Vec::with_capacity(n_queries);
+                let mut file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = Vec::with_capacity(n_queries);
+
                 let mut color: u32 = 0;
                 for query_file in query_files.iter() {
                     let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
+                    let start = color;
 
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
+                        contig_names.push(rec.id().to_vec());
                         let seqrec = rec.normalize(true);
                         let sequence_length = seqrec.len();
 
@@ -400,6 +419,10 @@ fn main() {
                         hashes.push(hash(&seqrec));
                         color += 1;
                     }
+                    let end = color;
+                    let filename: Vec<u8> = query_file.file_prefix().unwrap().as_encoded_bytes().to_vec();
+                    file_ranges.push((filename, start..end));
+
                     progress.inc(1_u64);
                 }
                 progress.finish();
@@ -412,14 +435,16 @@ fn main() {
                     let graph_bytes = postcard::to_allocvec(&csr).unwrap();
                     let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
 
+                    let contig_name_bytes = postcard::to_allocvec(&contig_names).unwrap();
+                    let file_range_bytes = postcard::to_allocvec(&file_ranges).unwrap();
                     let header = ntcomp::FileHeader{
                         nlz_header: [0_u8; 6],
                         start_node_bytes: 0,
                         n_queries: color,
-                        colex_bytes: 0_u64,
+                        contig_name_bytes: contig_name_bytes.len().try_into().unwrap(),
                         graph_bytes: graph_bytes.len() as u64,
                         hash_bytes: hash_bytes.len().try_into().unwrap(),
-                        lengths_bytes: 0,
+                        file_range_bytes: file_range_bytes.len().try_into().unwrap(),
                         max_visits,
                     };
                     let nbytes = bincode::encode_into_std_write(
@@ -429,6 +454,8 @@ fn main() {
                     ).unwrap();
                     assert_eq!(nbytes, 42);
 
+                    stdout.write_all(&file_range_bytes).unwrap();
+                    stdout.write_all(&contig_name_bytes).unwrap();
                     stdout.write_all(&graph_bytes).unwrap();
                     stdout.write_all(&hash_bytes).unwrap();
                 }
