@@ -104,6 +104,12 @@ pub enum Commands {
 
         #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]
         decompress: bool,
+
+        #[arg(long = "fasta", default_value_t = false, help = ".fasta output")]
+        fasta: bool,
+
+        #[arg(long = "fasta-cols", default_value_t = 80, help = ".fasta columns")]
+        fasta_columns: usize,
     },
 
     // Decode data written with Encode

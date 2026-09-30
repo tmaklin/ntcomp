@@ -296,6 +296,8 @@ fn main() {
             query_files,
             index_prefix,
             decompress,
+            fasta,
+            fasta_columns,
         }) => {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
@@ -330,7 +332,9 @@ fn main() {
 
                 let max_visits = header.max_visits;
 
-                eprintln!("accession\tcontig\tdecoded_len\tpath_found");
+                if !fasta {
+                    eprintln!("accession\tcontig\tdecoded_len\tpath_found");
+                }
                 let mut file_idx: usize = 0;
                 for (idx, seq) in colors.into_iter().enumerate() {
                     if idx as u32 == file_ranges[file_idx].1.end {
@@ -352,9 +356,22 @@ fn main() {
                             &nodes,
                             &sbwt,
                         );
-                        eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, sequence.len(), true);
+                        if !fasta {
+                            eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, sequence.len(), true);
+                        } else {
+                            stdout.write_all(b">").unwrap();
+                            stdout.write_all(&contig_names[idx].to_vec()).unwrap();
+                            stdout.write_all(b"\n").unwrap();
+                            sequence.chunks(*fasta_columns).for_each(|chunk| {
+                                stdout.write_all(chunk).unwrap();
+                                stdout.write_all(b"\n").unwrap();
+                            });
+                            stdout.flush().unwrap();
+                        }
                     } else {
-                        eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, 0, false);
+                        if !fasta {
+                            eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, 0, false);
+                        }
                     }
                 }
             } else {
