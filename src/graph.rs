@@ -162,8 +162,6 @@ pub fn backtracking_search(
         let hash_got = blake3::hash(&nucleotides);
         if hash_got == hash {
             return Some(path.to_vec())
-        } else {
-            return None
         }
     }
 
