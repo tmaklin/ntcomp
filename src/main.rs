@@ -307,26 +307,37 @@ fn main() {
             if *decompress {
                 assert!(query_files.len() == 1);
                 let mut input = File::open(&query_files[0]).unwrap();
-                let mut header_bytes: [u8; 42] = [0; 42];
-                input.read_exact(&mut header_bytes).unwrap();
-                let header = ntcomp::decode_file_header(&header_bytes).unwrap();
 
-                let mut file_range_bytes = vec![0_u8; header.file_range_bytes as usize];
-                input.read_exact(&mut file_range_bytes).unwrap();
-                let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = postcard::from_bytes(&file_range_bytes).unwrap();
+                let header = {
+                    let mut header_bytes: [u8; 42] = [0; 42];
+                    input.read_exact(&mut header_bytes).unwrap();
+                    ntcomp::decode_file_header(&header_bytes).unwrap()
+                };
 
-                let mut contig_name_bytes = vec![0_u8; header.contig_name_bytes as usize];
-                input.read_exact(&mut contig_name_bytes).unwrap();
-                let contig_names: Vec<Vec<u8>> = postcard::from_bytes(&contig_name_bytes).unwrap();
+                let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = {
+                    let mut file_range_bytes = vec![0_u8; header.file_range_bytes as usize];
+                    input.read_exact(&mut file_range_bytes).unwrap();
+                    postcard::from_bytes(&file_range_bytes).unwrap()
+                };
 
-                let mut graph_bytes = vec![0_u8; header.graph_bytes as usize];
-                input.read_exact(&mut graph_bytes).unwrap();
-                let csr: ntcomp::graph::Csr<u32> = postcard::from_bytes(&graph_bytes).unwrap();
-                let graph = csr.to_petgraph();
+                let contig_names: Vec<Vec<u8>> = {
+                    let mut contig_name_bytes = vec![0_u8; header.contig_name_bytes as usize];
+                    input.read_exact(&mut contig_name_bytes).unwrap();
+                    postcard::from_bytes(&contig_name_bytes).unwrap()
+                };
 
-                let mut hash_bytes = vec![0_u8; header.hash_bytes as usize];
-                input.read_exact(&mut hash_bytes).unwrap();
-                let hashes: Vec<Hash> = postcard::from_bytes(&hash_bytes).unwrap();
+                let graph = {
+                    let mut graph_bytes = vec![0_u8; header.graph_bytes as usize];
+                    input.read_exact(&mut graph_bytes).unwrap();
+                    let csr: ntcomp::graph::Csr<u32> = postcard::from_bytes(&graph_bytes).unwrap();
+                    csr.to_petgraph()
+                };
+
+                let hashes: Vec<Hash> = {
+                    let mut hash_bytes = vec![0_u8; header.hash_bytes as usize];
+                    input.read_exact(&mut hash_bytes).unwrap();
+                    postcard::from_bytes(&hash_bytes).unwrap()
+                };
 
                 let colors: Vec<u32> = (0..header.n_queries).collect();
 
@@ -448,20 +459,20 @@ fn main() {
                 // TODO move this part to an encoding function
                 {
 
-                    let csr = ntcomp::graph::Csr::from_petgraph(&graph);
-                    let graph_bytes = postcard::to_allocvec(&csr).unwrap();
-                    let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
+                    let csr = ntcomp::graph::Csr::from_petgraph(graph);
+                    let graph_bytes_len = postcard::to_allocvec(&csr).unwrap().len();
+                    let hash_bytes_len = postcard::to_allocvec(&hashes).unwrap().len();
 
-                    let contig_name_bytes = postcard::to_allocvec(&contig_names).unwrap();
-                    let file_range_bytes = postcard::to_allocvec(&file_ranges).unwrap();
+                    let contig_name_bytes_len = postcard::to_allocvec(&contig_names).unwrap().len();
+                    let file_range_bytes_len = postcard::to_allocvec(&file_ranges).unwrap().len();
                     let header = ntcomp::FileHeader{
                         nlz_header: [0_u8; 6],
                         start_node_bytes: 0,
                         n_queries: color,
-                        contig_name_bytes: contig_name_bytes.len().try_into().unwrap(),
-                        graph_bytes: graph_bytes.len() as u64,
-                        hash_bytes: hash_bytes.len().try_into().unwrap(),
-                        file_range_bytes: file_range_bytes.len().try_into().unwrap(),
+                        contig_name_bytes: contig_name_bytes_len.try_into().unwrap(),
+                        graph_bytes: graph_bytes_len as u64,
+                        hash_bytes: hash_bytes_len.try_into().unwrap(),
+                        file_range_bytes: file_range_bytes_len.try_into().unwrap(),
                         max_visits,
                     };
                     let nbytes = bincode::encode_into_std_write(
@@ -471,10 +482,10 @@ fn main() {
                     ).unwrap();
                     assert_eq!(nbytes, 42);
 
-                    stdout.write_all(&file_range_bytes).unwrap();
-                    stdout.write_all(&contig_name_bytes).unwrap();
-                    stdout.write_all(&graph_bytes).unwrap();
-                    stdout.write_all(&hash_bytes).unwrap();
+                    postcard::to_io(&file_ranges, &mut stdout).unwrap();
+                    postcard::to_io(&contig_names, &mut stdout).unwrap();
+                    postcard::to_io(&csr, &mut stdout).unwrap();
+                    postcard::to_io(&hashes, &mut stdout).unwrap();
                 }
 
                 // ntcomp::graph::encode_to(
