@@ -227,7 +227,7 @@ pub fn insert_edge(
         graph.add_node(target_colex)
     };
 
-    graph.try_add_edge(from, to, ColexGraphEdge { weight: suffix_len, colors: vec![color] }).unwrap();
+    graph.try_add_edge(from, to, ColexGraphEdge { weight: suffix_len, colors: vec![color], visit_counts: vec![1] }).unwrap();
 }
 
 pub fn deduplicate_edges(
@@ -241,21 +241,18 @@ pub fn deduplicate_edges(
 
     let mut edge_colors: HashMap<(NodeIndex, NodeIndex, u32), Vec<u32>> = HashMap::from_iter(
         graph.edge_references().map(|x| {
-            if x.source().index() > 1 {
-                x.weight().colors.iter().for_each(|color| {
-                    visit_counts.entry(x.source()).and_modify(|e| e[*color as usize] += 1).or_insert( {
-                        let mut counts = vec![0; n_colors];
-                        counts[*color as usize] = 1;
-                        counts
-                    });
-
-                })
-            }
+            x.weight().colors.iter().for_each(|color| {
+                visit_counts.entry(x.target()).and_modify(|e| e[*color as usize] += 1).or_insert( {
+                    let mut counts = vec![0; n_colors];
+                    counts[*color as usize] = 1;
+                    counts
+                });
+            });
             ((x.source(), x.target(), x.weight().weight), x.weight().colors.clone())
         })
     );
 
-    let max_visits = visit_counts.into_values().flatten().max().unwrap();
+    let max_visits = *visit_counts.values().flatten().max().unwrap();
 
     for e in graph.edge_references() {
         let key = (e.source(), e.target(), e.weight().weight);
@@ -268,11 +265,13 @@ pub fn deduplicate_edges(
     let edges_iter = graph.edge_references().map(|x| {
         let key = (x.source(), x.target(), x.weight().weight);
         let colors = edge_colors.get(&key).unwrap().clone();
+        let visit_counts = visit_counts.get(&x.target()).unwrap().clone();
         (x.source(),
          x.target(),
          ColexGraphEdge {
              weight: x.weight().weight,
              colors,
+             visit_counts,
          },
         )
     });
@@ -295,6 +294,7 @@ pub struct Csr<N> {
     pub column_indices: Vec<u32>,
     pub suffix_lens: Vec<u32>,
     pub colorsets: Vec<Vec<u32>>,
+    pub visit_counts: Vec<Vec<u32>>,
 }
 
 impl<N> Csr<N> {
@@ -312,6 +312,7 @@ impl<N> Csr<N> {
         let mut suffix_lens = Vec::with_capacity(edge_count);
         let mut node_weights = Vec::with_capacity(node_count);
         let mut colorsets: Vec<Vec<u32>> = Vec::with_capacity(edge_count);
+        let mut visit_counts: Vec<Vec<u32>> = Vec::with_capacity(edge_count);
 
         let mut current_offset = 0;
         row_ptrs.push(current_offset);
@@ -323,6 +324,7 @@ impl<N> Csr<N> {
                 column_indices.push(edge.target().index().try_into().unwrap());
                 suffix_lens.push(edge.weight().weight);
                 colorsets.push(edge.weight().colors.clone());
+                visit_counts.push(edge.weight().visit_counts.clone());
                 current_offset += 1;
             }
             node_weights.push(graph[node]);
@@ -335,6 +337,7 @@ impl<N> Csr<N> {
             column_indices,
             suffix_lens,
             colorsets,
+            visit_counts,
         }
     }
 
@@ -358,6 +361,7 @@ impl<N> Csr<N> {
                 let target_idx = self.column_indices[edge_offset as usize] as usize;
                 let suffix_len = &self.suffix_lens[edge_offset as usize];
                 let colorset = &self.colorsets[edge_offset as usize];
+                let visit_counts = &self.visit_counts[edge_offset as usize];
 
                 graph.add_edge(
                     NodeIndex::new(source_idx),
@@ -365,6 +369,7 @@ impl<N> Csr<N> {
                     ColexGraphEdge {
                         weight: *suffix_len,
                         colors: colorset.to_vec(),
+                        visit_counts: visit_counts.clone(),
                     },
                 );
             }
