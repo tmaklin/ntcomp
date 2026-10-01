@@ -79,12 +79,12 @@ impl PartialOrd for StackState {
             self.path.len() == other.path.len() &&
             self.node == other.node;
 
-        if is_less {
+        if is_partial_eq {
+            Some(Ordering::Equal)
+        } else if is_less {
             Some(Ordering::Less)
         } else if is_greater {
             Some(Ordering::Greater)
-        } else if is_partial_eq {
-            Some(Ordering::Equal)
         } else {
             None
         }
