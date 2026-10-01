@@ -39,7 +39,7 @@ pub struct FileHeader {
 
     pub file_range_bytes: u32,
 
-    pub start_node_bytes: u32,
+    pub path_len_bytes: u32,
 
     pub hash_bytes: u32,
 
@@ -76,7 +76,7 @@ pub fn encode_file_header(
     let mut bytes: Vec<u8> = Vec::new();
     let header_placeholder = FileHeader{
         nlz_header: [0_u8; 6],
-        start_node_bytes: 0_u32,
+        path_len_bytes: 0_u32,
         n_queries: 0_u32,
         contig_name_bytes: 0_u64,
         graph_bytes: 0_u64,

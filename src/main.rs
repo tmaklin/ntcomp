@@ -339,6 +339,12 @@ fn main() {
                     postcard::from_bytes(&hash_bytes).unwrap()
                 };
 
+                let path_lens: Vec<u32> = {
+                    let mut path_len_bytes = vec![0_u8; header.path_len_bytes as usize];
+                    input.read_exact(&mut path_len_bytes).unwrap();
+                    postcard::from_bytes(&path_len_bytes).unwrap()
+                };
+
                 let colors: Vec<u32> = (0..header.n_queries).collect();
 
                 let max_visits = header.max_visits;
@@ -356,7 +362,7 @@ fn main() {
                         seq,
                         hashes[idx],
                         &sbwt,
-                        max_visits,
+                        path_lens[idx],
                     );
 
                     let file_name = String::from_utf8(file_ranges[file_idx].0.to_vec()).unwrap_or(file_idx.to_string());
@@ -406,6 +412,7 @@ fn main() {
 
                 let mut contig_names: Vec<Vec<u8>> = Vec::with_capacity(n_queries);
                 let mut file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = Vec::with_capacity(n_queries);
+                let mut path_lens: Vec<u32> = Vec::new();
 
                 let mut color: u32 = 0;
                 for query_file in query_files.iter() {
@@ -419,6 +426,8 @@ fn main() {
 
                         let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
                         let n_entries = dictionary.len();
+                        path_lens.push(n_entries as u32 + 2);
+                        let avg_suffix_len = (dictionary.iter().map(|x| x.0 as f64).sum::<f64>() / (dictionary.len() as f64)) as usize;
                         ntcomp::graph::insert_edge(
                             &mut graph,
                             &mut node_indexes,
@@ -462,12 +471,13 @@ fn main() {
                     let csr = ntcomp::graph::Csr::from_petgraph(graph);
                     let graph_bytes_len = postcard::to_allocvec(&csr).unwrap().len();
                     let hash_bytes_len = postcard::to_allocvec(&hashes).unwrap().len();
+                    let path_len_bytes_len = postcard::to_allocvec(&path_lens).unwrap().len();
 
                     let contig_name_bytes_len = postcard::to_allocvec(&contig_names).unwrap().len();
                     let file_range_bytes_len = postcard::to_allocvec(&file_ranges).unwrap().len();
                     let header = ntcomp::FileHeader{
                         nlz_header: [0_u8; 6],
-                        start_node_bytes: 0,
+                        path_len_bytes: path_len_bytes_len.try_into().unwrap(),
                         n_queries: color,
                         contig_name_bytes: contig_name_bytes_len.try_into().unwrap(),
                         graph_bytes: graph_bytes_len as u64,
@@ -486,6 +496,7 @@ fn main() {
                     postcard::to_io(&contig_names, &mut stdout).unwrap();
                     postcard::to_io(&csr, &mut stdout).unwrap();
                     postcard::to_io(&hashes, &mut stdout).unwrap();
+                    postcard::to_io(&path_lens, &mut stdout).unwrap();
                 }
 
                 // ntcomp::graph::encode_to(
