@@ -1,6 +1,12 @@
 # ntcomp
 (Proof of concept) Reference-based microbial sequencing data compression using [SBWT](https://docs.rs/sbwt) and [_k_-bounded matching statistics](https://www.biorxiv.org/content/10.1101/2024.02.19.580943v1).
 
+Implements two algorithms for compressing/decompressing microbial genome assemblies:
+- nlz: Nucleotide relative Lempel-Ziv, encodes the sequence contents of an assembly using its SBWT as the dictionary.
+- nlz-og: Nucleotide relative Lempel-Ziv on graphs, stores the nlz encodings for closely related assemblies in a graph that deduplicates shared segments.
+
+*Note* this project is currently a work-in-progress and should only be used for research purposes.
+
 ## Installation
 ``` sh
 git clone https://github.com/tmaklin/ntcomp
@@ -24,7 +30,8 @@ ntcomp build -o index -k91 test/GCA_964037205.1_30348_1_60_genomic.fna.gz
 
 Larger values of `-k` produce better compression ratios at the cost of larger .lcs file size.
 
-### Encoding fastX data
+### nlz
+#### Encoding fastX data
 Query fastX data against an index and write the encoding
 ``` sh
 ntcomp encode --index index test/ERR10498075.fastq.gz > encoded.dat
@@ -34,7 +41,7 @@ Encoding data requires both the .sbwt and .lcs files.
 
 This removes quality scores.
 
-### Decoding encoded fastX data
+#### Decoding encoded fastX data
 Retrieve the encoded sequences from an index
 
 ``` sh
@@ -45,11 +52,23 @@ In theory decoding requires only the .sbwt file but the tool will not run withou
 
 Decoding will also work with a rebuilt SBWT, as the construction algorithm is deterministic.
 
-### Verify
+#### Verify
 Requires installing [seqtk](https://github.com/lh3/seqtk)
 ``` sh
 seqtk seq -A test/ERR10498075.fastq.gz | sed 's/ERR[0-9]*[.]\([0-9]*\).*$/seq.\1/g' > expected.fasta
 diff -s decoded.fasta expected.fasta
+```
+
+### nlz-og
+#### Encoding a collection of fastX files
+```sh
+ntcomp graph -i index query_1.fna query_2.fna query_3.fna > graph_3.dat
+```
+
+#### Decoding an encoded collection
+
+``` sh
+ntcomp graph -di index --fasta graph_3.dat > queries_1-3.fasta
 ```
 
 ## About
