@@ -13,6 +13,7 @@
 //
 use core::ops::Range;
 
+use std::cmp::Ordering;
 use std::collections::{
     HashMap,
     HashSet,
@@ -28,6 +29,7 @@ use petgraph::{
     EdgeType,
 };
 use petgraph::graph::{
+    EdgeReference,
     Graph,
     NodeIndex,
 };
@@ -37,10 +39,158 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 type E = Box<dyn std::error::Error>;
 
+#[derive(Clone, Debug)]
+struct StackState {
+    pub weight: u32,
+    pub visited: usize,
+    pub visit_counts: Vec<usize>,
+    pub path: Vec<NodeIndex>,
+    pub hash: Hash,
+    pub node: NodeIndex,
+}
+
+impl PartialEq for StackState {
+    fn eq(&self, other: &Self) -> bool {
+            self.weight == other.weight &&
+            self.visited == other.visited &&
+            self.path.len() == other.path.len() &&
+            self.hash == other.hash &&
+            self.visit_counts == other.visit_counts &&
+            self.node == other.node
+    }
+}
+
+
+impl PartialOrd for StackState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let is_less =
+            self.weight < other.weight ||
+            self.visited < other.visited ||
+            self.path.len() < other.path.len();
+
+        let is_greater =
+            self.weight > other.weight ||
+            self.visited > other.visited ||
+            self.path.len() > other.path.len();
+
+        let is_partial_eq =
+            self.weight == other.weight &&
+            self.visited == other.visited &&
+            self.path.len() == other.path.len() &&
+            self.node == other.node;
+
+        if is_less {
+            Some(Ordering::Less)
+        } else if is_greater {
+            Some(Ordering::Greater)
+        } else if is_partial_eq {
+            Some(Ordering::Equal)
+        } else {
+            None
+        }
+    }
+}
+
+impl StackState {
+    pub fn new(
+        graph: &Graph<u32, ColexGraphEdge>,
+    ) -> Self {
+        let first_node = NodeIndex::from(0_u32);
+        let mut path = Vec::with_capacity(graph.node_count());
+        path.push(first_node);
+        let mut visit_counts = vec![0_usize; graph.node_count()];
+        visit_counts[first_node.index()] = 1;
+
+        StackState {
+            weight: 0,
+            visited: 1,
+            visit_counts,
+            path,
+            hash: Hash::from_bytes([0_u8; 32]),
+            node: first_node,
+        }
+    }
+
+    pub fn for_path(
+        graph: &Graph<u32, ColexGraphEdge>,
+        color: u32,
+        hash: Hash,
+        path_len: usize,
+    ) -> Self {
+        let mut visit_counts = vec![0_usize; graph.node_count()];
+        let allowed_edges: Vec<_> = graph
+            .edge_references()
+            .filter(|e| e.weight().colors.contains(&color))
+            .flat_map(|e| {
+                visit_counts[e.target().index()]  = e.weight().visit_counts[color as usize] as usize;
+                [e.source(), e.target()]
+            }).collect();
+        visit_counts[0] += 1;
+        let nodes_in_path = HashSet::<NodeIndex>::from_iter(allowed_edges).len();
+
+        // Paths for all colors start at dummy NodeIndex 0
+        let first_node = NodeIndex::from(0_u32);
+
+        // Target length is stored in the weight for the first edge
+        let first_edge: Vec<u32> = graph.edges_directed(first_node, Direction::Outgoing)
+                                        .filter(|e| e.weight().colors.contains(&color))
+                                        .map(|e| e.weight().weight)
+                                        .collect();
+        assert!(first_edge.len() == 1);
+
+        // Target weight is multiplied by 2 to account for the first edge's weight
+        let total_weight = first_edge[0] * 2;
+
+        // Paths for all colors end at dummy NodeIndex 1
+        let target_node = NodeIndex::from(1_u32);
+        StackState {
+            weight: total_weight,
+            visited: nodes_in_path,
+            visit_counts,
+            path: vec![NodeIndex::new(0); path_len],
+            hash,
+            node: target_node,
+        }
+    }
+
+    pub fn advance(
+        &mut self,
+        edge: EdgeReference<ColexGraphEdge>,
+    ) {
+        self.weight += edge.weight().weight;
+
+        let node = edge.target();
+        self.node = node;
+        self.path.push(node);
+
+        let visit_count = self.visit_counts[node.index()];
+        self.visited += (visit_count == 0) as usize;
+        self.visit_counts[node.index()] += 1;
+    }
+
+    pub fn regress(
+        &mut self,
+        edge: EdgeReference<ColexGraphEdge>,
+    ) {
+        self.weight -= edge.weight().weight;
+
+        if self.path.len() > 1 {
+            self.path.pop();
+        }
+        let prev = edge.source();
+        self.node = prev;
+
+        let visit_count = self.visit_counts[prev.index()];
+        self.visited -= (visit_count == 0) as usize;
+        self.visit_counts[prev.index()] = self.visit_counts[prev.index()].saturating_sub(1);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct ColexGraphEdge {
-    pub weight: u32,
+    weight: u32,
     colors: Vec<u32>,
+    visit_counts: Vec<u32>,
 }
 
 pub fn decode_path(
@@ -97,101 +247,71 @@ pub fn search(
     color: u32,
     target_hash: Hash,
     sbwt: &SbwtIndexVariant,
-    max_visits: u32,
+    path_len: u32,
 ) -> Option<Vec<NodeIndex>> {
 
-    let nodes_in_path = HashSet::<NodeIndex>::from_iter(graph
-        .edge_references()
-        .filter(|e| e.weight().colors.contains(&color))
-        .flat_map(|e| [e.source(), e.target()])
-        .collect::<Vec<NodeIndex>>()
-    ).len();
+    let target = StackState::for_path(
+        graph,
+        color,
+        target_hash,
+        path_len.try_into().unwrap(),
+    );
 
-    // Dummy nodes that denote start/end
-    let first_node = NodeIndex::from(0_u32);
-    let last_node = NodeIndex::from(1_u32);
+    let filtered_edges = graph.edge_references()
+        .filter(|e| e.weight().colors.contains(&color));
 
-    // Target length is stored in the weight for the first edge
-    let first_edge: Vec<u32> = graph.edges_directed(first_node, Direction::Outgoing)
-        .filter(|e| e.weight().colors.contains(&color))
-        .map(|e| e.weight().weight)
-        .collect();
-    assert!(first_edge.len() == 1);
+    let mut filtered_graph = graph.clone();
+    filtered_graph.clear_edges();
+    for e in filtered_edges {
+        filtered_graph.add_edge(e.source(), e.target(), e.weight().clone());
+    }
 
-    // Target weight is multiplied by 2 to account for the first edge's weight
-    let total_weight = first_edge[0] * 2;
-
-    stacker::grow(1024 * 1024 * 1024, || {
+    stacker::grow(32 * 1024 * 1024, || {
         backtracking_search(
-            graph,
-            first_node,
-            last_node,
-            color,
-            total_weight,
-            nodes_in_path,
-            target_hash,
-            &mut HashMap::new(),
-            &mut 0_u32,
-            &mut Vec::new(),
+            &filtered_graph,
             sbwt,
-            max_visits as usize,
+            &target,
+            &mut StackState::new(graph),
         )
     })
 }
 
-pub fn backtracking_search(
+fn backtracking_search(
     graph: &Graph<u32, ColexGraphEdge>,
-    current: NodeIndex,
-    end: NodeIndex,
-    color: u32,
-    target_weight: u32,
-    nodes_to_visit: usize,
-    hash: Hash,
-    visit_counts: &mut HashMap<NodeIndex, usize>,
-    current_weight: &mut u32,
-    path: &mut Vec<NodeIndex>,
     sbwt: &SbwtIndexVariant,
-    max_visits: usize,
+    target: &StackState,
+    stack: &mut StackState,
 ) -> Option<Vec<NodeIndex>> {
-    if *current_weight > target_weight || visit_counts.len() > nodes_to_visit {
+    let state = target.partial_cmp(stack).unwrap();
+    if state == Ordering::Less {
         return None
     }
 
-    path.push(current);
-    visit_counts.entry(current).and_modify(|e| *e += 1).or_insert(1);
-
-    if current == end && *current_weight == target_weight {
-        let nucleotides = decode_sequence(graph, &path.clone(), sbwt);
-        let hash_got = blake3::hash(&nucleotides);
-        if hash_got == hash {
-            return Some(path.to_vec())
+    if state == Ordering::Equal {
+        let nucleotides = decode_sequence(graph, stack.path.as_slice(), sbwt);
+        stack.hash = blake3::hash(&nucleotides);
+        if target.eq(stack) {
+            return Some(std::mem::take(&mut stack.path))
+        } else {
+            return None
         }
     }
 
-    let outgoing_edges = graph
-        .edges_directed(current, petgraph::Direction::Outgoing)
-        .filter(|e| e.weight().colors.contains(&color));
+    let outgoing_edges: Vec<_> = graph
+        .edges_directed(stack.node, petgraph::Direction::Outgoing)
+        .filter(|e| {
+            let target_idx = e.target().index();
+            let visit_count: usize = stack.visit_counts[target_idx];
+            let allowed_count: usize = target.visit_counts[target_idx];
+            visit_count < allowed_count
+        }).collect();
 
     for edge in outgoing_edges {
-        *current_weight += edge.weight().weight;
-
-        let is_valid = visit_counts.get(&edge.target()).unwrap_or(&0_usize) <= &max_visits;
-
-        if is_valid {
-            if backtracking_search(graph, edge.target(), end, color, target_weight, nodes_to_visit, hash, visit_counts, current_weight, path, sbwt, max_visits).is_some() {
-                return Some(path.to_vec())
-            }
+        stack.advance(edge);
+        if let Some(path) = backtracking_search(graph, sbwt, target, stack) {
+            return Some(path)
         }
-
-        *current_weight -= edge.weight().weight;
-    }
-
-    path.pop();
-    let count = *visit_counts.get(&current).unwrap();
-    if count == 1 {
-        visit_counts.remove(&current);
-    } else {
-        *visit_counts.get_mut(&current).unwrap() -= 1;
+        stack.regress(edge);
     }
 
     None
