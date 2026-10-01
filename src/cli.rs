@@ -79,19 +79,6 @@ pub enum Commands {
     },
 
     // Encode a collection of fastX files using an SBWT index
-    Collection {
-        // Inputs
-        // // Input fasta or fastq query file(s)
-        #[arg(group = "input", required = true, help = "Querys file with sequence data.")]
-        query_files: Vec<PathBuf>,
-
-        // // Prebuilt index
-        #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
-        index_prefix: Option<String>,
-
-    },
-
-    // Encode a collection of fastX files using an SBWT index
     Graph {
         // Inputs
         // // Input fasta or fastq query file(s)
