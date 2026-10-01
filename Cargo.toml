@@ -47,3 +47,6 @@ random = "0.14"
 
 [profile.release]
 debug = true
+strip = false
+lto = true
+codegen-units = 1
