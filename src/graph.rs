@@ -125,7 +125,7 @@ impl StackState {
                 visit_counts[e.target().index()]  = e.weight().visit_counts[color as usize] as usize;
                 [e.source(), e.target()]
             }).collect();
-        visit_counts[0] += 1;
+        visit_counts[0] = 1;
         let nodes_in_path = HashSet::<NodeIndex>::from_iter(allowed_edges).len();
 
         // Paths for all colors start at dummy NodeIndex 0
