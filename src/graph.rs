@@ -177,12 +177,11 @@ impl StackState {
         if self.path.len() > 1 {
             self.path.pop();
         }
-        let prev = edge.source();
-        self.node = prev;
+        self.node = edge.source();
 
-        let visit_count = self.visit_counts[prev.index()];
-        self.visited -= (visit_count == 0) as usize;
-        self.visit_counts[prev.index()] = self.visit_counts[prev.index()].saturating_sub(1);
+        let visit_count = self.visit_counts[edge.target().index()];
+        self.visited -= (visit_count == 1) as usize;
+        self.visit_counts[edge.target().index()] = self.visit_counts[edge.target().index()].saturating_sub(1);
     }
 }
 
