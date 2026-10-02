@@ -36,6 +36,7 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 type E = Box<dyn std::error::Error>;
 
 pub mod dfs;
+pub mod dfs_compressed;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct ColexGraphEdge {
