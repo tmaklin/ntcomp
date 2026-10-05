@@ -319,11 +319,10 @@ fn main() {
                     if idx as u32 == file_ranges[file_idx].1.end {
                         file_idx += 1;
                     }
-                    let nodes = ntcomp::graph::dfs::search(
+                    let nodes = ntcomp::graph::dfs_compressed::search(
                         &graph,
                         seq,
                         hashes[idx],
-                        &sbwt,
                         path_lens[idx],
                     );
 
@@ -415,7 +414,9 @@ fn main() {
                             &(0, 1..1),
                         );
 
-                        hashes.push(hash(&seqrec));
+                        let path: Vec<u32> = dictionary.into_iter().map(|entry| entry.1.start as u32).collect();
+                        let path_bytes: Vec<u8> = path.clone().into_iter().flat_map(|node_idx| node_idx.to_le_bytes()).collect();
+                        hashes.push(hash(&path_bytes));
                         color += 1;
                     }
                     let end = color;

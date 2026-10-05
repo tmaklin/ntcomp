@@ -270,7 +270,6 @@ pub fn search(
     graph: &Graph<u32, ColexGraphEdge>,
     color: u32,
     target_hash: Hash,
-    sbwt: &SbwtIndexVariant,
     path_len: u32,
 ) -> Option<Vec<NodeIndex>> {
 
@@ -314,7 +313,6 @@ pub fn search(
         backtracking_search(
             &compressed_graph,
             &graph,
-            sbwt,
             &target,
             &mut StackState::new(&compressed_graph, first_node),
         )
@@ -324,7 +322,6 @@ pub fn search(
 fn backtracking_search(
     graph: &Graph<u32, ChainEdge>,
     original_graph: &Graph<u32, ColexGraphEdge>,
-    sbwt: &SbwtIndexVariant,
     target: &StackState,
     stack: &mut StackState,
 ) -> Option<Vec<NodeIndex>> {
@@ -335,11 +332,15 @@ fn backtracking_search(
     }
 
     if state == Ordering::Equal {
-        let nucleotides = decode_sequence(original_graph, stack.path.as_slice(), sbwt);
-        stack.hash = blake3::hash(&nucleotides);
-        let mut tmp_stack = stack.clone();
-        tmp_stack.path = Vec::new();
-        eprintln!("Hashed: {:?}", tmp_stack);
+        let path_bytes: Vec<u8> = stack
+            .path
+            .iter()
+            .take(stack.path.len() - 1)
+            .skip(1)
+            .flat_map(|node_idx| {
+                original_graph.raw_nodes()[node_idx.index()].weight.to_le_bytes()
+        }).collect();
+        stack.hash = blake3::hash(&path_bytes);
 
         if target.eq(stack) {
             return Some(std::mem::take(&mut stack.path))
@@ -359,7 +360,7 @@ fn backtracking_search(
 
     for edge in outgoing_edges {
         stack.advance(edge);
-        if let Some(path) = backtracking_search(graph, original_graph, sbwt, target, stack) {
+        if let Some(path) = backtracking_search(graph, original_graph, target, stack) {
             return Some(path)
         }
         stack.regress(edge);
