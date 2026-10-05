@@ -42,7 +42,7 @@ struct ChainEdge {
     chain_weight: u32,
     visit_count: usize,
     nodes_in_chain: usize,
-    chain_path: Vec<NodeIndex>,
+    chain_path: Vec<u32>,
 }
 
 fn compress_linear_chains(
@@ -83,7 +83,7 @@ fn compress_linear_chains(
             let mut chain_weight = edge_ref.weight().weight;
             let mut visit_count = edge_ref.weight().visit_counts[color as usize] as usize;
             let mut nodes_in_chain = 1;
-            let mut chain_path = vec![edge_ref.target()];
+            let mut chain_path = vec![g[edge_ref.target()]];
             let mut curr = edge_ref.target();
 
             while !junctions.contains(&curr) {
@@ -94,7 +94,7 @@ fn compress_linear_chains(
                 chain_weight += next_edge.weight().weight;
                 visit_count += next_edge.weight().visit_counts[color as usize] as usize;
                 nodes_in_chain += 1;
-                chain_path.push(next_edge.target());
+                chain_path.push(g[next_edge.target()]);
                 curr = next_edge.target();
             }
 
@@ -119,7 +119,7 @@ struct StackState {
     pub weight: u32,
     pub visited: usize,
     pub visit_counts: Vec<usize>,
-    pub path: Vec<NodeIndex>,
+    pub path: Vec<u32>,
     pub hash: Hash,
     pub node: NodeIndex,
     pub path_len: usize,
@@ -178,7 +178,7 @@ impl StackState {
         first_node: NodeIndex,
     ) -> Self {
         let mut path = Vec::with_capacity(graph.node_count());
-        path.push(first_node);
+        path.push(0);
         let mut visit_counts = vec![0_usize; graph.node_count()];
         visit_counts[first_node.index()] = 1;
 
@@ -224,7 +224,7 @@ impl StackState {
             weight: total_weight,
             visited: nodes_in_path,
             visit_counts,
-            path: vec![NodeIndex::new(0); path_len],
+            path: vec![0; path_len],
             hash,
             node: target_node,
             path_len,
@@ -312,22 +312,28 @@ pub fn search(
     tmp_stack.path = Vec::new();
     eprintln!("Target: {:?}", tmp_stack);
 
-    stacker::grow(32 * 1024 * 1024, || {
+    let colex_ranks = stacker::grow(32 * 1024 * 1024, || {
         backtracking_search(
             &compressed_graph,
-            &graph,
             &target,
             &mut StackState::new(&compressed_graph, first_node),
         )
-    })
+    })?;
+
+    let colex_to_node_idx: HashMap<u32, NodeIndex> = HashMap::from_iter(
+        graph.node_indices().map(|node_idx| {
+            (graph[node_idx], node_idx)
+        }));
+
+    let path: Vec<NodeIndex> = colex_ranks.into_iter().map(|colex_rank| *colex_to_node_idx.get(&colex_rank).unwrap()).collect();
+    Some(path)
 }
 
 fn backtracking_search(
     graph: &Graph<u32, ChainEdge>,
-    original_graph: &Graph<u32, ColexGraphEdge>,
     target: &StackState,
     stack: &mut StackState,
-) -> Option<Vec<NodeIndex>> {
+) -> Option<Vec<u32>> {
 
     let state = target.partial_cmp(stack).unwrap();
     if state == Ordering::Less {
@@ -340,8 +346,8 @@ fn backtracking_search(
             .iter()
             .take(stack.path.len() - 1)
             .skip(1)
-            .flat_map(|node_idx| {
-                original_graph.raw_nodes()[node_idx.index()].weight.to_le_bytes()
+            .flat_map(|colex_rank| {
+                colex_rank.to_le_bytes()
         });
         let mut hasher = Hasher::new();
         hasher.update_reader(IterRead::new(path_bytes_iter)).unwrap();
@@ -365,7 +371,7 @@ fn backtracking_search(
 
     for edge in outgoing_edges {
         stack.advance(edge);
-        if let Some(path) = backtracking_search(graph, original_graph, target, stack) {
+        if let Some(path) = backtracking_search(graph, target, stack) {
             return Some(path)
         }
         stack.regress(edge);
