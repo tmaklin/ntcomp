@@ -45,7 +45,7 @@ struct ChainEdge {
 fn compress_linear_chains(
     g: Graph<u32, ColexGraphEdge>,
     color: u32,
-) -> (Graph<u32, ChainEdge>, HashMap<NodeIndex, NodeIndex>) {
+) -> Graph<u32, ChainEdge> {
     let mut compressed = petgraph::Graph::new();
     let mut node_mapping: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
@@ -108,7 +108,7 @@ fn compress_linear_chains(
         }
     }
 
-    (compressed, node_mapping)
+    compressed
 }
 
 #[derive(Clone, Debug)]
@@ -291,7 +291,7 @@ pub fn search(
         }
     }
 
-    let (compressed_graph, node_mapping) = compress_linear_chains(filtered_graph, color);
+    let compressed_graph = compress_linear_chains(filtered_graph, color);
 
     let first_node = NodeIndex::from(0);
     let target_node = NodeIndex::from(1);
