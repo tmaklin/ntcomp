@@ -49,7 +49,18 @@ fn compress_linear_chains(
     let mut compressed = petgraph::Graph::new();
     let mut node_mapping: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
+    let source_node = NodeIndex::from(0);
+    let sink_node = NodeIndex::from(1);
+    node_mapping.insert(source_node, source_node);
+    node_mapping.insert(sink_node, sink_node);
+
     let mut junctions = HashSet::new();
+    junctions.insert(source_node);
+    junctions.insert(sink_node);
+
+    compressed.add_node(0_u32);
+    compressed.add_node(1_u32);
+
     for node in g.node_indices() {
         let in_deg = g.edges_directed(node, Direction::Incoming).collect::<Vec<_>>().len();
         let out_deg = g.edges_directed(node, Direction::Outgoing).collect::<Vec<_>>().len();
@@ -282,8 +293,8 @@ pub fn search(
 
     let (compressed_graph, node_mapping) = compress_linear_chains(filtered_graph, color);
 
-    let first_node = *node_mapping.get(&NodeIndex::from(0)).unwrap();
-    let target_node = *node_mapping.get(&NodeIndex::from(1)).unwrap();
+    let first_node = NodeIndex::from(0);
+    let target_node = NodeIndex::from(1);
 
     let target = StackState::for_path(
         &compressed_graph,
