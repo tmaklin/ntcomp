@@ -12,7 +12,6 @@
 // at your option.
 //
 use super::ColexGraphEdge;
-use super::decode_sequence;
 
 use std::cmp::Ordering;
 use std::collections::{
@@ -20,7 +19,12 @@ use std::collections::{
     HashSet,
 };
 
-use blake3::Hash;
+use blake3::{
+    Hash,
+    Hasher,
+};
+
+use iter_read::IterRead;
 
 use petgraph::{
     Direction,
@@ -32,7 +36,6 @@ use petgraph::graph::{
 };
 use petgraph::visit::EdgeRef;
 
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 #[derive(Debug)]
 struct ChainEdge {
@@ -332,15 +335,17 @@ fn backtracking_search(
     }
 
     if state == Ordering::Equal {
-        let path_bytes: Vec<u8> = stack
+        let path_bytes_iter = stack
             .path
             .iter()
             .take(stack.path.len() - 1)
             .skip(1)
             .flat_map(|node_idx| {
                 original_graph.raw_nodes()[node_idx.index()].weight.to_le_bytes()
-        }).collect();
-        stack.hash = blake3::hash(&path_bytes);
+        });
+        let mut hasher = Hasher::new();
+        hasher.update_reader(IterRead::new(path_bytes_iter)).unwrap();
+        stack.hash = hasher.finalize();
 
         if target.eq(stack) {
             return Some(std::mem::take(&mut stack.path))
