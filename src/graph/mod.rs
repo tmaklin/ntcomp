@@ -11,20 +11,32 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
+//! NLZ-OG: NLZ dictionaries stored as coloured paths in a shared graph.
+//!
+//! ## Graph structure
+//!
+//! Node weights are colexicographic ranks of _k_-mers in the SBWT; node 0 is a
+//! dummy source and node 1 a dummy sink. An edge `(u, v, s)` means "the
+//! dictionary entry for `u` has suffix length `s` and is followed by `v`".
+//! Edges are deduplicated across colours (contigs) and carry the set of colours
+//! that use them.
+//!
+//! ## Decoding the graph
+//!
+//! The edge set alone does not determine the order in which a colour walks
+//! the graph, so the encoder also stores a *choice stream*: whenever a colour
+//! leaves a node that has more than one outgoing edge carrying that colour,
+//! the rank of the taken edge among those edges is recorded. Decoding a
+//! colour is a single linear walk from the source to the sink, and every
+//! colour has its own stream so contigs can be decoded independently.
+//!
 use core::ops::Range;
 
-use std::collections::{
-    HashMap,
-    HashSet,
-};
 use std::io::Write;
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 
-use petgraph::{
-    Direction,
-    EdgeType,
-};
+use petgraph::EdgeType;
 use petgraph::graph::{
     Graph,
     NodeIndex,
@@ -35,13 +47,19 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 type E = Box<dyn std::error::Error>;
 
-pub mod dfs;
+/// Node index of the dummy source node.
+const SOURCE_NODE: u32 = 0;
+/// Node index of the dummy sink node.
+const SINK_NODE: u32 = 1;
+/// Colex rank stored in the dummy source node. Real colex ranks must be smaller.
+const SOURCE_COLEX: u32 = u32::MAX - 1;
+/// Colex rank stored in the dummy sink node. Real colex ranks must be smaller.
+const SINK_COLEX: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct ColexGraphEdge {
-    weight: u32,
-    colors: Vec<u32>,
-    visit_counts: Vec<u32>,
+    pub weight: u32,
+    pub colors: Vec<u32>,
 }
 
 pub fn decode_path(
@@ -69,120 +87,153 @@ pub fn decode_path(
     sequence
 }
 
-pub fn decode_sequence(
-    graph: &Graph<u32, ColexGraphEdge>,
-    nodes: &[NodeIndex],
-    sbwt: &SbwtIndexVariant,
-) -> Vec<u8> {
-    let mut path: Vec<(u32, u32)> = Vec::new();
-    for i in 1..nodes.len() {
-        let node_idx = nodes[i];
-        let colex_rank = graph[node_idx];
-        let edges = graph.edges_directed(node_idx, Direction::Outgoing);
-        let tmp = if i < nodes.len() - 1 { i + 1 } else { 0 };
-        let next_node_idx = nodes[tmp];
-        for e in edges {
-            if e.target() == next_node_idx {
-                let suffix_len: u32 = e.weight().weight;
-                path.push((colex_rank, suffix_len));
-                break;
+/// Builds the coloured graph and remembers the path each colour takes.
+pub struct GraphBuilder {
+
+    /// colex rank -> node index (position in the set)
+    nodes: IndexSet<u32>,
+
+    /// (source node, target node, suffix length) -> sorted colours using the edge
+    edges: IndexMap<(u32, u32, u32), Vec<u32>>,
+
+    /// Per colour: edge ids (indexes into `edges`) in traversal order
+    paths: Vec<Vec<usize>>,
+}
+
+impl Default for GraphBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphBuilder {
+    pub fn new() -> Self {
+        let mut nodes = IndexSet::new();
+        nodes.insert(SOURCE_COLEX);
+        nodes.insert(SINK_COLEX);
+
+        GraphBuilder {
+            nodes,
+            edges: IndexMap::new(),
+            paths: Vec::new()
+        }
+    }
+
+    fn insert_node(
+        &mut self,
+        colex_rank: usize
+    ) -> u32 {
+        let colex_rank: u32 = colex_rank.try_into().expect("colex rank does not fit in u32");
+        assert!(colex_rank < SOURCE_COLEX, "colex rank collides with dummy node ranks");
+        self.nodes.insert_full(colex_rank).0 as u32
+    }
+
+    fn edge(
+        &mut self,
+        source: u32,
+        target: u32,
+        weight: u32,
+        color: u32,
+    ) -> usize {
+        let entry = self.edges.entry((source, target, weight));
+        let id = entry.index();
+        let colors = entry.or_default();
+        // Colours are added in increasing order, so the colour sets stay sorted.
+        if colors.last() != Some(&color) {
+            colors.push(color);
+        }
+        id
+    }
+
+    /// Adds the dictionary of the next colour.
+    ///
+    /// `dictionary` is the output of [crate::encode_sequence]. The edge out of
+    /// the source node stores `sequence_length`.
+    pub fn add_path(
+        &mut self,
+        sequence_length: usize,
+        dictionary: &[(usize, Range<usize>)],
+    ) -> u32 {
+        let color: u32 = self.paths.len().try_into().unwrap();
+        let mut path = Vec::with_capacity(dictionary.len() + 1);
+
+        let mut prev = SOURCE_NODE;
+        let mut prev_weight: u32 = sequence_length.try_into().expect("sequence length does not fit in u32");
+        for (suffix_len, colex) in dictionary {
+            let node = self.insert_node(colex.start);
+            path.push(self.edge(prev, node, prev_weight, color));
+            prev = node;
+            prev_weight = (*suffix_len).try_into().unwrap();
+        }
+        path.push(self.edge(prev, SINK_NODE, prev_weight, color));
+
+        self.paths.push(path);
+        color
+    }
+
+    /// Converts into the stored representation (graph + choice stream).
+    pub fn to_csr(self) -> (Csr<u32>, Choices) {
+        let n_nodes = self.nodes.len();
+        let n_edges = self.edges.len();
+
+        // Canonical edge order: by source, then target, then suffix length.
+        let mut order: Vec<usize> = (0..n_edges).collect();
+        order.sort_unstable_by_key(|&id| *self.edges.get_index(id).unwrap().0);
+
+        let mut csr_pos = vec![0_u32; n_edges];
+        let mut row_ptrs = vec![0_u32; n_nodes + 1];
+        let mut column_indices = Vec::with_capacity(n_edges);
+        let mut suffix_lens = Vec::with_capacity(n_edges);
+        let mut colorsets = Vec::with_capacity(n_edges);
+
+        for (pos, &id) in order.iter().enumerate() {
+            let (&(source, target, weight), colors) = self.edges.get_index(id).unwrap();
+            csr_pos[id] = pos as u32;
+            row_ptrs[source as usize + 1] += 1;
+            column_indices.push(target);
+            suffix_lens.push(weight);
+            colorsets.push(colors.clone());
+        }
+        for i in 0..n_nodes {
+            row_ptrs[i + 1] += row_ptrs[i];
+        }
+
+        let csr = Csr {
+            node_weights: self.nodes.into_iter().collect(),
+            row_ptrs,
+            column_indices,
+            suffix_lens,
+            colorsets,
+        };
+
+        // Record which edge each colour takes at every node where it has a choice.
+        let mut streams: Vec<Vec<u32>> = Vec::with_capacity(self.paths.len());
+        for (color, path) in self.paths.iter().enumerate() {
+            let color = color as u32;
+            let mut stream = Vec::new();
+            for &id in path {
+                let source = self.edges.get_index(id).unwrap().0.0 as usize;
+                let pos = csr_pos[id] as usize;
+                let mut n_options = 0;
+                let mut rank = 0;
+                for option in csr.outgoing_edges(source, color) {
+                    if option < pos {
+                        rank += 1;
+                    }
+                    n_options += 1;
+                }
+                if n_options > 1 {
+                    stream.push(rank);
+                }
             }
+            streams.push(stream);
         }
-    }
 
-    decode_path(path, sbwt)
+        (csr, Choices { streams })
+    }
 }
 
-pub fn insert_edge(
-    graph: &mut Graph<u32, ColexGraphEdge>,
-    node_indexes: &mut IndexSet<u32>,
-    color: u32,
-    entry_from: &(usize, Range<usize>),
-    entry_to: &(usize, Range<usize>),
-) {
-    // TODO should check that we don't use colex ranks 0 or 1,
-    // iirc these are used for dummy nodes in the SBWT so should be fine
-    let source_colex: u32 = entry_from.1.start.try_into().unwrap();
-    let target_colex: u32 = entry_to.1.start.try_into().unwrap();
-
-    let suffix_len: u32 = entry_from.0.try_into().unwrap();
-
-    let from: NodeIndex<u32> = if node_indexes.contains(&source_colex) {
-        let source_index = node_indexes.get_index_of(&source_colex).unwrap();
-        NodeIndex::from(source_index as u32)
-    } else {
-        node_indexes.insert(source_colex);
-        graph.add_node(source_colex)
-    };
-
-    let to = if node_indexes.contains(&target_colex) {
-        let target_index = node_indexes.get_index_of(&target_colex).unwrap();
-        NodeIndex::from(target_index as u32)
-    } else {
-        node_indexes.insert(target_colex);
-        graph.add_node(target_colex)
-    };
-
-    graph.try_add_edge(from, to, ColexGraphEdge { weight: suffix_len, colors: vec![color], visit_counts: vec![1] }).unwrap();
-}
-
-pub fn deduplicate_edges(
-    graph: &mut Graph<u32, ColexGraphEdge>,
-) -> u32 {
-
-    let mut visit_counts: HashMap<NodeIndex, Vec<u32>> = HashMap::new();
-
-    let first_node = NodeIndex::from(0_u32);
-    let n_colors: usize = HashSet::<u32>::from_iter(graph.edges_directed(first_node, Direction::Outgoing).flat_map(|e| e.weight().colors.clone()).collect::<Vec<u32>>()).len();
-
-    let mut edge_colors: HashMap<(NodeIndex, NodeIndex, u32), Vec<u32>> = HashMap::from_iter(
-        graph.edge_references().map(|x| {
-            x.weight().colors.iter().for_each(|color| {
-                visit_counts.entry(x.target()).and_modify(|e| e[*color as usize] += 1).or_insert( {
-                    let mut counts = vec![0; n_colors];
-                    counts[*color as usize] = 1;
-                    counts
-                });
-            });
-            ((x.source(), x.target(), x.weight().weight), x.weight().colors.clone())
-        })
-    );
-
-    let max_visits = *visit_counts.values().flatten().max().unwrap();
-
-    for e in graph.edge_references() {
-        let key = (e.source(), e.target(), e.weight().weight);
-        if !edge_colors.get(&key).unwrap().contains(&e.weight().colors[0]) {
-            edge_colors.get_mut(&key).unwrap().push(e.weight().colors[0]);
-            edge_colors.get_mut(&key).unwrap().sort();
-        }
-    }
-
-    let edges_iter = graph.edge_references().map(|x| {
-        let key = (x.source(), x.target(), x.weight().weight);
-        let colors = edge_colors.get(&key).unwrap().clone();
-        let visit_counts = visit_counts.get(&x.target()).unwrap().clone();
-        (x.source(),
-         x.target(),
-         ColexGraphEdge {
-             weight: x.weight().weight,
-             colors,
-             visit_counts,
-         },
-        )
-    });
-
-    let unique_edges: IndexSet<(NodeIndex, NodeIndex, ColexGraphEdge)> = IndexSet::from_iter(edges_iter);
-
-    graph.clear_edges();
-    for (source, target, weight) in unique_edges {
-        graph.try_add_edge(source, target, weight).unwrap();
-    }
-
-    max_visits
-}
-
-/// CSR for storage
+/// Graph in compressed sparse row format; this is what gets stored.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Csr<N> {
     pub node_weights: Vec<N>,
@@ -190,51 +241,25 @@ pub struct Csr<N> {
     pub column_indices: Vec<u32>,
     pub suffix_lens: Vec<u32>,
     pub colorsets: Vec<Vec<u32>>,
-    pub visit_counts: Vec<Vec<u32>>,
 }
 
 impl<N> Csr<N> {
-    pub fn from_petgraph<Ty: EdgeType>(
-        graph: Graph<N, ColexGraphEdge, Ty>,
-    ) -> Self
-    where
-        N: Copy,
-    {
-        let node_count = graph.node_count();
-        let edge_count = graph.edge_count();
+    /// Range of edge positions leaving `node`.
+    pub fn row(
+        &self,
+        node: usize,
+    ) -> (usize, usize) {
+        (self.row_ptrs[node] as usize, self.row_ptrs[node + 1] as usize)
+    }
 
-        let mut row_ptrs = Vec::with_capacity(node_count + 1);
-        let mut column_indices = Vec::with_capacity(edge_count);
-        let mut suffix_lens = Vec::with_capacity(edge_count);
-        let mut node_weights = Vec::with_capacity(node_count);
-        let mut colorsets: Vec<Vec<u32>> = Vec::with_capacity(edge_count);
-        let mut visit_counts: Vec<Vec<u32>> = Vec::with_capacity(edge_count);
-
-        let mut current_offset = 0;
-        row_ptrs.push(current_offset);
-
-        for node in graph.node_indices() {
-            let edges = graph.edges_directed(node, Direction::Outgoing);
-
-            for edge in edges {
-                column_indices.push(edge.target().index().try_into().unwrap());
-                suffix_lens.push(edge.weight().weight);
-                colorsets.push(edge.weight().colors.clone());
-                visit_counts.push(edge.weight().visit_counts.clone());
-                current_offset += 1;
-            }
-            node_weights.push(graph[node]);
-            row_ptrs.push(current_offset);
-        }
-
-        Self {
-            node_weights,
-            row_ptrs,
-            column_indices,
-            suffix_lens,
-            colorsets,
-            visit_counts,
-        }
+    /// Edge positions leaving `node` that carry `color`.
+    pub fn outgoing_edges(
+        &self,
+        node: usize,
+        color: u32
+    ) -> impl Iterator<Item = usize> + '_ {
+        let (start, end) = self.row(node);
+        (start..end).filter(move |&pos| self.colorsets[pos].binary_search(&color).is_ok())
     }
 
     pub fn to_petgraph<Ty: EdgeType>(
@@ -250,22 +275,14 @@ impl<N> Csr<N> {
         }
 
         for source_idx in 0..self.node_weights.len() {
-            let start = self.row_ptrs[source_idx];
-            let end = self.row_ptrs[source_idx + 1];
-
-            for edge_offset in start..end {
-                let target_idx = self.column_indices[edge_offset as usize] as usize;
-                let suffix_len = &self.suffix_lens[edge_offset as usize];
-                let colorset = &self.colorsets[edge_offset as usize];
-                let visit_counts = &self.visit_counts[edge_offset as usize];
-
+            let (start, end) = self.row(source_idx);
+            for pos in start..end {
                 graph.add_edge(
                     NodeIndex::new(source_idx),
-                    NodeIndex::new(target_idx),
+                    NodeIndex::new(self.column_indices[pos] as usize),
                     ColexGraphEdge {
-                        weight: *suffix_len,
-                        colors: colorset.to_vec(),
-                        visit_counts: visit_counts.clone(),
+                        weight: self.suffix_lens[pos],
+                        colors: self.colorsets[pos].clone(),
                     },
                 );
             }
@@ -273,6 +290,97 @@ impl<N> Csr<N> {
 
         graph
     }
+}
+
+/// Per-colour choice streams.
+///
+/// `streams[c][i]` is the choice made by colour `c` the _i_-th time it left a
+/// node with more than one outgoing edge carrying `c`: the rank of the taken
+/// edge among those edges, in CSR order.
+///
+/// Each colour has its own stream so any contig can be decoded on its own.
+///
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+pub struct Choices {
+    pub streams: Vec<Vec<u32>>,
+}
+
+impl Choices {
+    /// Total number of recorded choices.
+    pub fn n_choices(&self) -> usize {
+        self.streams.iter().map(|x| x.len()).sum()
+    }
+}
+
+#[derive(Debug)]
+pub struct GraphDecodeError(pub String);
+
+impl std::fmt::Display for GraphDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "graph decoding failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for GraphDecodeError {}
+
+/// Walks the path of `color` from the source to the sink.
+///
+/// Returns the sequence length stored on the source edge and the NLZ
+/// dictionary as (colex rank, suffix length) pairs, in the order produced by
+/// [crate::encode_sequence].
+///
+/// The returned value can be passed to [decode_path] to recover the nucleotide
+/// sequence.
+///
+/// `max_steps` bounds the walk (the stored path length) so a corrupt input
+/// cannot loop forever.
+///
+pub fn walk_path(
+    csr: &Csr<u32>,
+    choices: &Choices,
+    color: u32,
+    max_steps: usize,
+) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
+    let mut stream = choices
+        .streams
+        .get(color as usize)
+        .ok_or_else(|| GraphDecodeError(format!("no choice stream for colour {}", color)))?
+        .iter();
+    let mut node = SOURCE_NODE as usize;
+    let mut sequence_length = 0_u32;
+    let mut dictionary: Vec<(u32, u32)> = Vec::with_capacity(max_steps);
+
+    for _ in 0..max_steps {
+        let mut options = csr.outgoing_edges(node, color);
+        let first = options.next().ok_or_else(|| GraphDecodeError(format!("colour {} has no edge out of node {}", color, node)))?;
+        let pos = match options.next() {
+            None => first,
+            Some(second) => {
+                let rank = *stream.next().ok_or_else(|| GraphDecodeError(format!("choice stream of colour {} exhausted at node {}", color, node)))? as usize;
+                match rank {
+                    0 => first,
+                    1 => second,
+                    _ => options.nth(rank - 2).ok_or_else(|| GraphDecodeError(format!("invalid choice {} for colour {} at node {}", rank, color, node)))?,
+                }
+            },
+        };
+
+        if node == SOURCE_NODE as usize {
+            sequence_length = csr.suffix_lens[pos];
+        } else {
+            dictionary.push((csr.node_weights[node], csr.suffix_lens[pos]));
+        }
+
+        node = csr.column_indices[pos] as usize;
+        if node == SINK_NODE as usize {
+            if stream.next().is_some() {
+                return Err(GraphDecodeError(format!("unused choices left for colour {}", color)))
+            }
+            return Ok((sequence_length, dictionary))
+        }
+    }
+
+    Err(GraphDecodeError(format!("colour {} did not reach the sink in {} steps", color, max_steps)))
 }
 
 /// With colex ranks stored in the node
