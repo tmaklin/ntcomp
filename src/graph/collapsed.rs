@@ -35,9 +35,12 @@ use super::{
     SOURCE_NODE,
     take_edge,
 };
+use super::bits::{BitReader, BitWriter};
 
 /// Graph of chains between junctions, in compressed sparse row format.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+///
+/// Serialized as [StoredChains].
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChainCsr {
     /// Colex ranks of the junctions; junction 0 is the source and 1 the sink.
     pub junction_weights: Vec<u32>,
@@ -61,6 +64,23 @@ pub struct ChainCsr {
     pub suffix_lens: Vec<u32>,
 }
 
+/// Stored form of [ChainCsr], see the module docs.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct StoredChains {
+    pub junction_weights: Vec<u32>,
+    pub inner_weights: Vec<u32>,
+    pub suffix_lens: Vec<u32>,
+
+    /// Out-degree of every junction except the sink.
+    pub out_degrees: Vec<u8>,
+
+    /// Number of inner nodes + 1 of every chain.
+    pub chain_lens: Vec<u8>,
+
+    /// Target of every chain.
+    pub targets: Vec<u8>,
+}
+
 impl ChainCsr {
     /// Collapses the linear chains in `csr`.
     pub fn from_csr(
@@ -74,56 +94,166 @@ impl ChainCsr {
             in_degree[target as usize] += 1;
         }
 
-        // Node index -> junction index, u32::MAX for inner nodes. The source
-        // and sink are nodes 0 and 1, so they become junctions 0 and 1.
-        let mut junction_index = vec![u32::MAX; n_nodes];
-        let mut junction_weights = Vec::new();
-        for node in 0..n_nodes {
+        let is_junction: Vec<bool> = (0..n_nodes).map(|node| {
             let (start, end) = csr.row(node);
             let is_dummy = node == SOURCE_NODE as usize || node == SINK_NODE as usize;
-            if is_dummy || in_degree[node] != 1 || end - start != 1 {
-                junction_index[node] = junction_weights.len() as u32;
-                junction_weights.push(csr.node_weights[node]);
-            }
-        }
+            is_dummy || in_degree[node] != 1 || end - start != 1
+        }).collect();
 
-        let mut row_ptrs = Vec::with_capacity(junction_weights.len() + 1);
+        let mut junction_index = vec![u32::MAX; n_nodes];
+        junction_index[SOURCE_NODE as usize] = 0;
+        junction_index[SINK_NODE as usize] = 1;
+        let mut order: Vec<usize> = vec![SOURCE_NODE as usize, SINK_NODE as usize];
+
+        let mut row_ptrs = Vec::with_capacity(n_nodes + 1);
         let mut targets = Vec::new();
         let mut chain_ptrs = vec![0_u32];
         let mut inner_weights = Vec::new();
         let mut suffix_lens = Vec::with_capacity(n_edges);
 
         row_ptrs.push(0);
-        for node in 0..n_nodes {
-            if junction_index[node] == u32::MAX {
-                continue;
-            }
+        let mut head = 0;
+        while head < order.len() {
+            let node = order[head];
+            head += 1;
+
             let (start, end) = csr.row(node);
             for pos in start..end {
                 suffix_lens.push(csr.suffix_lens[pos]);
 
                 let mut next = csr.column_indices[pos] as usize;
-                while junction_index[next] == u32::MAX {
+                while !is_junction[next] {
                     let edge = csr.row(next).0;
                     inner_weights.push(csr.node_weights[next]);
                     suffix_lens.push(csr.suffix_lens[edge]);
                     next = csr.column_indices[edge] as usize;
                 }
 
+                if junction_index[next] == u32::MAX {
+                    junction_index[next] = order.len() as u32;
+                    order.push(next);
+                }
                 targets.push(junction_index[next]);
                 chain_ptrs.push(inner_weights.len() as u32);
             }
             row_ptrs.push(targets.len() as u32);
         }
+        assert_eq!(order.len(), is_junction.iter().filter(|x| **x).count(), "junction not reachable from the source");
 
         ChainCsr {
-            junction_weights,
+            junction_weights: order.iter().map(|&node| csr.node_weights[node]).collect(),
             row_ptrs,
             targets,
             chain_ptrs,
             inner_weights,
             suffix_lens,
         }
+    }
+
+    /// Converts into the stored form.
+    ///
+    /// Panics if the junctions are not numbered in breadth-first order.
+    pub fn to_stored(
+        &self,
+    ) -> StoredChains {
+        let n_junctions = self.junction_weights.len();
+
+        let mut out_degrees = BitWriter::new();
+        for junction in (0..n_junctions).filter(|&j| j != SINK_NODE as usize) {
+            let (start, end) = self.row(junction);
+            out_degrees.write_gamma((end - start) as u64);
+        }
+        let (sink_start, sink_end) = self.row(SINK_NODE as usize);
+        assert_eq!(sink_start, sink_end, "sink has outgoing chains");
+
+        let mut chain_lens = BitWriter::new();
+        let mut targets = BitWriter::new();
+        let mut next_new = 2_u32;
+        for chain in 0..self.n_chains() {
+            chain_lens.write_gamma(self.inner_nodes(chain).len() as u64 + 1);
+
+            let target = self.targets[chain];
+            if target == next_new {
+                targets.write_bits(1, 1);
+                next_new += 1;
+            } else {
+                assert!(target < next_new, "junctions are not numbered in breadth-first order");
+                targets.write_bits(0, 1);
+                targets.write_truncated_binary(target, next_new);
+            }
+        }
+        assert_eq!(next_new as usize, n_junctions, "junctions are not numbered in breadth-first order");
+
+        StoredChains {
+            junction_weights: self.junction_weights.clone(),
+            inner_weights: self.inner_weights.clone(),
+            suffix_lens: self.suffix_lens.clone(),
+            out_degrees: out_degrees.finish(),
+            chain_lens: chain_lens.finish(),
+            targets: targets.finish(),
+        }
+    }
+
+    /// Converts from the stored form.
+    pub fn from_stored(
+        stored: StoredChains,
+    ) -> Result<Self, GraphDecodeError> {
+        let truncated = |what: &str| GraphDecodeError(format!("stored chains: {} truncated or invalid", what));
+        let n_junctions = stored.junction_weights.len();
+        if n_junctions < 2 {
+            return Err(GraphDecodeError("stored chains: missing source or sink".to_string()))
+        }
+
+        let mut row_ptrs = Vec::with_capacity(n_junctions + 1);
+        row_ptrs.push(0_u32);
+        let mut degrees = BitReader::new(&stored.out_degrees);
+        for junction in 0..n_junctions {
+            let degree = if junction == SINK_NODE as usize {
+                0
+            } else {
+                degrees.read_gamma().ok_or_else(|| truncated("out-degrees"))?
+            };
+            let ptr = (*row_ptrs.last().unwrap() as u64 + degree).try_into().map_err(|_| truncated("out-degrees"))?;
+            row_ptrs.push(ptr);
+        }
+        let n_chains = *row_ptrs.last().unwrap() as usize;
+
+        let mut chain_ptrs = Vec::with_capacity(n_chains + 1);
+        chain_ptrs.push(0_u32);
+        let mut lens = BitReader::new(&stored.chain_lens);
+        for _ in 0..n_chains {
+            let len = lens.read_gamma().ok_or_else(|| truncated("chain lengths"))? - 1;
+            let ptr = (*chain_ptrs.last().unwrap() as u64 + len).try_into().map_err(|_| truncated("chain lengths"))?;
+            chain_ptrs.push(ptr);
+        }
+        if *chain_ptrs.last().unwrap() as usize != stored.inner_weights.len()
+            || stored.suffix_lens.len() != stored.inner_weights.len() + n_chains {
+            return Err(truncated("chain lengths"))
+        }
+
+        let mut targets = Vec::with_capacity(n_chains);
+        let mut bits = BitReader::new(&stored.targets);
+        let mut next_new = 2_u32;
+        for _ in 0..n_chains {
+            if bits.read_bits(1).ok_or_else(|| truncated("targets"))? == 1 {
+                targets.push(next_new);
+                next_new += 1;
+            } else {
+                targets.push(bits.read_truncated_binary(next_new).ok_or_else(|| truncated("targets"))?);
+            }
+        }
+        if next_new as usize != n_junctions {
+            return Err(truncated("targets"))
+        }
+
+        Ok(ChainCsr {
+            junction_weights: stored.junction_weights,
+            row_ptrs,
+            targets,
+            chain_ptrs,
+            inner_weights: stored.inner_weights,
+            suffix_lens: stored.suffix_lens,
+        })
     }
 
     pub fn n_chains(&self) -> usize {
@@ -246,3 +376,17 @@ impl ChainCsr {
         }
     }
 }
+
+impl serde::Serialize for ChainCsr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_stored().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChainCsr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let stored = StoredChains::deserialize(deserializer)?;
+        ChainCsr::from_stored(stored).map_err(serde::de::Error::custom)
+    }
+}
+

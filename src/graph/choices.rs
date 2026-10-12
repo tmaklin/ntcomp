@@ -21,6 +21,8 @@
 //! Each colour has its own stream so any contig can be decoded on its own.
 //!
 
+use super::bits::{BitReader, BitWriter};
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct Choices {
     pub streams: Vec<ChoiceStream>,
@@ -37,7 +39,7 @@ impl Choices {
         &self,
         color: u32,
     ) -> Option<ChoiceReader<'_>> {
-        self.streams.get(color as usize).map(|stream| ChoiceReader { stream, bit: 0, n_read: 0 })
+        self.streams.get(color as usize).map(|stream| ChoiceReader { stream, bits: BitReader::new(&stream.bits), n_read: 0 })
     }
 }
 
@@ -51,43 +53,15 @@ pub struct ChoiceStream {
     pub bits: Vec<u8>,
 }
 
-/// Number of bits `k` and threshold `u` of the truncated binary code for `n` symbols.
-///
-/// Ranks below `u` are written with `k` bits, the rest as `rank + u` with `k + 1` bits.
-#[inline]
-fn truncated_binary(
-    n_options: u32,
-) -> (u32, u32) {
-    let k = 31 - n_options.leading_zeros();
-    let u = ((2_u64 << k) - n_options as u64) as u32;
-    (k, u)
-}
-
 #[derive(Default)]
 pub struct ChoiceWriter {
-    stream: ChoiceStream,
-    n_bits: usize,
+    bits: BitWriter,
+    n_choices: u32,
 }
 
 impl ChoiceWriter {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn write_bits(
-        &mut self,
-        value: u32,
-        n_bits: u32,
-    ) {
-        for i in (0..n_bits).rev() {
-            if self.n_bits % 8 == 0 {
-                self.stream.bits.push(0);
-            }
-            if (value >> i) & 1 == 1 {
-                *self.stream.bits.last_mut().unwrap() |= 0x80 >> (self.n_bits % 8);
-            }
-            self.n_bits += 1;
-        }
     }
 
     /// Records that edge `rank` of `n_options > 1` edges was taken.
@@ -97,43 +71,22 @@ impl ChoiceWriter {
         n_options: u32,
     ) {
         assert!(n_options > 1 && rank < n_options, "invalid choice {} of {}", rank, n_options);
-        let (k, u) = truncated_binary(n_options);
-        if rank < u {
-            self.write_bits(rank, k);
-        } else {
-            self.write_bits(rank + u, k + 1);
-        }
-        self.stream.n_choices += 1;
+        self.bits.write_truncated_binary(rank, n_options);
+        self.n_choices += 1;
     }
 
     pub fn finish(self) -> ChoiceStream {
-        self.stream
+        ChoiceStream { n_choices: self.n_choices, bits: self.bits.finish() }
     }
 }
 
 pub struct ChoiceReader<'a> {
     stream: &'a ChoiceStream,
-    bit: usize,
+    bits: BitReader<'a>,
     n_read: u32,
 }
 
 impl ChoiceReader<'_> {
-    fn read_bits(
-        &mut self,
-        n_bits: u32,
-    ) -> Option<u32> {
-        if self.bit + n_bits as usize > self.stream.bits.len() * 8 {
-            return None
-        }
-        let mut value = 0;
-        for _ in 0..n_bits {
-            let bit = (self.stream.bits[self.bit / 8] >> (7 - self.bit % 8)) & 1;
-            value = (value << 1) | bit as u32;
-            self.bit += 1;
-        }
-        Some(value)
-    }
-
     /// Reads the next choice among `n_options > 1` edges, None if the stream is exhausted.
     pub fn next(
         &mut self,
@@ -142,13 +95,7 @@ impl ChoiceReader<'_> {
         if self.n_read == self.stream.n_choices {
             return None
         }
-        let (k, u) = truncated_binary(n_options);
-        let value = self.read_bits(k)?;
-        let rank = if value < u {
-            value
-        } else {
-            ((value << 1) | self.read_bits(1)?) - u
-        };
+        let rank = self.bits.read_truncated_binary(n_options)?;
         self.n_read += 1;
         Some(rank)
     }
