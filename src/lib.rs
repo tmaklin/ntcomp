@@ -212,23 +212,12 @@ pub fn encode_sequence(
 
                     let ref_nts = &nucleotides[0..i];
                     let new_kmer = left_extend_kmer(&kmer, ref_nts, sbwt, i - k - 1);
-                    let new_seq = nucleotides[(i - new_kmer.len())..i].to_vec();
-                    assert_eq!(new_kmer.len(), new_seq.len());
+                    assert_eq!(new_kmer.as_slice(), &nucleotides[(i - new_kmer.len())..i]);
 
-                    let mut match_len = new_kmer.len();
-
-                    let old_i = i;
-                    loop {
-                        if res[i - 1].0 < match_len {
-                            let old_ms = res[i - 1].0;
-                            i -= old_ms;
-                            match_len -= old_ms;
-                        } else {
-                            res[old_i - 1].0 = new_kmer.len() - (match_len - 1);
-                            kept.push(old_i - 1);
-                            break;
-                        }
-                    }
+                    // Store the whole left extension; the next entry ends where it starts.
+                    res[i - 1].0 = new_kmer.len();
+                    kept.push(i - 1);
+                    i -= new_kmer.len() - 1;
                 } else {
                     kept.push(i - 1);
                     if i > res[i - 1].0 {
