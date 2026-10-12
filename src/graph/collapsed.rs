@@ -33,7 +33,7 @@ use super::{
     GraphDecodeError,
     SINK_NODE,
     SOURCE_NODE,
-    take_option,
+    take_edge,
 };
 
 /// Graph of chains between junctions, in compressed sparse row format.
@@ -47,9 +47,6 @@ pub struct ChainCsr {
 
     /// Junction that each chain ends at.
     pub targets: Vec<u32>,
-
-    /// Colours using each chain.
-    pub colorsets: Vec<Vec<u32>>,
 
     /// Inner nodes of chain `c` are `inner_weights[chain_ptrs[c]..chain_ptrs[c + 1]]`.
     pub chain_ptrs: Vec<u32>,
@@ -66,12 +63,9 @@ pub struct ChainCsr {
 
 impl ChainCsr {
     /// Collapses the linear chains in `csr`.
-    ///
-    /// Also returns, for every edge position in `csr`, the chain that the edge
-    /// starts or `u32::MAX` if the edge is inside a chain.
     pub fn from_csr(
         csr: &Csr<u32>,
-    ) -> (Self, Vec<u32>) {
+    ) -> Self {
         let n_nodes = csr.node_weights.len();
         let n_edges = csr.column_indices.len();
 
@@ -93,10 +87,8 @@ impl ChainCsr {
             }
         }
 
-        let mut chain_of_edge = vec![u32::MAX; n_edges];
         let mut row_ptrs = Vec::with_capacity(junction_weights.len() + 1);
         let mut targets = Vec::new();
-        let mut colorsets = Vec::new();
         let mut chain_ptrs = vec![0_u32];
         let mut inner_weights = Vec::new();
         let mut suffix_lens = Vec::with_capacity(n_edges);
@@ -108,36 +100,30 @@ impl ChainCsr {
             }
             let (start, end) = csr.row(node);
             for pos in start..end {
-                chain_of_edge[pos] = targets.len() as u32;
-                let colors = &csr.colorsets[pos];
                 suffix_lens.push(csr.suffix_lens[pos]);
 
                 let mut next = csr.column_indices[pos] as usize;
                 while junction_index[next] == u32::MAX {
                     let edge = csr.row(next).0;
-                    assert_eq!(&csr.colorsets[edge], colors, "colour set changes inside a linear chain");
                     inner_weights.push(csr.node_weights[next]);
                     suffix_lens.push(csr.suffix_lens[edge]);
                     next = csr.column_indices[edge] as usize;
                 }
 
                 targets.push(junction_index[next]);
-                colorsets.push(colors.clone());
                 chain_ptrs.push(inner_weights.len() as u32);
             }
             row_ptrs.push(targets.len() as u32);
         }
 
-        let chains = ChainCsr {
+        ChainCsr {
             junction_weights,
             row_ptrs,
             targets,
-            colorsets,
             chain_ptrs,
             inner_weights,
             suffix_lens,
-        };
-        (chains, chain_of_edge)
+        }
     }
 
     pub fn n_chains(&self) -> usize {
@@ -150,24 +136,6 @@ impl ChainCsr {
         junction: usize,
     ) -> (usize, usize) {
         (self.row_ptrs[junction] as usize, self.row_ptrs[junction + 1] as usize)
-    }
-
-    /// Junction that chain `chain` starts from.
-    pub fn source(
-        &self,
-        chain: usize,
-    ) -> usize {
-        self.row_ptrs.partition_point(|&ptr| ptr as usize <= chain) - 1
-    }
-
-    /// Chains leaving `junction` that carry `color`.
-    pub fn outgoing_chains(
-        &self,
-        junction: usize,
-        color: u32,
-    ) -> impl Iterator<Item = usize> + '_ {
-        let (start, end) = self.row(junction);
-        (start..end).filter(move |&chain| self.colorsets[chain].binary_search(&color).is_ok())
     }
 
     /// Colex ranks of the inner nodes of `chain`.
@@ -198,18 +166,16 @@ impl ChainCsr {
         color: u32,
         max_steps: usize,
     ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
-        let mut stream = choices
-            .streams
-            .get(color as usize)
-            .ok_or_else(|| GraphDecodeError(format!("no choice stream for colour {}", color)))?
-            .iter();
+        let mut reader = choices
+            .reader(color)
+            .ok_or_else(|| GraphDecodeError(format!("no choice stream for colour {}", color)))?;
         let mut junction = SOURCE_NODE as usize;
         let mut sequence_length = 0_u32;
         let mut dictionary: Vec<(u32, u32)> = Vec::new();
         let mut steps = 0;
 
         loop {
-            let chain = take_option(self.outgoing_chains(junction, color), &mut stream, color, junction)?;
+            let chain = take_edge(self.row(junction), &mut reader, color, junction)?;
             let inner = self.inner_nodes(chain);
             let suffix_lens = self.chain_suffix_lens(chain);
 
@@ -227,7 +193,7 @@ impl ChainCsr {
 
             junction = self.targets[chain] as usize;
             if junction == SINK_NODE as usize {
-                if stream.next().is_some() {
+                if !reader.is_finished() {
                     return Err(GraphDecodeError(format!("unused choices left for colour {}", color)))
                 }
                 return Ok((sequence_length, dictionary))
@@ -247,8 +213,8 @@ impl ChainCsr {
         let mut node_weights = self.junction_weights.clone();
         node_weights.extend(self.inner_weights.iter().copied());
 
-        // (source, target, suffix length, chain); junction rows come first in chain order.
-        let mut edges: Vec<(u32, u32, u32, usize)> = Vec::with_capacity(self.suffix_lens.len());
+        // (source, target, suffix length); junction rows come first in chain order.
+        let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(self.suffix_lens.len());
         for junction in 0..n_junctions as usize {
             let (start, end) = self.row(junction);
             for chain in start..end {
@@ -256,10 +222,10 @@ impl ChainCsr {
                 let mut prev = junction as u32;
                 for i in 0..self.inner_nodes(chain).len() {
                     let node = n_junctions + self.chain_ptrs[chain] + i as u32;
-                    edges.push((prev, node, suffix_lens[i], chain));
+                    edges.push((prev, node, suffix_lens[i]));
                     prev = node;
                 }
-                edges.push((prev, self.targets[chain], *suffix_lens.last().unwrap(), chain));
+                edges.push((prev, self.targets[chain], *suffix_lens.last().unwrap()));
             }
         }
         edges.sort_by_key(|edge| edge.0);
@@ -277,7 +243,6 @@ impl ChainCsr {
             row_ptrs,
             column_indices: edges.iter().map(|edge| edge.1).collect(),
             suffix_lens: edges.iter().map(|edge| edge.2).collect(),
-            colorsets: edges.iter().map(|edge| self.colorsets[edge.3].clone()).collect(),
         }
     }
 }
