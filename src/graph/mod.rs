@@ -30,6 +30,11 @@
 //! colour is a single linear walk from the source to the sink, and every
 //! colour has its own stream so contigs can be decoded independently.
 //!
+//! ## Collapsed chains
+//!
+//! Optionally, linear chains of nodes are stored as single edges between
+//! junctions, see [collapsed].
+//!
 use core::ops::Range;
 
 use std::io::Write;
@@ -44,6 +49,10 @@ use petgraph::graph::{
 use petgraph::visit::EdgeRef;
 
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
+
+pub mod collapsed;
+
+use collapsed::ChainCsr;
 
 type E = Box<dyn std::error::Error>;
 
@@ -98,6 +107,9 @@ pub struct GraphBuilder {
 
     /// Per colour: edge ids (indexes into `edges`) in traversal order
     paths: Vec<Vec<usize>>,
+
+    /// Store linear chains as single edges in [GraphBuilder::finish]
+    collapse_chains: bool,
 }
 
 impl Default for GraphBuilder {
@@ -115,8 +127,18 @@ impl GraphBuilder {
         GraphBuilder {
             nodes,
             edges: IndexMap::new(),
-            paths: Vec::new()
+            paths: Vec::new(),
+            collapse_chains: false,
         }
+    }
+
+    /// Collapse linear chains into single edges in [GraphBuilder::finish].
+    pub fn collapse_chains(
+        mut self,
+        collapse: bool,
+    ) -> Self {
+        self.collapse_chains = collapse;
+        self
     }
 
     fn insert_node(
@@ -171,8 +193,69 @@ impl GraphBuilder {
         color
     }
 
+    /// Converts into the stored representation (graph + choice stream),
+    /// collapsing linear chains if [GraphBuilder::collapse_chains] was set.
+    pub fn finish(self) -> (StoredGraph, Choices) {
+        if self.collapse_chains {
+            let (chains, choices) = self.to_chains();
+            (StoredGraph::Chains(chains), choices)
+        } else {
+            let (csr, choices) = self.to_csr();
+            (StoredGraph::Csr(csr), choices)
+        }
+    }
+
     /// Converts into the stored representation (graph + choice stream).
     pub fn to_csr(self) -> (Csr<u32>, Choices) {
+        let (csr, csr_pos) = self.build_csr();
+
+        // Record which edge each colour takes at every node where it has a choice.
+        let mut streams: Vec<Vec<u32>> = Vec::with_capacity(self.paths.len());
+        for (color, path) in self.paths.iter().enumerate() {
+            let color = color as u32;
+            let mut stream = Vec::new();
+            for &id in path {
+                let source = self.edges.get_index(id).unwrap().0.0 as usize;
+                let pos = csr_pos[id] as usize;
+                if let Some(rank) = choice_rank(csr.outgoing_edges(source, color), pos) {
+                    stream.push(rank);
+                }
+            }
+            streams.push(stream);
+        }
+
+        (csr, Choices { streams })
+    }
+
+    /// Converts into the stored representation with linear chains collapsed.
+    pub fn to_chains(self) -> (ChainCsr, Choices) {
+        let (csr, csr_pos) = self.build_csr();
+        let (chains, chain_of_edge) = ChainCsr::from_csr(&csr);
+        drop(csr);
+
+        // Choices are only made at junctions, i.e. where a chain starts.
+        let mut streams: Vec<Vec<u32>> = Vec::with_capacity(self.paths.len());
+        for (color, path) in self.paths.iter().enumerate() {
+            let color = color as u32;
+            let mut stream = Vec::new();
+            for &id in path {
+                let chain = chain_of_edge[csr_pos[id] as usize];
+                if chain == u32::MAX {
+                    continue;
+                }
+                let chain = chain as usize;
+                if let Some(rank) = choice_rank(chains.outgoing_chains(chains.source(chain), color), chain) {
+                    stream.push(rank);
+                }
+            }
+            streams.push(stream);
+        }
+
+        (chains, Choices { streams })
+    }
+
+    /// Builds the CSR and the CSR position of every edge id.
+    fn build_csr(&self) -> (Csr<u32>, Vec<u32>) {
         let n_nodes = self.nodes.len();
         let n_edges = self.edges.len();
 
@@ -199,37 +282,94 @@ impl GraphBuilder {
         }
 
         let csr = Csr {
-            node_weights: self.nodes.into_iter().collect(),
+            node_weights: self.nodes.iter().copied().collect(),
             row_ptrs,
             column_indices,
             suffix_lens,
             colorsets,
         };
 
-        // Record which edge each colour takes at every node where it has a choice.
-        let mut streams: Vec<Vec<u32>> = Vec::with_capacity(self.paths.len());
-        for (color, path) in self.paths.iter().enumerate() {
-            let color = color as u32;
-            let mut stream = Vec::new();
-            for &id in path {
-                let source = self.edges.get_index(id).unwrap().0.0 as usize;
-                let pos = csr_pos[id] as usize;
-                let mut n_options = 0;
-                let mut rank = 0;
-                for option in csr.outgoing_edges(source, color) {
-                    if option < pos {
-                        rank += 1;
-                    }
-                    n_options += 1;
-                }
-                if n_options > 1 {
-                    stream.push(rank);
-                }
-            }
-            streams.push(stream);
-        }
+        (csr, csr_pos)
+    }
+}
 
-        (csr, Choices { streams })
+/// Rank of `taken` among `options`, or None if there is only one option.
+fn choice_rank(
+    options: impl Iterator<Item = usize>,
+    taken: usize,
+) -> Option<u32> {
+    let mut n_options = 0;
+    let mut rank = 0;
+    for option in options {
+        if option < taken {
+            rank += 1;
+        }
+        n_options += 1;
+    }
+    (n_options > 1).then_some(rank)
+}
+
+/// Picks the next edge out of `node` from `options`, reading the choice stream
+/// if there is more than one option.
+fn take_option(
+    mut options: impl Iterator<Item = usize>,
+    stream: &mut std::slice::Iter<'_, u32>,
+    color: u32,
+    node: usize,
+) -> Result<usize, GraphDecodeError> {
+    let first = options.next().ok_or_else(|| GraphDecodeError(format!("colour {} has no edge out of node {}", color, node)))?;
+    match options.next() {
+        None => Ok(first),
+        Some(second) => {
+            let rank = *stream.next().ok_or_else(|| GraphDecodeError(format!("choice stream of colour {} exhausted at node {}", color, node)))? as usize;
+            match rank {
+                0 => Ok(first),
+                1 => Ok(second),
+                _ => options.nth(rank - 2).ok_or_else(|| GraphDecodeError(format!("invalid choice {} for colour {} at node {}", rank, color, node))),
+            }
+        },
+    }
+}
+
+/// Stored graph, either as is or with linear chains collapsed.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum StoredGraph {
+    Csr(Csr<u32>),
+    Chains(ChainCsr),
+}
+
+impl StoredGraph {
+    /// Walks the path of `color` from the source to the sink, see [walk_path].
+    pub fn walk_path(
+        &self,
+        choices: &Choices,
+        color: u32,
+        max_steps: usize,
+    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
+        match self {
+            StoredGraph::Csr(csr) => walk_path(csr, choices, color, max_steps),
+            StoredGraph::Chains(chains) => chains.walk_path(choices, color, max_steps),
+        }
+    }
+
+    /// Uncollapsed graph.
+    pub fn into_csr(self) -> Csr<u32> {
+        match self {
+            StoredGraph::Csr(csr) => csr,
+            StoredGraph::Chains(chains) => chains.to_csr(),
+        }
+    }
+
+    /// One-line description for logging.
+    pub fn summary(&self) -> String {
+        match self {
+            StoredGraph::Csr(csr) => format!(
+                "{} nodes, {} edges",
+                csr.node_weights.len(), csr.column_indices.len()),
+            StoredGraph::Chains(chains) => format!(
+                "{} junctions, {} chains, {} inner nodes, {} edges",
+                chains.junction_weights.len(), chains.n_chains(), chains.inner_weights.len(), chains.suffix_lens.len()),
+        }
     }
 }
 
@@ -351,19 +491,7 @@ pub fn walk_path(
     let mut dictionary: Vec<(u32, u32)> = Vec::with_capacity(max_steps);
 
     for _ in 0..max_steps {
-        let mut options = csr.outgoing_edges(node, color);
-        let first = options.next().ok_or_else(|| GraphDecodeError(format!("colour {} has no edge out of node {}", color, node)))?;
-        let pos = match options.next() {
-            None => first,
-            Some(second) => {
-                let rank = *stream.next().ok_or_else(|| GraphDecodeError(format!("choice stream of colour {} exhausted at node {}", color, node)))? as usize;
-                match rank {
-                    0 => first,
-                    1 => second,
-                    _ => options.nth(rank - 2).ok_or_else(|| GraphDecodeError(format!("invalid choice {} for colour {} at node {}", rank, color, node)))?,
-                }
-            },
-        };
+        let pos = take_option(csr.outgoing_edges(node, color), &mut stream, color, node)?;
 
         if node == SOURCE_NODE as usize {
             sequence_length = csr.suffix_lens[pos];

@@ -95,6 +95,10 @@ pub enum Commands {
         #[arg(long = "fasta-cols", default_value_t = 80, help = ".fasta columns")]
         fasta_columns: usize,
 
+        // // Collapse linear chains
+        #[arg(long = "collapse-chains", default_value_t = false, help = "Store linear chains of nodes as single edges.")]
+        collapse_chains: bool,
+
         // Decompression
         // // Toggle decompression
         #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]

@@ -261,6 +261,7 @@ fn main() {
             decompress,
             fasta,
             fasta_columns,
+            collapse_chains,
             colors,
             contigs,
         }) => {
@@ -281,7 +282,7 @@ fn main() {
 
                 let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = read_section(&mut input, header.file_range_bytes as u64);
                 let contig_names: Vec<Vec<u8>> = read_section(&mut input, header.contig_name_bytes);
-                let csr: ntcomp::graph::Csr<u32> = read_section(&mut input, header.graph_bytes);
+                let graph: ntcomp::graph::StoredGraph = read_section(&mut input, header.graph_bytes);
                 let hashes: Vec<Hash> = read_section(&mut input, header.hash_bytes as u64);
                 let path_lens: Vec<u32> = read_section(&mut input, header.path_len_bytes as u64);
                 let choices: ntcomp::graph::Choices = read_section(&mut input, header.choice_bytes);
@@ -315,8 +316,7 @@ fn main() {
                     let file_idx = file_ranges.iter().position(|(_, range)| range.contains(&color)).unwrap();
                     let start_time = std::time::Instant::now();
 
-                    let (sequence_length, dictionary) = ntcomp::graph::walk_path(
-                        &csr,
+                    let (sequence_length, dictionary) = graph.walk_path(
                         &choices,
                         color,
                         path_lens[idx] as usize,
@@ -348,7 +348,7 @@ fn main() {
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let mut builder = ntcomp::graph::GraphBuilder::new();
+                let mut builder = ntcomp::graph::GraphBuilder::new().collapse_chains(*collapse_chains);
 
                 // blake3 hash of every (normalized) input contig, checked after decoding
                 let mut hashes: Vec<Hash> = Vec::new();
@@ -383,18 +383,18 @@ fn main() {
                 }
                 progress.finish();
 
-                let (csr, choices) = builder.to_csr();
+                let (graph, choices) = builder.finish();
 
                 // TODO move this part to an encoding function
                 {
                     let file_range_bytes = postcard::to_allocvec(&file_ranges).unwrap();
                     let contig_name_bytes = postcard::to_allocvec(&contig_names).unwrap();
-                    let graph_bytes = postcard::to_allocvec(&csr).unwrap();
+                    let graph_bytes = postcard::to_allocvec(&graph).unwrap();
                     let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
                     let path_len_bytes = postcard::to_allocvec(&path_lens).unwrap();
                     let choice_bytes = postcard::to_allocvec(&choices).unwrap();
 
-                    info!("Graph: {} nodes, {} edges, {} bytes", csr.node_weights.len(), csr.column_indices.len(), graph_bytes.len());
+                    info!("Graph: {}, {} bytes", graph.summary(), graph_bytes.len());
                     info!("Choices: {} choices, {} bytes", choices.n_choices(), choice_bytes.len());
 
                     let header = ntcomp::FileHeader{
