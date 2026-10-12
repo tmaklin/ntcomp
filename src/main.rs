@@ -319,7 +319,7 @@ fn main() {
                     if idx as u32 == file_ranges[file_idx].1.end {
                         file_idx += 1;
                     }
-                    let nodes = ntcomp::graph::dfs_compressed::search(
+                    let nodes = ntcomp::graph::dfs::search(
                         &graph,
                         seq,
                         hashes[idx],
