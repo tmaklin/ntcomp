@@ -15,18 +15,12 @@ use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use std::collections::{
-    HashSet,
-};
-
 use std::fs::File;
 
 use blake3::{
     hash,
     Hash,
 };
-
-use indexmap::IndexSet;
 
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
@@ -104,6 +98,13 @@ fn read_input_list(
             panic!("  Error in reading --input-list: {}", input_list_file);
         }
     }).collect::<Vec<(String, PathBuf)>>()
+}
+
+/// Helper for deserializing postcard data
+fn read_section<T: serde::de::DeserializeOwned, R: Read>(input: &mut R, n_bytes: u64) -> T {
+    let mut bytes = vec![0_u8; n_bytes as usize];
+    input.read_exact(&mut bytes).unwrap();
+    postcard::from_bytes(&bytes).unwrap()
 }
 
 fn main() {
@@ -260,6 +261,8 @@ fn main() {
             decompress,
             fasta,
             fasta_columns,
+            colors,
+            contigs,
         }) => {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
@@ -268,107 +271,86 @@ fn main() {
 
             if *decompress {
                 assert!(query_files.len() == 1);
-                let mut input = File::open(&query_files[0]).unwrap();
+                let mut input = std::io::BufReader::new(File::open(&query_files[0]).unwrap());
 
                 let header = {
-                    let mut header_bytes: [u8; 42] = [0; 42];
+                    let mut header_bytes = [0_u8; ntcomp::FILE_HEADER_BYTES];
                     input.read_exact(&mut header_bytes).unwrap();
                     ntcomp::decode_file_header(&header_bytes).unwrap()
                 };
 
-                let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = {
-                    let mut file_range_bytes = vec![0_u8; header.file_range_bytes as usize];
-                    input.read_exact(&mut file_range_bytes).unwrap();
-                    postcard::from_bytes(&file_range_bytes).unwrap()
-                };
+                let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = read_section(&mut input, header.file_range_bytes as u64);
+                let contig_names: Vec<Vec<u8>> = read_section(&mut input, header.contig_name_bytes);
+                let csr: ntcomp::graph::Csr<u32> = read_section(&mut input, header.graph_bytes);
+                let hashes: Vec<Hash> = read_section(&mut input, header.hash_bytes as u64);
+                let path_lens: Vec<u32> = read_section(&mut input, header.path_len_bytes as u64);
+                let choices: ntcomp::graph::Choices = read_section(&mut input, header.choice_bytes);
 
-                let contig_names: Vec<Vec<u8>> = {
-                    let mut contig_name_bytes = vec![0_u8; header.contig_name_bytes as usize];
-                    input.read_exact(&mut contig_name_bytes).unwrap();
-                    postcard::from_bytes(&contig_name_bytes).unwrap()
-                };
-
-                let graph = {
-                    let mut graph_bytes = vec![0_u8; header.graph_bytes as usize];
-                    input.read_exact(&mut graph_bytes).unwrap();
-                    let csr: ntcomp::graph::Csr<u32> = postcard::from_bytes(&graph_bytes).unwrap();
-                    csr.to_petgraph()
-                };
-
-                let hashes: Vec<Hash> = {
-                    let mut hash_bytes = vec![0_u8; header.hash_bytes as usize];
-                    input.read_exact(&mut hash_bytes).unwrap();
-                    postcard::from_bytes(&hash_bytes).unwrap()
-                };
-
-                let path_lens: Vec<u32> = {
-                    let mut path_len_bytes = vec![0_u8; header.path_len_bytes as usize];
-                    input.read_exact(&mut path_len_bytes).unwrap();
-                    postcard::from_bytes(&path_len_bytes).unwrap()
-                };
-
-                let colors: Vec<u32> = (0..header.n_queries).collect();
-
-                let max_visits = header.max_visits;
+                // Contigs to decode: all by default, otherwise the requested ones in the given order.
+                let mut want_colors: Vec<u32> = colors.clone();
+                for name in contigs {
+                    let matches: Vec<u32> = contig_names.iter().enumerate()
+                        .filter(|(_, x)| x.as_slice() == name.as_bytes() || x.split(|c| *c == b' ').next() == Some(name.as_bytes()))
+                        .map(|(i, _)| i as u32)
+                        .collect();
+                    if matches.is_empty() {
+                        eprintln!("ntcomp: contig {} not found in archive {}", name, query_files[0].to_string_lossy());
+                        std::process::exit(1);
+                    }
+                    want_colors.extend(matches);
+                }
+                if want_colors.is_empty() {
+                    want_colors = (0..header.n_queries).collect();
+                }
+                if let Some(bad) = want_colors.iter().find(|&&c| c >= header.n_queries) {
+                    eprintln!("ntcomp: color {} out of range (archive {} contains {} contigs)", bad, query_files[0].to_string_lossy(), header.n_queries);
+                    std::process::exit(1);
+                }
 
                 if !fasta {
-                    eprintln!("accession\tcontig\tdecoded_len\tpath_found");
+                    eprintln!("color\taccession\tcontig\tdecoded_len\thash_match\tseconds");
                 }
-                let mut file_idx: usize = 0;
-                for (idx, seq) in colors.into_iter().enumerate() {
-                    if idx as u32 == file_ranges[file_idx].1.end {
-                        file_idx += 1;
-                    }
-                    let nodes = ntcomp::graph::dfs::search(
-                        &graph,
-                        seq,
-                        hashes[idx],
-                        path_lens[idx],
-                    );
+                for color in want_colors {
+                    let idx = color as usize;
+                    let file_idx = file_ranges.iter().position(|(_, range)| range.contains(&color)).unwrap();
+                    let start_time = std::time::Instant::now();
 
-                    let file_name = String::from_utf8(file_ranges[file_idx].0.to_vec()).unwrap_or(file_idx.to_string());
-                    let contig_name = String::from_utf8(contig_names[idx].to_vec()).unwrap_or(seq.to_string());
-                    if let Some(nodes) = nodes {
-                        let sequence = ntcomp::graph::decode_sequence(
-                            &graph,
-                            &nodes,
-                            &sbwt,
-                        );
-                        if !fasta {
-                            eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, sequence.len(), true);
-                        } else {
-                            stdout.write_all(b">").unwrap();
-                            stdout.write_all(&contig_names[idx].to_vec()).unwrap();
-                            stdout.write_all(b"\n").unwrap();
-                            sequence.chunks(*fasta_columns).for_each(|chunk| {
-                                stdout.write_all(chunk).unwrap();
-                                stdout.write_all(b"\n").unwrap();
-                            });
-                            stdout.flush().unwrap();
-                        }
+                    let (sequence_length, dictionary) = ntcomp::graph::walk_path(
+                        &csr,
+                        &choices,
+                        color,
+                        path_lens[idx] as usize,
+                    ).unwrap();
+                    let sequence = ntcomp::graph::decode_path(dictionary, &sbwt);
+                    assert_eq!(sequence.len(), sequence_length as usize);
+
+                    let hash_match = hash(&sequence) == hashes[idx];
+                    assert!(hash_match, "hash mismatch for color {color}");
+
+                    if !fasta {
+                        let file_name = String::from_utf8(file_ranges[file_idx].0.to_vec()).unwrap_or(file_idx.to_string());
+                        let contig_name = String::from_utf8(contig_names[idx].to_vec()).unwrap_or(color.to_string());
+                        eprintln!("{}\t{}\t{}\t{}\t{}\t{:.3}", color, file_name, contig_name, sequence.len(), hash_match, start_time.elapsed().as_secs_f64());
                     } else {
-                        if !fasta {
-                            eprintln!("{}\t{}\t{}\t{}", file_name, contig_name, 0, false);
-                        }
+                        stdout.write_all(b">").unwrap();
+                        stdout.write_all(&contig_names[idx]).unwrap();
+                        stdout.write_all(b"\n").unwrap();
+                        sequence.chunks(*fasta_columns).for_each(|chunk| {
+                            stdout.write_all(chunk).unwrap();
+                            stdout.write_all(b"\n").unwrap();
+                        });
                     }
                 }
+                stdout.flush().unwrap();
             } else {
                 let n_queries = query_files.len();
 
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let mut graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = Graph::new();
-                let mut node_indexes: IndexSet<u32> = IndexSet::new();
+                let mut builder = ntcomp::graph::GraphBuilder::new();
 
-                // Dummy nodes to track start and end positions
-                let start_node = graph.add_node(0_u32);
-                let end_node = graph.add_node(0_u32);
-                assert!(start_node.index() == 0);
-                assert!(end_node.index() == 1);
-                node_indexes.insert(0);
-                node_indexes.insert(1);
-
+                // blake3 hash of every (normalized) input contig, checked after decoding
                 let mut hashes: Vec<Hash> = Vec::new();
 
                 let mut contig_names: Vec<Vec<u8>> = Vec::with_capacity(n_queries);
@@ -383,40 +365,14 @@ fn main() {
                     while let Some(rec) = read_from_fastx_parser(&mut *reader) {
                         contig_names.push(rec.id().to_vec());
                         let seqrec = rec.normalize(true);
-                        let sequence_length = seqrec.len();
+                        hashes.push(hash(&seqrec));
 
                         let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
-                        let n_entries = dictionary.len();
-                        path_lens.push(n_entries as u32 + 2);
-                        let avg_suffix_len = (dictionary.iter().map(|x| x.0 as f64).sum::<f64>() / (dictionary.len() as f64)) as usize;
-                        ntcomp::graph::insert_edge(
-                            &mut graph,
-                            &mut node_indexes,
-                            color,
-                            &(sequence_length, 0..0),
-                            &dictionary[0],
-                        );
+                        path_lens.push(dictionary.len() as u32 + 2);
+                        info!("Encoded color {} with {} nodes", color, dictionary.len());
 
-                        for i in 1..n_entries {
-                            ntcomp::graph::insert_edge(
-                                &mut graph,
-                                &mut node_indexes,
-                                color,
-                                &dictionary[i - 1],
-                                &dictionary[i]
-                            );
-                        }
-                        ntcomp::graph::insert_edge(
-                            &mut graph,
-                            &mut node_indexes,
-                            color,
-                            &dictionary[dictionary.len() - 1],
-                            &(0, 1..1),
-                        );
-
-                        let path: Vec<u32> = dictionary.into_iter().map(|entry| entry.1.start as u32).collect();
-                        let path_bytes: Vec<u8> = path.clone().into_iter().flat_map(|node_idx| node_idx.to_le_bytes()).collect();
-                        hashes.push(hash(&path_bytes));
+                        let added = builder.add_path(seqrec.len(), &dictionary);
+                        assert_eq!(added, color);
                         color += 1;
                     }
                     let end = color;
@@ -426,40 +382,44 @@ fn main() {
                     progress.inc(1_u64);
                 }
                 progress.finish();
-                let max_visits = ntcomp::graph::deduplicate_edges(&mut graph);
+
+                let (csr, choices) = builder.to_csr();
 
                 // TODO move this part to an encoding function
                 {
+                    let file_range_bytes = postcard::to_allocvec(&file_ranges).unwrap();
+                    let contig_name_bytes = postcard::to_allocvec(&contig_names).unwrap();
+                    let graph_bytes = postcard::to_allocvec(&csr).unwrap();
+                    let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
+                    let path_len_bytes = postcard::to_allocvec(&path_lens).unwrap();
+                    let choice_bytes = postcard::to_allocvec(&choices).unwrap();
 
-                    let csr = ntcomp::graph::Csr::from_petgraph(graph);
-                    let graph_bytes_len = postcard::to_allocvec(&csr).unwrap().len();
-                    let hash_bytes_len = postcard::to_allocvec(&hashes).unwrap().len();
-                    let path_len_bytes_len = postcard::to_allocvec(&path_lens).unwrap().len();
+                    info!("Graph: {} nodes, {} edges, {} bytes", csr.node_weights.len(), csr.column_indices.len(), graph_bytes.len());
+                    info!("Choices: {} choices, {} bytes", choices.n_choices(), choice_bytes.len());
 
-                    let contig_name_bytes_len = postcard::to_allocvec(&contig_names).unwrap().len();
-                    let file_range_bytes_len = postcard::to_allocvec(&file_ranges).unwrap().len();
                     let header = ntcomp::FileHeader{
                         nlz_header: [0_u8; 6],
-                        path_len_bytes: path_len_bytes_len.try_into().unwrap(),
+                        path_len_bytes: path_len_bytes.len().try_into().unwrap(),
                         n_queries: color,
-                        contig_name_bytes: contig_name_bytes_len.try_into().unwrap(),
-                        graph_bytes: graph_bytes_len as u64,
-                        hash_bytes: hash_bytes_len.try_into().unwrap(),
-                        file_range_bytes: file_range_bytes_len.try_into().unwrap(),
-                        max_visits,
+                        contig_name_bytes: contig_name_bytes.len() as u64,
+                        graph_bytes: graph_bytes.len() as u64,
+                        hash_bytes: hash_bytes.len().try_into().unwrap(),
+                        file_range_bytes: file_range_bytes.len().try_into().unwrap(),
+                        choice_bytes: choice_bytes.len() as u64,
                     };
                     let nbytes = bincode::encode_into_std_write(
                         &header,
                         &mut stdout,
                         bincode::config::standard().with_fixed_int_encoding(),
                     ).unwrap();
-                    assert_eq!(nbytes, 42);
+                    assert_eq!(nbytes, ntcomp::FILE_HEADER_BYTES);
 
-                    postcard::to_io(&file_ranges, &mut stdout).unwrap();
-                    postcard::to_io(&contig_names, &mut stdout).unwrap();
-                    postcard::to_io(&csr, &mut stdout).unwrap();
-                    postcard::to_io(&hashes, &mut stdout).unwrap();
-                    postcard::to_io(&path_lens, &mut stdout).unwrap();
+                    stdout.write_all(&file_range_bytes).unwrap();
+                    stdout.write_all(&contig_name_bytes).unwrap();
+                    stdout.write_all(&graph_bytes).unwrap();
+                    stdout.write_all(&hash_bytes).unwrap();
+                    stdout.write_all(&path_len_bytes).unwrap();
+                    stdout.write_all(&choice_bytes).unwrap();
                 }
 
                 // ntcomp::graph::encode_to(

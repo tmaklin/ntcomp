@@ -48,8 +48,10 @@ pub struct FileHeader {
 
     pub graph_bytes: u64,
 
-    pub max_visits: u32,
+    pub choice_bytes: u64,
 }
+
+pub const FILE_HEADER_BYTES: usize = 46;
 
 #[derive(Encode, Decode)]
 pub struct BlockHeader {
@@ -81,14 +83,14 @@ pub fn encode_file_header(
         graph_bytes: 0_u64,
         hash_bytes: 0_u32,
         file_range_bytes: 0_u32,
-        max_visits: 0_u32,
+        choice_bytes: 0_u64,
     };
     let nbytes = encode_into_std_write(
         &header_placeholder,
         &mut bytes,
         bincode::config::standard().with_fixed_int_encoding(),
     )?;
-    assert_eq!(nbytes, 32);
+    assert_eq!(nbytes, FILE_HEADER_BYTES);
     Ok(bytes)
 }
 

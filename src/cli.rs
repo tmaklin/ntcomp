@@ -89,14 +89,22 @@ pub enum Commands {
         #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
         index_prefix: Option<String>,
 
-        #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]
-        decompress: bool,
-
         #[arg(long = "fasta", default_value_t = false, help = ".fasta output")]
         fasta: bool,
 
         #[arg(long = "fasta-cols", default_value_t = 80, help = ".fasta columns")]
         fasta_columns: usize,
+
+        // Decompression
+        // // Toggle decompression
+        #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]
+        decompress: bool,
+        // // Retrieve specific contig(s) when decompressing
+        #[arg(long = "color", help_heading = "Decompression", help = "Decode by contig index(es) (0-based).")]
+        colors: Vec<u32>,
+
+        #[arg(long = "contig", help_heading = "Decompression", help = "Decode by contig name(s).")]
+        contigs: Vec<String>,
     },
 
     // Decode data written with Encode
