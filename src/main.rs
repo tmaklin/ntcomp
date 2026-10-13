@@ -102,13 +102,6 @@ fn read_input_list(
     }).collect::<Vec<(String, PathBuf)>>()
 }
 
-/// Helper for deserializing postcard data
-fn read_section<T: serde::de::DeserializeOwned, R: Read>(input: &mut R, n_bytes: u64) -> T {
-    let mut bytes = vec![0_u8; n_bytes as usize];
-    input.read_exact(&mut bytes).unwrap();
-    postcard::from_bytes(&bytes).unwrap()
-}
-
 fn main() {
     let cli = cli::Cli::parse();
 
@@ -276,18 +269,16 @@ fn main() {
                 assert!(query_files.len() == 1);
                 let mut input = std::io::BufReader::new(File::open(&query_files[0]).unwrap());
 
-                let header = {
-                    let mut header_bytes = [0_u8; ntcomp::FILE_HEADER_BYTES];
-                    input.read_exact(&mut header_bytes).unwrap();
-                    ntcomp::decode_file_header(&header_bytes).unwrap()
-                };
+                let mut decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
 
-                let file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = read_section(&mut input, header.file_range_bytes as u64);
-                let contig_names: Vec<Vec<u8>> = read_section(&mut input, header.contig_name_bytes);
-                let graph: ntcomp::graph::StoredGraph = read_section(&mut input, header.graph_bytes);
-                let hashes: Vec<Hash> = read_section(&mut input, header.hash_bytes as u64);
-                let path_lens: Vec<u32> = read_section(&mut input, header.path_len_bytes as u64);
-                let choices: ntcomp::graph::Choices = read_section(&mut input, header.choice_bytes);
+                let header = decoder.header();
+
+                let (graph, choices) = decoder.decode_from_read().unwrap();
+
+                let file_ranges = decoder.file_ranges;
+                let contig_names = decoder.contig_names;
+                let hashes = decoder.hashes;
+                let path_lens = decoder.path_lens;
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
@@ -403,48 +394,14 @@ fn main() {
 
                 let (graph, choices) = builder.finish();
 
-                // TODO move this part to an encoding function
-                {
-                    let file_range_bytes = postcard::to_allocvec(&file_ranges).unwrap();
-                    let contig_name_bytes = postcard::to_allocvec(&contig_names).unwrap();
-                    let graph_bytes = postcard::to_allocvec(&graph).unwrap();
-                    let hash_bytes = postcard::to_allocvec(&hashes).unwrap();
-                    let path_len_bytes = postcard::to_allocvec(&path_lens).unwrap();
-                    let choice_bytes = postcard::to_allocvec(&choices).unwrap();
+                let mut encoder = ntcomp::graph::encoder::GraphEncoder::new(graph, choices)
+                    .with_hashes(hashes)
+                    .with_contig_names(contig_names)
+                    .with_file_ranges(file_ranges)
+                    .with_path_lens(path_lens);
 
-                    info!("Graph: {}, {} bytes", graph.summary(), graph_bytes.len());
-                    info!("Choices: {} choices, {} bytes", choices.n_choices(), choice_bytes.len());
-
-                    let header = ntcomp::FileHeader{
-                        nlz_header: [0_u8; 6],
-                        path_len_bytes: path_len_bytes.len().try_into().unwrap(),
-                        n_queries: color,
-                        contig_name_bytes: contig_name_bytes.len() as u64,
-                        graph_bytes: graph_bytes.len() as u64,
-                        hash_bytes: hash_bytes.len().try_into().unwrap(),
-                        file_range_bytes: file_range_bytes.len().try_into().unwrap(),
-                        choice_bytes: choice_bytes.len() as u64,
-                    };
-                    let nbytes = bincode::encode_into_std_write(
-                        &header,
-                        &mut stdout,
-                        bincode::config::standard().with_fixed_int_encoding(),
-                    ).unwrap();
-                    assert_eq!(nbytes, ntcomp::FILE_HEADER_BYTES);
-
-                    stdout.write_all(&file_range_bytes).unwrap();
-                    stdout.write_all(&contig_name_bytes).unwrap();
-                    stdout.write_all(&graph_bytes).unwrap();
-                    stdout.write_all(&hash_bytes).unwrap();
-                    stdout.write_all(&path_len_bytes).unwrap();
-                    stdout.write_all(&choice_bytes).unwrap();
-                }
-
-                // ntcomp::graph::encode_to(
-                //     &graph,
-                //     &colex_remapping,
-                //     &mut stdout,
-                // ).unwrap();
+                info!("{}", encoder.summary().unwrap());
+                encoder.encode_to_write(&mut stdout).unwrap();
             }
 
             let _ = stdout.flush();
