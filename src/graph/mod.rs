@@ -26,10 +26,14 @@
 //! The edge set alone does not determine the path a colour takes through the
 //! graph, so the encoder also stores a *choice stream*: whenever a colour
 //! leaves a node that has more than one outgoing edge, the rank of the taken
-//! edge among all of them is recorded, see [choices]. Decoding a colour is a
-//! single linear walk from the source to the sink, and every colour has its
-//! own stream so contigs can be decoded independently. The colours using each
-//! edge can be recovered by walking every colour, see [Csr::colorsets].
+//! edge among all of them is recorded. The edges of every node are ordered by
+//! how many times the colours take them, so the most common choice has rank 0
+//! and the ranks can be compressed, see [choices].
+//!
+//! Decoding a colour is a single linear walk from the source to the sink, and
+//! every colour has its own stream so contigs can be decoded independently. The
+//! colours using each edge can be recovered by walking every colour, see
+//! [Csr::colorsets].
 //!
 //! ## Collapsed chains
 //!
@@ -342,9 +346,22 @@ impl GraphBuilder {
         let n_nodes = self.nodes.len();
         let n_edges = self.edges.len();
 
-        // Canonical edge order: by source, then target, then suffix length.
+        // Number of times the colours take each edge.
+        let mut uses = vec![0_u32; n_edges];
+        for path in &self.paths {
+            for &id in path {
+                uses[id] += 1;
+            }
+        }
+
+        // Edge order: by source, then the most used edges first, then target
+        // and suffix length. The choice streams store ranks in this order, and
+        // rank 0 being the most common choice makes them compress well.
         let mut order: Vec<usize> = (0..n_edges).collect();
-        order.sort_unstable_by_key(|&id| *self.edges.get_index(id).unwrap());
+        order.sort_unstable_by_key(|&id| {
+            let &(source, target, weight) = self.edges.get_index(id).unwrap();
+            (source, std::cmp::Reverse(uses[id]), target, weight)
+        });
 
         let mut csr_pos = vec![0_u32; n_edges];
         let mut row_ptrs = vec![0_u32; n_nodes + 1];

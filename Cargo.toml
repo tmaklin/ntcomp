@@ -36,6 +36,7 @@ indexmap = "2.14"
 blake3 = {version = "1.8", features = ["serde"] }
 petgraph = { version = "0.8", features = ["serde-1"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder", "optimization"] }
 serde = "1"
 stacker = "0.1"
 
