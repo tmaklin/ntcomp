@@ -63,6 +63,7 @@ pub mod collapsed;
 pub mod decoder;
 pub mod encoder;
 pub mod huffman;
+pub mod lzma_wrapper;
 
 pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};

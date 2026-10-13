@@ -21,6 +21,7 @@ use crate::{
     decode_file_header,
 };
 use super::choices::Choices;
+use super::lzma_wrapper::{self, LzmaData};
 use super::StoredGraph;
 
 use core::ops::Range;
@@ -28,55 +29,89 @@ use core::ops::Range;
 use std::io::Read;
 
 use blake3::Hash;
-use lzma_rust2::LzmaReader;
 
 type E = Box<dyn std::error::Error>;
 
+#[derive(Debug)]
+pub struct ArchiveError(pub String);
 
-/// Helper for deserializing postcard data
+impl std::fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid archive: {}", self.0)
+    }
+}
+
+impl std::error::Error for ArchiveError {}
+
+/// Reads `n_bytes` from `input`.
+fn read_bytes<R: Read>(
+    input: &mut R,
+    n_bytes: u64,
+) -> Result<Vec<u8>, E> {
+    let mut bytes = vec![0_u8; n_bytes.try_into()?];
+    input.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Deserializes a section of `n_bytes` bytes, None if the section is empty (absent).
 fn read_section<T: serde::de::DeserializeOwned, R: Read>(
     input: &mut R,
     n_bytes: u64,
-) -> Result<T, E> {
-    let mut bytes = vec![0_u8; n_bytes as usize];
-    input.read_exact(&mut bytes)?;
-    let ret = postcard::from_bytes(&bytes)?;
-    Ok(ret)
+) -> Result<Option<T>, E> {
+    if n_bytes == 0 {
+        return Ok(None)
+    }
+    Ok(Some(postcard::from_bytes(&read_bytes(input, n_bytes)?)?))
 }
+
+/// Deserializes a section that must be present.
+fn read_required_section<T: serde::de::DeserializeOwned, R: Read>(
+    input: &mut R,
+    n_bytes: u64,
+    name: &str,
+) -> Result<T, E> {
+    read_section(input, n_bytes)?.ok_or_else(|| Box::new(ArchiveError(format!("the {} section is missing", name))) as E)
+}
+
+/// Contig names, LZMA compressed; None if the section is empty (absent).
+fn read_contig_names<R: Read>(
+    input: &mut R,
+    n_bytes: u64,
+) -> Result<Option<Vec<Vec<u8>>>, E> {
+    let Some(lzma) = read_section::<LzmaData, R>(input, n_bytes)? else {
+        return Ok(None)
+    };
+    Ok(Some(postcard::from_bytes(&lzma_wrapper::decompress(&lzma)?)?))
+}
+
+/// Sections of an archive, in the order returned by [GraphDecoder::decode_from_read].
+pub type DecodedSections = (
+    StoredGraph,
+    Choices,
+    Option<Vec<Hash>>,
+    Option<Vec<Vec<u8>>>,
+    Option<Vec<(Vec<u8>, Range<u32>)>>,
+    Option<Vec<u32>>,
+);
 
 /// Decodes the output from [GraphEncoder](super::encoder::GraphEncoder).
 pub struct GraphDecoder<'a, R: Read> {
     reader: &'a mut R,
     file_header: FileHeader,
-
-    /// Hashes
-    pub hashes: Vec<Hash>,
-
-    /// Contig names
-    pub contig_names: Vec<Vec<u8>>,
-
-    /// File ranges
-    pub file_ranges: Vec<(Vec<u8>, Range<u32>)>,
-
-    /// Path lens
-    pub path_lens: Vec<u32>,
 }
 
 impl<'a, R: Read> GraphDecoder<'a, R> {
+    /// Reads the file header from `reader`.
     pub fn new(
         reader: &'a mut R,
     ) -> Result<Self, E> {
         let mut header_bytes = [0_u8; FILE_HEADER_BYTES];
-        reader.read_exact(&mut header_bytes).unwrap();
+        reader.read_exact(&mut header_bytes)?;
         let file_header = decode_file_header(&header_bytes)?;
 
         Ok(GraphDecoder {
             reader,
             file_header,
-            hashes: Vec::new(),
-            contig_names: Vec::new(),
-            file_ranges: Vec::new(),
-            path_lens: Vec::new(),
         })
     }
 
@@ -86,38 +121,20 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         self.file_header.clone()
     }
 
+    /// Reads and decodes every section, see [DecodedSections].
     pub fn decode_from_read(
-        &mut self,
-    ) -> Result<(StoredGraph, Choices), E> {
-        self.file_ranges = read_section(&mut self.reader, self.file_header.file_range_bytes as u64)?;
-        let mut lzma_bytes: Vec<u8> = vec![0; self.file_header.contig_name_bytes as usize];
-        self.reader.read_exact(&mut lzma_bytes)?;
-        self.contig_names = self.decode_contig_names(&lzma_bytes)?;
-        let graph: StoredGraph = read_section(&mut self.reader, self.file_header.graph_bytes)?;
-        self.hashes = read_section(&mut self.reader, self.file_header.hash_bytes as u64)?;
-        self.path_lens = read_section(&mut self.reader, self.file_header.path_len_bytes as u64)?;
-        let choices: Choices = read_section(&mut self.reader, self.file_header.choice_bytes)?;
+        self,
+    ) -> Result<DecodedSections, E> {
+        let header = self.file_header;
+        let reader = self.reader;
 
-        Ok((graph, choices))
-    }
+        let file_ranges = read_section(reader, header.file_range_bytes as u64)?;
+        let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
+        let graph: StoredGraph = read_required_section(reader, header.graph_bytes, "graph")?;
+        let hashes = read_section(reader, header.hash_bytes as u64)?;
+        let path_lens = read_section(reader, header.path_len_bytes as u64)?;
+        let choices: Choices = read_required_section(reader, header.choice_bytes, "choice")?;
 
-    fn decode_contig_names(
-        &mut self,
-        compressed: &[u8],
-    ) -> Result<Vec<Vec<u8>>, E> {
-        let mut reader =  LzmaReader::new_mem_limit(compressed, u32::MAX, None).unwrap();
-        let mut buf = [0; 1024];
-        let mut out = Vec::new();
-        loop {
-            let n = reader.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-
-        let n_bytes = out.len();
-        let contig_names: Vec<Vec<u8>> = read_section(&mut std::io::Cursor::new(out), n_bytes as u64)?;
-        Ok(contig_names)
+        Ok((graph, choices, hashes, contig_names, file_ranges, path_lens))
     }
 }

@@ -269,21 +269,18 @@ fn main() {
                 assert!(query_files.len() == 1);
                 let mut input = std::io::BufReader::new(File::open(&query_files[0]).unwrap());
 
-                let mut decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
-
+                let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
                 let header = decoder.header();
-
-                let (graph, choices) = decoder.decode_from_read().unwrap();
-
-                let file_ranges = decoder.file_ranges;
-                let contig_names = decoder.contig_names;
-                let hashes = decoder.hashes;
-                let path_lens = decoder.path_lens;
+                let (graph, choices, hashes, contig_names, file_ranges, path_lens) = decoder.decode_from_read().unwrap();
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
+                if !contigs.is_empty() && contig_names.is_none() {
+                    eprintln!("ntcomp: archive {} has no contig names", query_files[0].to_string_lossy());
+                    std::process::exit(1);
+                }
                 for name in contigs {
-                    let matches: Vec<u32> = contig_names.iter().enumerate()
+                    let matches: Vec<u32> = contig_names.iter().flatten().enumerate()
                         .filter(|(_, x)| x.as_slice() == name.as_bytes() || x.split(|c| *c == b' ').next() == Some(name.as_bytes()))
                         .map(|(i, _)| i as u32)
                         .collect();
@@ -306,13 +303,14 @@ fn main() {
                 }
                 for color in want_colors {
                     let idx = color as usize;
-                    let file_idx = file_ranges.iter().position(|(_, range)| range.contains(&color)).unwrap();
                     let start_time = std::time::Instant::now();
 
+                    // Without stored path lengths the walk is not bounded.
+                    let max_steps = path_lens.as_ref().map_or(usize::MAX, |lens| lens[idx] as usize);
                     let (sequence_length, dictionary) = graph.walk_path(
                         &choices,
                         color,
-                        path_lens[idx] as usize,
+                        max_steps,
                     ).unwrap();
 
                     // Transform from Vec<(u32, u32)> to Vec<(u32, SuffixLen)>
@@ -333,16 +331,20 @@ fn main() {
 
                     let sequence = ntcomp::graph::decode_path(dictionary, sequence_length as usize, &sbwt).unwrap();
 
-                    let hash_match = hash(&sequence) == hashes[idx];
-                    assert!(hash_match, "hash mismatch for color {color}");
+                    // Not checked if the archive has no hashes.
+                    let hash_match = hashes.as_ref().map(|hashes| hash(&sequence) == hashes[idx]);
+                    assert!(hash_match != Some(false), "hash mismatch for color {color}");
 
+                    let contig_name: Vec<u8> = contig_names.as_ref().map_or_else(|| format!("color_{}", color).into_bytes(), |names| names[idx].clone());
                     if !fasta {
-                        let file_name = String::from_utf8(file_ranges[file_idx].0.to_vec()).unwrap_or(file_idx.to_string());
-                        let contig_name = String::from_utf8(contig_names[idx].to_vec()).unwrap_or(color.to_string());
-                        eprintln!("{}\t{}\t{}\t{}\t{}\t{:.3}", color, file_name, contig_name, sequence.len(), hash_match, start_time.elapsed().as_secs_f64());
+                        let file_name = file_ranges.as_ref()
+                            .and_then(|ranges| ranges.iter().position(|(_, range)| range.contains(&color)).map(|i| String::from_utf8_lossy(&ranges[i].0).to_string()))
+                            .unwrap_or("NA".to_string());
+                        let hash_match = hash_match.map_or("NA".to_string(), |x| x.to_string());
+                        eprintln!("{}\t{}\t{}\t{}\t{}\t{:.3}", color, file_name, String::from_utf8_lossy(&contig_name), sequence.len(), hash_match, start_time.elapsed().as_secs_f64());
                     } else {
                         stdout.write_all(b">").unwrap();
-                        stdout.write_all(&contig_names[idx]).unwrap();
+                        stdout.write_all(&contig_name).unwrap();
                         stdout.write_all(b"\n").unwrap();
                         sequence.chunks(*fasta_columns).for_each(|chunk| {
                             stdout.write_all(chunk).unwrap();
@@ -394,14 +396,14 @@ fn main() {
 
                 let (graph, choices) = builder.finish();
 
-                let mut encoder = ntcomp::graph::encoder::GraphEncoder::new(graph, choices)
+                let encoder = ntcomp::graph::encoder::GraphEncoder::new(graph, choices)
                     .with_hashes(hashes)
                     .with_contig_names(contig_names)
                     .with_file_ranges(file_ranges)
                     .with_path_lens(path_lens);
 
-                info!("{}", encoder.summary().unwrap());
-                encoder.encode_to_write(&mut stdout).unwrap();
+                let sizes = encoder.encode_to_write(&mut stdout).unwrap();
+                info!("{}", sizes);
             }
 
             let _ = stdout.flush();

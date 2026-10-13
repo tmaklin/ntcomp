@@ -18,13 +18,13 @@ use crate::FileHeader;
 use crate::FILE_HEADER_BYTES;
 use super::StoredGraph;
 use super::choices::Choices;
+use super::lzma_wrapper;
 
 use core::ops::Range;
 
 use std::io::Write;
 
 use blake3::Hash;
-use lzma_rust2::{LzmaOptions, LzmaWriter};
 use postcard::to_allocvec;
 
 type E = Box<dyn std::error::Error>;
@@ -49,6 +49,18 @@ pub struct GraphEncoder {
     /// Path lens
     path_lens: Option<Vec<u32>>,
 
+}
+
+/// Serializes an optional section, 0 bytes if absent.
+///
+/// This is temporary and will be changed.
+fn optional_section<T: serde::Serialize>(
+    section: &Option<T>,
+) -> Result<Vec<u8>, E> {
+    match section {
+        Some(value) => Ok(to_allocvec(value)?),
+        None => Ok(Vec::new()),
+    }
 }
 
 impl GraphEncoder {
@@ -102,102 +114,30 @@ impl GraphEncoder {
         self
     }
 
-    pub fn summary(
-        &self,
-    ) -> Result<String, E> {
-        let graph_bytes = to_allocvec(&self.graph)?;
-        let mut ret = format!("Graph: {}, {} bytes", self.graph.summary(), graph_bytes.len());
-        let choice_bytes = to_allocvec(&self.choices)?;
-        ret += &format!("Choices: {} choices, {} bytes", self.choices.n_choices(), choice_bytes.len());
-        Ok(ret)
-    }
-
-    fn encode_file_ranges(
-        &mut self,
-    ) -> Option<Result<Vec<u8>, E>> {
-        let file_ranges = std::mem::take(self.file_ranges.as_mut()?);
-        self.file_ranges = None;
-        match to_allocvec(&file_ranges) {
-            Ok(bytes) => Some(Ok(bytes)),
-            Err(e) => Some(Err(Box::new(e))),
-        }
-    }
-
+    /// Contig names are compressed with LZMA.
     fn encode_contig_names(
-        &mut self,
-    ) -> Option<Result<Vec<u8>, E>> {
-        let contig_names = std::mem::take(self.contig_names.as_mut()?);
-        self.contig_names = None;
-        match to_allocvec(&contig_names) {
-            Ok(bytes) => {
-                let mut options = LzmaOptions::with_preset(9);
-                options.lc = 0;
-                options.lp = 0;
-                options.pb = 0;
-                options.dict_size = options.dict_size.min((bytes.len() as u32).max(4096));
-
-                let mut writer = LzmaWriter::new_use_header(Vec::new(), &options, None).expect("creating LZMA writer failed");
-                writer.write_all(&bytes).expect("LZMA compression failed");
-                let lzma = writer.finish().expect("LZMA compression failed");
-
-                Some(Ok(lzma))
-            },
-            Err(e) => Some(Err(Box::new(e))),
+        &self,
+    ) -> Result<Vec<u8>, E> {
+        match &self.contig_names {
+            Some(contig_names) => Ok(to_allocvec(&lzma_wrapper::compress(&to_allocvec(contig_names)?)?)?),
+            None => Ok(Vec::new()),
         }
     }
 
-    fn encode_hashes(
-        &mut self,
-    ) -> Option<Result<Vec<u8>, E>> {
-        let hashes = std::mem::take(self.hashes.as_mut()?);
-        self.hashes = None;
-        match to_allocvec(&hashes) {
-            Ok(bytes) => Some(Ok(bytes)),
-            Err(e) => Some(Err(Box::new(e))),
-        }
-    }
-
-    fn encode_path_lens(
-        &mut self,
-    ) -> Option<Result<Vec<u8>, E>> {
-        let path_lens = std::mem::take(self.path_lens.as_mut()?);
-        self.path_lens = None;
-        match to_allocvec(&path_lens) {
-            Ok(bytes) => Some(Ok(bytes)),
-            Err(e) => Some(Err(Box::new(e))),
-        }
-    }
-
+    /// Writes the archive to `writer`.
+    ///
+    /// Returns a description of the graph and the size of every section for
+    /// logging (subject to change).
     pub fn encode_to_write<W: Write>(
-        &mut self,
+        self,
         writer: &mut W,
-    ) -> Result<(), E> {
-        let n_colors: u32 = self.path_lens.as_ref().unwrap().len().try_into()?;
+    ) -> Result<String, E> {
+        let n_colors: u32 = self.choices.streams.len().try_into()?;
 
-        let file_range_bytes = if let Some(bytes) = self.encode_file_ranges() {
-            bytes?
-        } else {
-            Vec::new()
-        };
-
-        let contig_name_bytes = if let Some(bytes) = self.encode_contig_names() {
-            bytes?
-        } else {
-            Vec::new()
-        };
-
-        let hash_bytes = if let Some(bytes) = self.encode_hashes() {
-            bytes?
-        } else {
-            Vec::new()
-        };
-
-        let path_len_bytes = if let Some(bytes) = self.encode_path_lens() {
-            bytes?
-        } else {
-            Vec::new()
-        };
-
+        let file_range_bytes = optional_section(&self.file_ranges)?;
+        let contig_name_bytes = self.encode_contig_names()?;
+        let hash_bytes = optional_section(&self.hashes)?;
+        let path_len_bytes = optional_section(&self.path_lens)?;
         let graph_bytes = to_allocvec(&self.graph)?;
         let choice_bytes = to_allocvec(&self.choices)?;
 
@@ -226,6 +166,12 @@ impl GraphEncoder {
         writer.write_all(&path_len_bytes)?;
         writer.write_all(&choice_bytes)?;
 
-        Ok(())
+        let total = FILE_HEADER_BYTES + file_range_bytes.len() + contig_name_bytes.len() + graph_bytes.len()
+            + hash_bytes.len() + path_len_bytes.len() + choice_bytes.len();
+        Ok(format!(
+            "Graph: {}, {} bytes; choices: {} choices, {} bytes; contig names {} bytes, hashes {} bytes, path lengths {} bytes, file ranges {} bytes; total {} bytes",
+            self.graph.summary(), graph_bytes.len(), self.choices.n_choices(), choice_bytes.len(),
+            contig_name_bytes.len(), hash_bytes.len(), path_len_bytes.len(), file_range_bytes.len(), total,
+        ))
     }
 }
