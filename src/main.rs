@@ -11,6 +11,8 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
+use ntcomp::graph::Walkable;
+
 use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -321,8 +323,24 @@ fn main() {
                         color,
                         path_lens[idx] as usize,
                     ).unwrap();
-                    let sequence = ntcomp::graph::decode_path(dictionary, &sbwt);
-                    assert_eq!(sequence.len(), sequence_length as usize);
+
+                    // Transform from Vec<(u32, u32)> to Vec<(u32, SuffixLen)>
+                    //
+                    // TODO Should return the correct value directly from walking the graph.
+                    // This requires the graph knowing the value of k, or passing it in to walk_path.
+                    //
+                    let dictionary = dictionary.into_iter().map(|(colex_rank, len)| {
+                        let suffix_len = if len > sbwt.k() as u32 {
+                            ntcomp::graph::SuffixLen::Explicit { suffix_len: len }
+                        } else if len == 0 {
+                            ntcomp::graph::SuffixLen::Implicit
+                        } else {
+                            ntcomp::graph::SuffixLen::Plain { suffix_len: len }
+                        };
+                        (colex_rank, suffix_len)
+                    }).collect::<Vec<(u32, ntcomp::graph::SuffixLen)>>();
+
+                    let sequence = ntcomp::graph::decode_path(dictionary, sequence_length as usize, &sbwt).unwrap();
 
                     let hash_match = hash(&sequence) == hashes[idx];
                     assert!(hash_match, "hash mismatch for color {color}");
@@ -367,11 +385,11 @@ fn main() {
                         let seqrec = rec.normalize(true);
                         hashes.push(hash(&seqrec));
 
-                        let dictionary = ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap();
+                        let (dictionary, implicit) = ntcomp::encode_sequence_flagged(&seqrec, &sbwt, &lcs).unwrap();
                         path_lens.push(dictionary.len() as u32 + 2);
                         info!("Encoded color {} with {} nodes", color, dictionary.len());
 
-                        let added = builder.add_path(seqrec.len(), &dictionary);
+                        let added = builder.add_path_with_flags(seqrec.len(), &dictionary, &implicit);
                         assert_eq!(added, color);
                         color += 1;
                     }

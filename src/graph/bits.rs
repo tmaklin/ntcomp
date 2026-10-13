@@ -43,7 +43,7 @@ impl BitWriter {
         n_bits: u32,
     ) {
         for i in (0..n_bits).rev() {
-            if self.n_bits % 8 == 0 {
+            if self.n_bits.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             if (value >> i) & 1 == 1 {

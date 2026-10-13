@@ -15,25 +15,28 @@
 //!
 //! ## Graph structure
 //!
-//! Node weights are colexicographic ranks of _k_-mers in the SBWT; node 0 is a
+//! Node weights are colexicographic ranks of _k_-mers in the SBWT. Node 0 is a
 //! dummy source and node 1 a dummy sink. An edge `(u, v, s)` means "the
 //! dictionary entry for `u` has suffix length `s` and is followed by `v`".
-//! Edges are deduplicated across colours (contigs) and carry the set of colours
-//! that use them.
+//! Edges are deduplicated across colours (contigs). Colours used by the edges
+//! are not stored but can be retrieved by walking the paths.
 //!
 //! ## Decoding the graph
 //!
-//! The edge set alone does not determine the order in which a colour walks
-//! the graph, so the encoder also stores a *choice stream*: whenever a colour
-//! leaves a node that has more than one outgoing edge carrying that colour,
-//! the rank of the taken edge among those edges is recorded. Decoding a
-//! colour is a single linear walk from the source to the sink, and every
-//! colour has its own stream so contigs can be decoded independently.
+//! The edge set alone does not determine the path a colour takes through the
+//! graph, so the encoder also stores a *choice stream*: whenever a colour
+//! leaves a node that has more than one outgoing edge, the rank of the taken
+//! edge among all of them is recorded, see [choices]. Decoding a colour is a
+//! single linear walk from the source to the sink, and every colour has its
+//! own stream so contigs can be decoded independently. The colours using each
+//! edge can be recovered by walking every colour, see [Csr::colorsets].
 //!
 //! ## Collapsed chains
 //!
 //! Optionally, linear chains of nodes are stored as single edges between
-//! junctions, see [collapsed].
+//! junctions, see [collapsed]. Linear chains are paths on the graph composed
+//! entirely of inner nodes, meaning nodes that have exactly one incoming and
+//! exactly one outgoing edge. All other nodes are junction nodes.
 //!
 use core::ops::Range;
 
@@ -53,6 +56,7 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 pub mod bits;
 pub mod choices;
 pub mod collapsed;
+pub mod huffman;
 
 pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};
@@ -69,35 +73,100 @@ const SOURCE_COLEX: u32 = u32::MAX - 1;
 /// Colex rank stored in the dummy sink node. Real colex ranks must be smaller.
 const SINK_COLEX: u32 = u32::MAX;
 
+/// [Implicit](SuffixLen::Implicit) suffix lengths are stored as a 0; a real suffix length can never be 0.
+const IMPLICIT_SUFFIX_LEN: u32 = 0;
+
+/// Walkable graph that implements random access to any colour (contig) stored inside.
+pub trait Walkable {
+    /// Walk the path of `color` from the source to the sink.
+    fn walk_path(
+        &self,
+        choices: &Choices,
+        color: u32,
+        max_steps: usize,
+    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError>;
+}
+
+/// Suffix length and type for an edge
+///
+/// Classifies the suffix length for a dictionary entry by specifying whether
+/// its implicit (for a left extended _k_-mer but can be inferred), explicit
+/// (left extended and needs to be declared), or plain (subsequence of a plan
+/// _k_-mer). Stores the value for explicit and plain types.
+///
+pub enum SuffixLen {
+    /// The dictionary entry is a left extended _k_-mer whose extension stopped
+    /// where [crate::left_extend_kmer2] stops, so [decode_path] recovers the
+    /// length by extending the _k_-mer as far as possible.
+    Implicit,
+
+    /// Entry is a left extended _k_-mer, whose extension stops after an
+    /// explicit number of extensions, so [decode_path] needs to know the
+    /// length.
+    Explicit { suffix_len: u32 },
+
+    /// Entry is a plain _k_-mer whose suffix length is less or equal to the
+    /// value of k.
+    Plain { suffix_len: u32 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct ColexGraphEdge {
     pub weight: u32,
     pub colors: Vec<u32>,
 }
 
+/// Decodes the nucleotide sequence of length `sequence_length` from its NLZ
+/// dictionary (colex rank, suffix length), as returned by [walk_path].
+///
+/// The dictionary is processed in its own order, from the end of the sequence
+/// to the start, so that the end position of every entry is known.
+/// [Implicit](SuffixLen::Implicit) suffix lengths are recovered by extending
+/// the k-mer as far as the encoder could have extended it at that position and
+/// explicit and plain by taking the suffix length stored inside [SuffixLen].
+///
+/// Fails if the dictionary does not cover exactly `sequence_length` bases.
 pub fn decode_path(
-    path: Vec<(u32, u32)>,
+    path: Vec<(u32, SuffixLen)>,
+    sequence_length: usize,
     sbwt: &SbwtIndexVariant,
-) -> Vec<u8> {
-    let mut sequence: Vec<u8> = Vec::new();
+) -> Result<Vec<u8>, GraphDecodeError> {
+    let mut sequence: Vec<u8> = vec![0; sequence_length];
+    let mut end = sequence_length;
     match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
             let k = sbwt.k();
-            path.into_iter().rev().for_each(|(colex_rank, suffix_len)| {
-                let kmer = if suffix_len > k as u32 {
-                    let kmer = sbwt.access_kmer(colex_rank as usize);
-                    let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, (suffix_len - k as u32) as usize);
-                    assert_eq!(new_kmer.len(), suffix_len as usize);
-                    new_kmer
-                } else {
-                    sbwt.access_kmer(colex_rank as usize)
+            for (colex_rank, suffix_len) in path {
+                let kmer = sbwt.access_kmer(colex_rank as usize);
+                let (kmer, len) = match suffix_len {
+                    SuffixLen::Implicit => {
+                        // The encoder extends at most end - k - 1 characters.
+                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, end.saturating_sub(k + 1));
+                        let len = new_kmer.len();
+                        (new_kmer, len)
+                    },
+                    SuffixLen::Explicit { suffix_len: len } => {
+                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, (len - k as u32) as usize);
+                        assert_eq!(new_kmer.len(), len as usize);
+                        (new_kmer, len as usize)
+                    },
+                    SuffixLen::Plain { suffix_len: len } => {
+                        (kmer, len as usize)
+                    },
                 };
-                sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter());
-            });
+                if len > end {
+                    return Err(GraphDecodeError(format!("dictionary covers more than {} bases", sequence_length)))
+                }
+                sequence[(end - len)..end].copy_from_slice(&kmer[(kmer.len() - len)..]);
+                end -= len;
+            }
         },
     };
+    if end != 0 {
+        return Err(GraphDecodeError(format!("dictionary covers {} of {} bases", sequence_length - end, sequence_length)))
+    }
 
-    sequence
+    Ok(sequence)
 }
 
 /// Builds the graph and remembers the path each colour takes.
@@ -108,6 +177,9 @@ pub struct GraphBuilder {
 
     /// (source node, target node, suffix length); edge id is the position in the set
     edges: IndexSet<(u32, u32, u32)>,
+
+    /// Per edge id: true if the suffix length is implicit, see [SuffixLen]
+    implicit: Vec<bool>,
 
     /// Per colour: edge ids (indexes into `edges`) in traversal order
     paths: Vec<Vec<usize>>,
@@ -131,6 +203,7 @@ impl GraphBuilder {
         GraphBuilder {
             nodes,
             edges: IndexSet::new(),
+            implicit: Vec::new(),
             paths: Vec::new(),
             collapse_chains: false,
         }
@@ -159,8 +232,16 @@ impl GraphBuilder {
         source: u32,
         target: u32,
         weight: u32,
+        implicit: bool,
     ) -> usize {
-        self.edges.insert_full((source, target, weight)).0
+        let (id, inserted) = self.edges.insert_full((source, target, weight));
+        if inserted {
+            self.implicit.push(false);
+        }
+        // Implicit if any colour saw the extension stop in the SBWT: the length
+        // then only depends on the _k_-mer, not on where the colour uses it.
+        self.implicit[id] |= implicit;
+        id
     }
 
     /// Adds the dictionary of the next colour.
@@ -172,18 +253,35 @@ impl GraphBuilder {
         sequence_length: usize,
         dictionary: &[(usize, Range<usize>)],
     ) -> u32 {
+        self.add_path_with_flags(sequence_length, dictionary, &vec![false; dictionary.len()])
+    }
+
+    /// Same as [GraphBuilder::add_path] but stores the suffix length of the
+    /// entries flagged in `implicit` as [SuffixLen::Implicit].
+    ///
+    /// `dictionary` and `implicit` are the output of [crate::encode_sequence_flagged].
+    pub fn add_path_with_flags(
+        &mut self,
+        sequence_length: usize,
+        dictionary: &[(usize, Range<usize>)],
+        implicit: &[bool],
+    ) -> u32 {
+        assert_eq!(dictionary.len(), implicit.len());
         let color: u32 = self.paths.len().try_into().unwrap();
         let mut path = Vec::with_capacity(dictionary.len() + 1);
 
         let mut prev = SOURCE_NODE;
         let mut prev_weight: u32 = sequence_length.try_into().expect("sequence length does not fit in u32");
-        for (suffix_len, colex) in dictionary {
+        let mut prev_implicit = false;
+        for ((suffix_len, colex), &is_implicit) in dictionary.iter().zip(implicit) {
             let node = self.insert_node(colex.start);
-            path.push(self.edge(prev, node, prev_weight));
+            path.push(self.edge(prev, node, prev_weight, prev_implicit));
             prev = node;
             prev_weight = (*suffix_len).try_into().unwrap();
+            assert!(prev_weight != 0, "empty dictionary entry");
+            prev_implicit = is_implicit;
         }
-        path.push(self.edge(prev, SINK_NODE, prev_weight));
+        path.push(self.edge(prev, SINK_NODE, prev_weight, prev_implicit));
 
         self.paths.push(path);
         color
@@ -258,7 +356,7 @@ impl GraphBuilder {
             csr_pos[id] = pos as u32;
             row_ptrs[source as usize + 1] += 1;
             column_indices.push(target);
-            suffix_lens.push(weight);
+            suffix_lens.push(if self.implicit[id] { IMPLICIT_SUFFIX_LEN } else { weight });
         }
         for i in 0..n_nodes {
             row_ptrs[i + 1] += row_ptrs[i];
@@ -301,19 +399,6 @@ pub enum StoredGraph {
 }
 
 impl StoredGraph {
-    /// Walks the path of `color` from the source to the sink, see [walk_path].
-    pub fn walk_path(
-        &self,
-        choices: &Choices,
-        color: u32,
-        max_steps: usize,
-    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
-        match self {
-            StoredGraph::Csr(csr) => walk_path(csr, choices, color, max_steps),
-            StoredGraph::Chains(chains) => chains.walk_path(choices, color, max_steps),
-        }
-    }
-
     /// Uncollapsed graph.
     pub fn into_csr(self) -> Csr<u32> {
         match self {
@@ -331,6 +416,21 @@ impl StoredGraph {
             StoredGraph::Chains(chains) => format!(
                 "{} junctions, {} chains, {} inner nodes, {} edges",
                 chains.junction_weights.len(), chains.n_chains(), chains.inner_weights.len(), chains.suffix_lens.len()),
+        }
+    }
+}
+
+impl Walkable for StoredGraph {
+    /// Walks the path of `color` from the source to the sink, see [walk_path].
+    fn walk_path(
+        &self,
+        choices: &Choices,
+        color: u32,
+        max_steps: usize,
+    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
+        match self {
+            StoredGraph::Csr(csr) => csr.walk_path(choices, color, max_steps),
+            StoredGraph::Chains(chains) => chains.walk_path(choices, color, max_steps),
         }
     }
 }
@@ -422,19 +522,54 @@ impl<N> Csr<N> {
 
         for source_idx in 0..self.node_weights.len() {
             let (start, end) = self.row(source_idx);
-            for pos in start..end {
+            for (pos, colorset) in colorsets.iter().enumerate().take(end).skip(start) {
                 graph.add_edge(
                     NodeIndex::new(source_idx),
                     NodeIndex::new(self.column_indices[pos] as usize),
                     ColexGraphEdge {
                         weight: self.suffix_lens[pos],
-                        colors: colorsets[pos].clone(),
+                        colors: colorset.clone(),
                     },
                 );
             }
         }
 
         graph
+    }
+}
+
+impl<N: Copy> Walkable for Csr<N> where u32: From<N> {
+    /// Walks the path of `color` from the source to the sink.
+    ///
+    /// Returns the sequence length stored on the source edge and the NLZ
+    /// dictionary as (colex rank, suffix length) pairs, in the order produced by
+    /// [crate::encode_sequence].
+    ///
+    /// The returned value can be passed to [decode_path] to recover the nucleotide
+    /// sequence.
+    ///
+    /// `max_steps` bounds the walk (the stored path length) so a corrupt input
+    /// cannot loop forever.
+    ///
+    fn walk_path(
+        &self,
+        choices: &Choices,
+        color: u32,
+        max_steps: usize,
+    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
+        let mut sequence_length = 0_u32;
+        let mut dictionary: Vec<(u32, u32)> = Vec::with_capacity(max_steps);
+
+        self.walk(choices, color, max_steps, |node, pos| {
+            if node == SOURCE_NODE as usize {
+                sequence_length = self.suffix_lens[pos];
+            } else {
+                let colex_rank: u32 = self.node_weights[node].into();
+                dictionary.push((colex_rank, self.suffix_lens[pos]));
+            }
+        })?;
+
+        Ok((sequence_length, dictionary))
     }
 }
 
@@ -448,38 +583,6 @@ impl std::fmt::Display for GraphDecodeError {
 }
 
 impl std::error::Error for GraphDecodeError {}
-
-/// Walks the path of `color` from the source to the sink.
-///
-/// Returns the sequence length stored on the source edge and the NLZ
-/// dictionary as (colex rank, suffix length) pairs, in the order produced by
-/// [crate::encode_sequence].
-///
-/// The returned value can be passed to [decode_path] to recover the nucleotide
-/// sequence.
-///
-/// `max_steps` bounds the walk (the stored path length) so a corrupt input
-/// cannot loop forever.
-///
-pub fn walk_path(
-    csr: &Csr<u32>,
-    choices: &Choices,
-    color: u32,
-    max_steps: usize,
-) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
-    let mut sequence_length = 0_u32;
-    let mut dictionary: Vec<(u32, u32)> = Vec::with_capacity(max_steps);
-
-    csr.walk(choices, color, max_steps, |node, pos| {
-        if node == SOURCE_NODE as usize {
-            sequence_length = csr.suffix_lens[pos];
-        } else {
-            dictionary.push((csr.node_weights[node], csr.suffix_lens[pos]));
-        }
-    })?;
-
-    Ok((sequence_length, dictionary))
-}
 
 /// With colex ranks stored in the node
 pub fn encode_to<W: Write>(

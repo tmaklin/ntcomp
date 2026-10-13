@@ -119,17 +119,25 @@ pub fn decode_block_header(
     Ok(decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding())?.0)
 }
 
+/// Left extends `kmer_start` while the extension is unique in the SBWT and
+/// matches `ref_nts`, by at most `max_extension_len` characters.
+///
+/// Returns the extended k-mer and whether the extension stopped because the
+/// SBWT has no unique left extension, i.e. where [left_extend_kmer2] stops as
+/// well. False if it stopped because of a mismatch with `ref_nts` or because
+/// `max_extension_len` was reached.
 pub fn left_extend_kmer(
     kmer_start: &[u8],
     ref_nts: &[u8],
     sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
     max_extension_len: usize,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     assert!(!kmer_start.is_empty());
     assert!(!ref_nts.is_empty());
 
     let mut left_extension_len = 0;
     let mut kmer = kmer_start.to_vec();
+    let mut stopped_in_sbwt = false;
     while left_extension_len < max_extension_len {
         let new_kmers: Vec<(Vec<u8>, Range<usize>)> = sbwt.alphabet().iter().filter_map(|c| {
             let new_kmer: Vec<u8> = [&[*c], &kmer[0..(kmer.len() - (left_extension_len + 1))]].concat();
@@ -141,18 +149,21 @@ pub fn left_extend_kmer(
             }
         }).collect();
         if !new_kmers.is_empty() {
+            let unique = new_kmers.len() == 1 && new_kmers[0].1.end - new_kmers[0].1.start == 1;
             let seq_matches = new_kmers[0].0[0] == ref_nts[ref_nts.len() - kmer.len() - 1];
-            if seq_matches && new_kmers.len() == 1 && new_kmers[0].1.end - new_kmers[0].1.start == 1 {
+            if seq_matches && unique {
                 kmer = [&[new_kmers[0].0[0]], kmer.as_slice()].concat();
             } else {
+                stopped_in_sbwt = !unique;
                 break;
             }
         } else {
+            stopped_in_sbwt = true;
             break;
         }
         left_extension_len += 1;
     }
-    kmer
+    (kmer, stopped_in_sbwt)
 }
 
 pub fn left_extend_kmer2(
@@ -193,7 +204,20 @@ pub fn encode_sequence(
     sbwt: &SbwtIndexVariant,
     lcs: &LcsArray,
 ) -> Result<Vec<(usize, Range<usize>)>, E> {
+    Ok(encode_sequence_flagged(nucleotides, sbwt, lcs)?.0)
+}
+
+/// Same as [encode_sequence], but also returns for every dictionary entry
+/// whether its suffix length is *implicit*: the entry is a left extended k-mer
+/// whose extension stopped where [left_extend_kmer2] stops as well, so the
+/// decoder can recover the length by extending the k-mer as far as possible.
+pub fn encode_sequence_flagged(
+    nucleotides: &[u8],
+    sbwt: &SbwtIndexVariant,
+    lcs: &LcsArray,
+) -> Result<(Vec<(usize, Range<usize>)>, Vec<bool>), E> {
     let n = nucleotides.len();
+    let mut implicit: Vec<bool> = Vec::new();
     let dictionary: Vec<(usize, Range<usize>)> = match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
             let k = sbwt.k();
@@ -211,15 +235,17 @@ pub fn encode_sequence(
                     assert_eq!(kmer, seq);
 
                     let ref_nts = &nucleotides[0..i];
-                    let new_kmer = left_extend_kmer(&kmer, ref_nts, sbwt, i - k - 1);
+                    let (new_kmer, stopped_in_sbwt) = left_extend_kmer(&kmer, ref_nts, sbwt, i - k - 1);
                     assert_eq!(new_kmer.as_slice(), &nucleotides[(i - new_kmer.len())..i]);
 
                     // Store the whole left extension; the next entry ends where it starts.
                     res[i - 1].0 = new_kmer.len();
                     kept.push(i - 1);
+                    implicit.push(stopped_in_sbwt);
                     i -= new_kmer.len() - 1;
                 } else {
                     kept.push(i - 1);
+                    implicit.push(false);
                     if i > res[i - 1].0 {
                         i -= res[i - 1].0 - 1;
                     } else {
@@ -242,8 +268,9 @@ pub fn encode_sequence(
 
     assert!(dictionary_max < 16777216); // Match lengths are coded as 24 bit unsigned integers
     assert_eq!(dictionary_bases, nucleotides.len());
+    assert_eq!(dictionary.len(), implicit.len());
 
-    Ok(dictionary)
+    Ok((dictionary, implicit))
 }
 
 pub fn write_block_to<W: std::io::Write>(

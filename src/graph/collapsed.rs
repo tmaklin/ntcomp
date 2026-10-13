@@ -13,19 +13,45 @@
 //
 //! NLZ-OG graph with linear chains collapsed into single edges.
 //!
-//! A node with exactly one incoming and one outgoing edge is an *inner* node;
-//! the dummy source and sink and every other node are *junctions*. Following
-//! edges from a junction through inner nodes always ends at a junction, so the
-//! graph can be stored as chains between junctions.
+//! ## Graph structure
 //!
-//! A chain stores the colex ranks of its inner nodes and the suffix lengths of
-//! its edges, and its colour set only once. An inner node passes every
-//! colour that enters it on to its only outgoing edge, so all edges in a chain
-//! have the same colours.
+//! Represents the graph as paths through inner nodes and junctions. An *inner
+//! node* is a node with exactly one incoming and one outgoing edge. Every other
+//! node including the dummy source and sink are *junction nodes*. Following
+//! edges from a junction through inner nodes always ends at a junction, so the
+//! graph can be stored as linear chains between junctions.
+//!
+//! Node weights for junction nodes are colex ranks. Node weights for the
+//! collapsed linear chains between junctions are concatenated in the edge
+//! weight.
+//!
+//! ## Colours
+//!
+//! All edges between inner nodes always have the same colour set, as changing the
+//! colour set requires introducing an incoming edge with a different colour
+//! set, which converts the node into a junction. Therefore, a chain stores the
+//! colex ranks of its inner nodes and the suffix lengths of its edges, and its
+//! colour set only once.
 //!
 //! Colours only have a choice at junctions, so the choice stream has the same
-//! number of entries as for the uncollapsed graph. The stored ranks refer to the
-//! order of the chains in the junction's row.
+//! number of entries as for the uncollapsed graph. The stored ranks refer to
+//! the order of the chains in the junction's row. This means that the edges
+//! between inner nodes do not need to store the colour sets if they are stored
+//! in the choice stream.
+//!
+//! ## Stored suffix lengths
+//!
+//! The suffix lengths on the edges out of the dummy source node are the total
+//! contig lengths and are stored as they are.
+//!
+//! Every other suffix length is a symbol of one canonical Huffman code, in
+//! chain order:
+//! - 0: the length is implicit, see [SuffixLen::Implicit](super::SuffixLen),
+//! - 1..=255: the length itself,
+//! - 256: a longer length, followed by the length - 255 (Elias gamma code).
+//!
+//! TODO Do not hardcode 255 as the maximum length -- this value should be taken
+//! from the SBWT as it is equal to the _k_-mer length used.
 //!
 use super::{
     Csr,
@@ -34,27 +60,52 @@ use super::{
     SINK_NODE,
     SOURCE_NODE,
     take_edge,
+    Walkable,
 };
 use super::bits::{BitReader, BitWriter};
+use super::huffman::HuffmanCode;
 
-/// Graph of chains between junctions, in compressed sparse row format.
+/// Longest suffix length that is its own Huffman symbol.
+///
+/// This is equal to the value of `k` from the SBWT that was used to generate
+/// the graph.
+///
+/// TODO Should be stored somewhere instead of being hardcoded here.
+///
+const MAX_DIRECT_SUFFIX_LEN: u32 = 255;
+/// Huffman symbol for longer suffix lengths, followed by the length in Elias gamma.
+///
+/// TODO Infer from MAX_DIRECT_SUFFIX_LEN once it's stored inside this graph.
+///
+const LONG_SUFFIX_SYMBOL: usize = MAX_DIRECT_SUFFIX_LEN as usize + 1;
+
+/// Graph of linear chains between junctions, in compressed sparse row format.
 ///
 /// Serialized as [StoredChains].
 #[derive(Debug, PartialEq, Eq)]
 pub struct ChainCsr {
-    /// Colex ranks of the junctions; junction 0 is the source and 1 the sink.
+    /// Colex ranks of the junction nodes.
+    ///
+    /// Junction with weight 0 is the dummy source node, weight 1 is the sink.
     pub junction_weights: Vec<u32>,
 
-    /// Chains leaving junction `j` are `row_ptrs[j]..row_ptrs[j + 1]`.
+    /// Chains leaving junction node `j` are `row_ptrs[j]..row_ptrs[j + 1]`.
     pub row_ptrs: Vec<u32>,
 
-    /// Junction that each chain ends at.
+    /// Index of the junction that each chain ends at.
+    ///
+    /// Junctions are numbered in breadth-first order.
+    /// TODO describe breadth-first order in the module docs.
     pub targets: Vec<u32>,
 
-    /// Inner nodes of chain `c` are `inner_weights[chain_ptrs[c]..chain_ptrs[c + 1]]`.
+    /// Inner nodes of linear chain `c` are
+    /// `inner_weights[chain_ptrs[c]..chain_ptrs[c + 1]]`.
     pub chain_ptrs: Vec<u32>,
 
     /// Colex ranks of the inner nodes, concatenated over all chains.
+    ///
+    /// Colex ranks for chain `c` are stored at
+    /// `inner_weights[chain_ptrs[c]..chain_ptrs[c + 1]]`.
     pub inner_weights: Vec<u32>,
 
     /// Suffix lengths of the edges in each chain, concatenated over all chains.
@@ -67,9 +118,20 @@ pub struct ChainCsr {
 /// Stored form of [ChainCsr], see the module docs.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct StoredChains {
+    /// Colex ranks of the junction nodes.
     pub junction_weights: Vec<u32>,
+
+    /// Colex ranks of the linear chains, concatenated over all chains.
     pub inner_weights: Vec<u32>,
-    pub suffix_lens: Vec<u32>,
+
+    /// Suffix lengths of the edges out of the dummy source node (the contig lengths).
+    pub sequence_lens: Vec<u32>,
+
+    /// Huffman code lengths of the other suffix length symbols.
+    pub suffix_code: Vec<u8>,
+
+    /// Other suffix lengths, Huffman coded.
+    pub suffix_lens: Vec<u8>,
 
     /// Out-degree of every junction except the sink.
     pub out_degrees: Vec<u8>,
@@ -100,6 +162,9 @@ impl ChainCsr {
             is_dummy || in_degree[node] != 1 || end - start != 1
         }).collect();
 
+        // Node index -> junction index in breadth-first order, u32::MAX until
+        // reached. `order` is the queue of the search and lists the nodes of
+        // the junctions in index order.
         let mut junction_index = vec![u32::MAX; n_nodes];
         junction_index[SOURCE_NODE as usize] = 0;
         junction_index[SINK_NODE as usize] = 1;
@@ -184,10 +249,40 @@ impl ChainCsr {
         }
         assert_eq!(next_new as usize, n_junctions, "junctions are not numbered in breadth-first order");
 
+        // Chains out of the source come first; their first edge holds the contig length.
+        let n_source_chains = self.row(SOURCE_NODE as usize).1;
+        let mut sequence_lens = Vec::with_capacity(n_source_chains);
+        let mut symbols: Vec<(usize, u32)> = Vec::with_capacity(self.suffix_lens.len());
+        for chain in 0..self.n_chains() {
+            for (i, &len) in self.chain_suffix_lens(chain).iter().enumerate() {
+                if chain < n_source_chains && i == 0 {
+                    sequence_lens.push(len);
+                } else if len > MAX_DIRECT_SUFFIX_LEN {
+                    symbols.push((LONG_SUFFIX_SYMBOL, len));
+                } else {
+                    symbols.push((len as usize, len));
+                }
+            }
+        }
+        let mut counts = vec![0_u64; LONG_SUFFIX_SYMBOL + 1];
+        for &(symbol, _) in &symbols {
+            counts[symbol] += 1;
+        }
+        let code = HuffmanCode::from_counts(&counts);
+        let mut suffix_lens = BitWriter::new();
+        for &(symbol, len) in &symbols {
+            code.write(symbol, &mut suffix_lens);
+            if symbol == LONG_SUFFIX_SYMBOL {
+                suffix_lens.write_gamma((len - MAX_DIRECT_SUFFIX_LEN) as u64);
+            }
+        }
+
         StoredChains {
             junction_weights: self.junction_weights.clone(),
             inner_weights: self.inner_weights.clone(),
-            suffix_lens: self.suffix_lens.clone(),
+            sequence_lens,
+            suffix_code: code.lengths().to_vec(),
+            suffix_lens: suffix_lens.finish(),
             out_degrees: out_degrees.finish(),
             chain_lens: chain_lens.finish(),
             targets: targets.finish(),
@@ -226,9 +321,34 @@ impl ChainCsr {
             let ptr = (*chain_ptrs.last().unwrap() as u64 + len).try_into().map_err(|_| truncated("chain lengths"))?;
             chain_ptrs.push(ptr);
         }
-        if *chain_ptrs.last().unwrap() as usize != stored.inner_weights.len()
-            || stored.suffix_lens.len() != stored.inner_weights.len() + n_chains {
+        if *chain_ptrs.last().unwrap() as usize != stored.inner_weights.len() {
             return Err(truncated("chain lengths"))
+        }
+
+        let n_source_chains = row_ptrs[1] as usize;
+        if stored.sequence_lens.len() != n_source_chains {
+            return Err(truncated("contig lengths"))
+        }
+        let code = HuffmanCode::from_lengths(stored.suffix_code).map_err(|e| GraphDecodeError(format!("stored chains: {}", e)))?;
+        let mut bits = BitReader::new(&stored.suffix_lens);
+        let mut suffix_lens = Vec::with_capacity(stored.inner_weights.len() + n_chains);
+        for chain in 0..n_chains {
+            let n_edges = (chain_ptrs[chain + 1] - chain_ptrs[chain]) as usize + 1;
+            for i in 0..n_edges {
+                if chain < n_source_chains && i == 0 {
+                    suffix_lens.push(stored.sequence_lens[chain]);
+                    continue;
+                }
+                let len = match code.read(&mut bits).ok_or_else(|| truncated("suffix lengths"))? {
+                    LONG_SUFFIX_SYMBOL => {
+                        let long = bits.read_gamma().ok_or_else(|| truncated("suffix lengths"))? + MAX_DIRECT_SUFFIX_LEN as u64;
+                        long.try_into().map_err(|_| truncated("suffix lengths"))?
+                    },
+                    symbol if symbol < LONG_SUFFIX_SYMBOL => symbol as u32,
+                    _ => return Err(truncated("suffix lengths")),
+                };
+                suffix_lens.push(len);
+            }
         }
 
         let mut targets = Vec::with_capacity(n_chains);
@@ -252,10 +372,11 @@ impl ChainCsr {
             targets,
             chain_ptrs,
             inner_weights: stored.inner_weights,
-            suffix_lens: stored.suffix_lens,
+            suffix_lens,
         })
     }
 
+    /// Number of linear chains.
     pub fn n_chains(&self) -> usize {
         self.targets.len()
     }
@@ -286,11 +407,58 @@ impl ChainCsr {
         &self.suffix_lens[start..end]
     }
 
+    /// Expands the chains back into an uncollapsed graph.
+    ///
+    /// Junctions keep their indices and inner nodes are numbered after them.
+    /// Edges out of a junction keep the order of the chains, so the choice
+    /// stream stays valid for the expanded graph.
+    pub fn to_csr(
+        &self,
+    ) -> Csr<u32> {
+        let n_junctions = self.junction_weights.len() as u32;
+        let mut node_weights = self.junction_weights.clone();
+        node_weights.extend(self.inner_weights.iter().copied());
+
+        // (source, target, suffix length); junction rows come first in chain order.
+        let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(self.suffix_lens.len());
+        for junction in 0..n_junctions as usize {
+            let (start, end) = self.row(junction);
+            for chain in start..end {
+                let suffix_lens = self.chain_suffix_lens(chain);
+                let mut prev = junction as u32;
+                for (i, suffix_len) in suffix_lens.iter().enumerate().take(self.inner_nodes(chain).len()) {
+                    let node = n_junctions + self.chain_ptrs[chain] + i as u32;
+                    edges.push((prev, node, *suffix_len));
+                    prev = node;
+                }
+                edges.push((prev, self.targets[chain], *suffix_lens.last().unwrap()));
+            }
+        }
+        edges.sort_by_key(|edge| edge.0);
+
+        let mut row_ptrs = vec![0_u32; node_weights.len() + 1];
+        for edge in &edges {
+            row_ptrs[edge.0 as usize + 1] += 1;
+        }
+        for i in 0..node_weights.len() {
+            row_ptrs[i + 1] += row_ptrs[i];
+        }
+
+        Csr {
+            node_weights,
+            row_ptrs,
+            column_indices: edges.iter().map(|edge| edge.1).collect(),
+            suffix_lens: edges.iter().map(|edge| edge.2).collect(),
+        }
+    }
+}
+
+impl Walkable for ChainCsr {
     /// Walks the path of `color` from the source to the sink.
     ///
     /// Same as [super::walk_path] for the uncollapsed graph; `max_steps` bounds
     /// the number of uncollapsed edges.
-    pub fn walk_path(
+    fn walk_path(
         &self,
         choices: &Choices,
         color: u32,
@@ -328,51 +496,6 @@ impl ChainCsr {
                 }
                 return Ok((sequence_length, dictionary))
             }
-        }
-    }
-
-    /// Expands the chains back into an uncollapsed graph.
-    ///
-    /// Junctions keep their indices and inner nodes are numbered after them.
-    /// Edges out of a junction keep the order of the chains, so the choice
-    /// stream stays valid for the expanded graph.
-    pub fn to_csr(
-        &self,
-    ) -> Csr<u32> {
-        let n_junctions = self.junction_weights.len() as u32;
-        let mut node_weights = self.junction_weights.clone();
-        node_weights.extend(self.inner_weights.iter().copied());
-
-        // (source, target, suffix length); junction rows come first in chain order.
-        let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(self.suffix_lens.len());
-        for junction in 0..n_junctions as usize {
-            let (start, end) = self.row(junction);
-            for chain in start..end {
-                let suffix_lens = self.chain_suffix_lens(chain);
-                let mut prev = junction as u32;
-                for i in 0..self.inner_nodes(chain).len() {
-                    let node = n_junctions + self.chain_ptrs[chain] + i as u32;
-                    edges.push((prev, node, suffix_lens[i]));
-                    prev = node;
-                }
-                edges.push((prev, self.targets[chain], *suffix_lens.last().unwrap()));
-            }
-        }
-        edges.sort_by_key(|edge| edge.0);
-
-        let mut row_ptrs = vec![0_u32; node_weights.len() + 1];
-        for edge in &edges {
-            row_ptrs[edge.0 as usize + 1] += 1;
-        }
-        for i in 0..node_weights.len() {
-            row_ptrs[i + 1] += row_ptrs[i];
-        }
-
-        Csr {
-            node_weights,
-            row_ptrs,
-            column_indices: edges.iter().map(|edge| edge.1).collect(),
-            suffix_lens: edges.iter().map(|edge| edge.2).collect(),
         }
     }
 }
