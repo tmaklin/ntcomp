@@ -45,10 +45,6 @@ pub struct GraphEncoder {
 
     /// File ranges
     file_ranges: Option<Vec<(Vec<u8>, Range<u32>)>>,
-
-    /// Path lens
-    path_lens: Option<Vec<u32>>,
-
 }
 
 /// Serializes an optional section, 0 bytes if absent.
@@ -74,7 +70,6 @@ impl GraphEncoder {
             hashes: None,
             contig_names: None,
             file_ranges: None,
-            path_lens: None,
         }
     }
 
@@ -105,15 +100,6 @@ impl GraphEncoder {
         self
     }
 
-    /// Add path lens
-    pub fn with_path_lens(
-        mut self,
-        path_lens: Vec<u32>,
-    ) -> Self {
-        self.path_lens = Some(path_lens);
-        self
-    }
-
     /// Contig names are compressed with LZMA.
     fn encode_contig_names(
         &self,
@@ -137,13 +123,11 @@ impl GraphEncoder {
         let file_range_bytes = optional_section(&self.file_ranges)?;
         let contig_name_bytes = self.encode_contig_names()?;
         let hash_bytes = optional_section(&self.hashes)?;
-        let path_len_bytes = optional_section(&self.path_lens)?;
         let graph_bytes = to_allocvec(&self.graph)?;
         let choice_bytes = to_allocvec(&self.choices)?;
 
         let header = FileHeader{
             nlz_header: [0_u8; 6],
-            path_len_bytes: path_len_bytes.len().try_into()?,
             n_queries: n_colors,
             contig_name_bytes: contig_name_bytes.len() as u64,
             graph_bytes: graph_bytes.len() as u64,
@@ -163,15 +147,14 @@ impl GraphEncoder {
         writer.write_all(&contig_name_bytes)?;
         writer.write_all(&graph_bytes)?;
         writer.write_all(&hash_bytes)?;
-        writer.write_all(&path_len_bytes)?;
         writer.write_all(&choice_bytes)?;
 
         let total = FILE_HEADER_BYTES + file_range_bytes.len() + contig_name_bytes.len() + graph_bytes.len()
-            + hash_bytes.len() + path_len_bytes.len() + choice_bytes.len();
+            + hash_bytes.len() + choice_bytes.len();
         Ok(format!(
-            "Graph: {}, {} bytes; choices: {} choices, {} bytes; contig names {} bytes, hashes {} bytes, path lengths {} bytes, file ranges {} bytes; total {} bytes",
+            "Graph: {}, {} bytes; choices: {} choices, {} bytes; contig names {} bytes, hashes {} bytes, file ranges {} bytes; total {} bytes",
             self.graph.summary(), graph_bytes.len(), self.choices.n_choices(), choice_bytes.len(),
-            contig_name_bytes.len(), hash_bytes.len(), path_len_bytes.len(), file_range_bytes.len(), total,
+            contig_name_bytes.len(), hash_bytes.len(), file_range_bytes.len(), total,
         ))
     }
 }

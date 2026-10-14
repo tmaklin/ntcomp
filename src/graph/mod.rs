@@ -84,13 +84,17 @@ const SINK_COLEX: u32 = u32::MAX;
 const IMPLICIT_SUFFIX_LEN: u32 = 0;
 
 /// Walkable graph that implements random access to any colour (contig) stored inside.
+///
+/// Every dictionary entry covers at least one base, so the path of a contig of
+/// `n` bases has at most `n + 1` edges (counting the edge out of the source,
+/// which stores `n`). Walks stop with an error after that many edges, so a
+/// corrupt input cannot loop forever.
 pub trait Walkable {
     /// Walk the path of `color` from the source to the sink.
     fn walk_path(
         &self,
         choices: &Choices,
         color: u32,
-        max_steps: usize,
     ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError>;
 }
 
@@ -446,11 +450,10 @@ impl Walkable for StoredGraph {
         &self,
         choices: &Choices,
         color: u32,
-        max_steps: usize,
     ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
         match self {
-            StoredGraph::Csr(csr) => csr.walk_path(choices, color, max_steps),
-            StoredGraph::Chains(chains) => chains.walk_path(choices, color, max_steps),
+            StoredGraph::Csr(csr) => csr.walk_path(choices, color),
+            StoredGraph::Chains(chains) => chains.walk_path(choices, color),
         }
     }
 }
@@ -476,13 +479,11 @@ impl<N> Csr<N> {
     /// Walks the path of `color` from the source to the sink, calling
     /// `visit(node, edge position)` for every edge taken.
     ///
-    /// `max_steps` bounds the walk (the stored path length) so a corrupt input
-    /// cannot loop forever.
+    /// The walk is bounded by the contig length, see [Walkable].
     pub fn walk(
         &self,
         choices: &Choices,
         color: u32,
-        max_steps: usize,
         mut visit: impl FnMut(usize, usize),
     ) -> Result<(), GraphDecodeError> {
         let mut reader = choices
@@ -490,8 +491,15 @@ impl<N> Csr<N> {
             .ok_or_else(|| GraphDecodeError(format!("no choice stream for colour {}", color)))?;
         let mut node = SOURCE_NODE as usize;
 
-        for _ in 0..max_steps {
+        // Only the edge out of the source until its contig length is known.
+        let mut max_edges = 1_usize;
+        let mut n_edges = 0_usize;
+        while n_edges < max_edges {
             let pos = take_edge(self.row(node), &mut reader, color, node)?;
+            if node == SOURCE_NODE as usize {
+                max_edges = (self.suffix_lens[pos] as usize).saturating_add(1);
+            }
+            n_edges += 1;
             visit(node, pos);
 
             node = self.column_indices[pos] as usize;
@@ -503,21 +511,18 @@ impl<N> Csr<N> {
             }
         }
 
-        Err(GraphDecodeError(format!("colour {} did not reach the sink in {} steps", color, max_steps)))
+        Err(GraphDecodeError(format!("colour {} did not reach the sink in {} edges", color, max_edges)))
     }
 
-    /// Sorted colours using each edge, recovered by walking every colour.
-    ///
-    /// `path_lens[c]` bounds the walk of colour `c`, see [Csr::walk].
+    /// Sorted colours using each edge, recovered by walking colours `0..n_colors`.
     pub fn colorsets(
         &self,
         choices: &Choices,
-        path_lens: &[u32],
+        n_colors: u32,
     ) -> Result<Vec<Vec<u32>>, GraphDecodeError> {
         let mut colorsets: Vec<Vec<u32>> = vec![Vec::new(); self.column_indices.len()];
-        for (color, &max_steps) in path_lens.iter().enumerate() {
-            let color = color as u32;
-            self.walk(choices, color, max_steps as usize, |_, pos| {
+        for color in 0..n_colors {
+            self.walk(choices, color, |_, pos| {
                 if colorsets[pos].last() != Some(&color) {
                     colorsets[pos].push(color);
                 }
@@ -568,19 +573,15 @@ impl<N: Copy> Walkable for Csr<N> where u32: From<N> {
     /// The returned value can be passed to [decode_path] to recover the nucleotide
     /// sequence.
     ///
-    /// `max_steps` bounds the walk (the stored path length) so a corrupt input
-    /// cannot loop forever.
-    ///
     fn walk_path(
         &self,
         choices: &Choices,
         color: u32,
-        max_steps: usize,
     ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
         let mut sequence_length = 0_u32;
-        let mut dictionary: Vec<(u32, u32)> = Vec::with_capacity(max_steps);
+        let mut dictionary: Vec<(u32, u32)> = Vec::new();
 
-        self.walk(choices, color, max_steps, |node, pos| {
+        self.walk(choices, color, |node, pos| {
             if node == SOURCE_NODE as usize {
                 sequence_length = self.suffix_lens[pos];
             } else {

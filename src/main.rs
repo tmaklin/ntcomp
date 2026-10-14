@@ -271,7 +271,7 @@ fn main() {
 
                 let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
                 let header = decoder.header();
-                let (graph, choices, hashes, contig_names, file_ranges, path_lens) = decoder.decode_from_read().unwrap();
+                let (graph, choices, hashes, contig_names, file_ranges) = decoder.decode_from_read().unwrap();
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
@@ -305,13 +305,7 @@ fn main() {
                     let idx = color as usize;
                     let start_time = std::time::Instant::now();
 
-                    // Without stored path lengths the walk is not bounded.
-                    let max_steps = path_lens.as_ref().map_or(usize::MAX, |lens| lens[idx] as usize);
-                    let (sequence_length, dictionary) = graph.walk_path(
-                        &choices,
-                        color,
-                        max_steps,
-                    ).unwrap();
+                    let (sequence_length, dictionary) = graph.walk_path(&choices, color).unwrap();
 
                     // Transform from Vec<(u32, u32)> to Vec<(u32, SuffixLen)>
                     //
@@ -366,7 +360,6 @@ fn main() {
 
                 let mut contig_names: Vec<Vec<u8>> = Vec::with_capacity(n_queries);
                 let mut file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = Vec::with_capacity(n_queries);
-                let mut path_lens: Vec<u32> = Vec::new();
 
                 let mut color: u32 = 0;
                 for query_file in query_files.iter() {
@@ -379,7 +372,6 @@ fn main() {
                         hashes.push(hash(&seqrec));
 
                         let (dictionary, implicit) = ntcomp::encode_sequence_flagged(&seqrec, &sbwt, &lcs).unwrap();
-                        path_lens.push(dictionary.len() as u32 + 2);
                         info!("Encoded color {} with {} nodes", color, dictionary.len());
 
                         let added = builder.add_path_with_flags(seqrec.len(), &dictionary, &implicit);
@@ -399,8 +391,7 @@ fn main() {
                 let encoder = ntcomp::graph::encoder::GraphEncoder::new(graph, choices)
                     .with_hashes(hashes)
                     .with_contig_names(contig_names)
-                    .with_file_ranges(file_ranges)
-                    .with_path_lens(path_lens);
+                    .with_file_ranges(file_ranges);
 
                 let sizes = encoder.encode_to_write(&mut stdout).unwrap();
                 info!("{}", sizes);

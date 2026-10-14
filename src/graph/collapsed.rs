@@ -519,13 +519,12 @@ impl ChainCsr {
 impl Walkable for ChainCsr {
     /// Walks the path of `color` from the source to the sink.
     ///
-    /// Same as [super::walk_path] for the uncollapsed graph; `max_steps` bounds
-    /// the number of uncollapsed edges.
+    /// Same as the walk of the uncollapsed graph; the bound from [Walkable]
+    /// counts uncollapsed edges.
     fn walk_path(
         &self,
         choices: &Choices,
         color: u32,
-        max_steps: usize,
     ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
         let mut reader = choices
             .reader(color)
@@ -533,21 +532,23 @@ impl Walkable for ChainCsr {
         let mut junction = SOURCE_NODE as usize;
         let mut sequence_length = 0_u32;
         let mut dictionary: Vec<(u32, u32)> = Vec::new();
-        let mut steps = 0;
+        let mut n_edges = 0_usize;
 
         loop {
             let chain = take_edge(self.row(junction), &mut reader, color, junction)?;
             let inner = self.inner_nodes(chain);
             let suffix_lens = self.chain_suffix_lens(chain);
 
-            steps += suffix_lens.len();
-            if steps > max_steps {
-                return Err(GraphDecodeError(format!("colour {} did not reach the sink in {} steps", color, max_steps)))
-            }
-
             if junction == SOURCE_NODE as usize {
                 sequence_length = suffix_lens[0];
-            } else {
+            }
+            n_edges += suffix_lens.len();
+            let max_edges = (sequence_length as usize).saturating_add(1);
+            if n_edges > max_edges {
+                return Err(GraphDecodeError(format!("colour {} did not reach the sink in {} edges", color, max_edges)))
+            }
+
+            if junction != SOURCE_NODE as usize {
                 dictionary.push((self.junction_weights[junction], suffix_lens[0]));
             }
             dictionary.extend(inner.iter().copied().zip(suffix_lens[1..].iter().copied()));

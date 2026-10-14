@@ -91,7 +91,6 @@ pub type DecodedSections = (
     Option<Vec<Hash>>,
     Option<Vec<Vec<u8>>>,
     Option<Vec<(Vec<u8>, Range<u32>)>>,
-    Option<Vec<u32>>,
 );
 
 /// Decodes the output from [GraphEncoder](super::encoder::GraphEncoder).
@@ -132,9 +131,11 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
         let graph: StoredGraph = read_required_section(reader, header.graph_bytes, "graph")?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
-        let path_lens = read_section(reader, header.path_len_bytes as u64)?;
         let choices: Choices = read_required_section(reader, header.choice_bytes, "choice")?;
 
-        Ok((graph, choices, hashes, contig_names, file_ranges, path_lens))
+        Ok((graph, choices, hashes, contig_names, file_ranges))
+    }
+}
+
     }
 }
