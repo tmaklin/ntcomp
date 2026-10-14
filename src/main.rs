@@ -325,7 +325,7 @@ fn main() {
                         (colex_rank, suffix_len)
                     }).collect::<Vec<(u32, ntcomp::graph::SuffixLen)>>();
 
-                    let sequence = ntcomp::graph::decode_path(dictionary, sequence_length as usize, &sbwt).unwrap();
+                    let sequence = ntcomp::graph::decode_path(dictionary, sequence_length as usize, &sbwt, Some(&lcs)).unwrap();
                     // Contigs stored on the other strand are reverse complemented back.
                     let sequence = if reversed.as_ref().is_some_and(|r| r[idx]) {
                         ntcomp::graph::orientation::reverse_complement(&sequence)

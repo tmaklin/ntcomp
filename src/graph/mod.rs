@@ -139,11 +139,16 @@ pub struct ColexGraphEdge {
 /// the k-mer as far as the encoder could have extended it at that position and
 /// explicit and plain by taking the suffix length stored inside [SuffixLen].
 ///
+/// If `lcs` is given, the k-mers are extended with right extensions of their
+/// reverse complements, which is faster and gives the same sequence if the
+/// SBWT contains both strands, see [crate::left_extend_kmer].
+///
 /// Fails if the dictionary does not cover exactly `sequence_length` bases.
 pub fn decode_path(
     path: Vec<(u32, SuffixLen)>,
     sequence_length: usize,
     sbwt: &SbwtIndexVariant,
+    lcs: Option<&LcsArray>,
 ) -> Result<Vec<u8>, GraphDecodeError> {
     let mut sequence: Vec<u8> = vec![0; sequence_length];
     let mut end = sequence_length;
@@ -155,12 +160,12 @@ pub fn decode_path(
                 let (kmer, len) = match suffix_len {
                     SuffixLen::Implicit => {
                         // The encoder extends at most end - k - 1 characters.
-                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, end.saturating_sub(k + 1));
+                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, lcs, end.saturating_sub(k + 1));
                         let len = new_kmer.len();
                         (new_kmer, len)
                     },
                     SuffixLen::Explicit { suffix_len: len } => {
-                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, (len - k as u32) as usize);
+                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, lcs, (len - k as u32) as usize);
                         assert_eq!(new_kmer.len(), len as usize);
                         (new_kmer, len as usize)
                     },
