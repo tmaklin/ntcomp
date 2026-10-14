@@ -55,6 +55,7 @@ use petgraph::graph::{
 };
 use petgraph::visit::EdgeRef;
 
+use sbwt::LcsArray;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 pub mod bits;
@@ -64,10 +65,12 @@ pub mod decoder;
 pub mod encoder;
 pub mod huffman;
 pub mod lzma_wrapper;
+pub mod orientation;
 
 pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};
 use collapsed::ChainCsr;
+use orientation::StrandChooser;
 
 type E = Box<dyn std::error::Error>;
 
@@ -197,6 +200,18 @@ pub struct GraphBuilder {
 
     /// Store linear chains as single edges in [GraphBuilder::finish]
     collapse_chains: bool,
+
+    /// Choose the strand of every contig added with [GraphBuilder::add_contig]
+    reorient_contigs: bool,
+
+    /// One in this many _k_-mers is sampled for choosing the strands, see [orientation]
+    reorient_sampling: u64,
+
+    /// Created when the first contig is added with reorienting on
+    strand_chooser: Option<StrandChooser>,
+
+    /// Per colour: true if the contig is stored reverse complemented
+    reversed: Vec<bool>,
 }
 
 impl Default for GraphBuilder {
@@ -217,6 +232,10 @@ impl GraphBuilder {
             implicit: Vec::new(),
             paths: Vec::new(),
             collapse_chains: false,
+            reorient_contigs: false,
+            reorient_sampling: orientation::DEFAULT_SAMPLING,
+            strand_chooser: None,
+            reversed: Vec::new(),
         }
     }
 
@@ -227,6 +246,65 @@ impl GraphBuilder {
     ) -> Self {
         self.collapse_chains = collapse;
         self
+    }
+
+    /// Store every contig added with [GraphBuilder::add_contig] on the strand
+    /// that shares the most with the contigs before it, see [orientation].
+    pub fn reorient_contigs(
+        mut self,
+        reorient: bool,
+    ) -> Self {
+        self.reorient_contigs = reorient;
+        self
+    }
+
+    /// Sample one in `one_in` _k_-mers for choosing the strands
+    /// ([orientation::DEFAULT_SAMPLING] by default); panics if `one_in` is 0.
+    pub fn reorient_sampling(
+        mut self,
+        one_in: u64,
+    ) -> Self {
+        assert!(one_in > 0, "sampling width must be at least 1");
+        self.reorient_sampling = one_in;
+        self
+    }
+
+    /// Per colour: true if the contig is stored reverse complemented.
+    ///
+    /// Only contigs added with [GraphBuilder::add_contig] with
+    /// [GraphBuilder::reorient_contigs] on can be reversed. Their decoded
+    /// sequences have to be reverse complemented to get the input back.
+    pub fn reversed(&self) -> &[bool] {
+        &self.reversed
+    }
+
+    /// Encodes the next contig and adds its path.
+    ///
+    /// With [GraphBuilder::reorient_contigs] on, chooses the strand of the contig
+    /// first and encodes that strand. `sequence` is a normalized nucleotide
+    /// sequence, and `sbwt` and `lcs` are the index passed to
+    /// [crate::encode_sequence_flagged].
+    pub fn add_contig(
+        &mut self,
+        sequence: &[u8],
+        sbwt: &SbwtIndexVariant,
+        lcs: &LcsArray,
+    ) -> Result<u32, E> {
+        let reversed = if self.reorient_contigs {
+            let sampling = self.reorient_sampling;
+            self.strand_chooser.get_or_insert_with(|| StrandChooser::new(sampling)).choose(sequence)
+        } else {
+            false
+        };
+        let oriented: std::borrow::Cow<[u8]> = if reversed {
+            std::borrow::Cow::Owned(orientation::reverse_complement(sequence))
+        } else {
+            std::borrow::Cow::Borrowed(sequence)
+        };
+        let (dictionary, implicit) = crate::encode_sequence_flagged(&oriented, sbwt, lcs)?;
+        let color = self.add_path_with_flags(oriented.len(), &dictionary, &implicit);
+        self.reversed[color as usize] = reversed;
+        Ok(color)
     }
 
     fn insert_node(
@@ -295,6 +373,7 @@ impl GraphBuilder {
         path.push(self.edge(prev, SINK_NODE, prev_weight, prev_implicit));
 
         self.paths.push(path);
+        self.reversed.push(false);
         color
     }
 

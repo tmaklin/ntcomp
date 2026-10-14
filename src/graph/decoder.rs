@@ -20,6 +20,7 @@ use crate::{
     FILE_HEADER_BYTES,
     decode_file_header,
 };
+use super::bits::BitReader;
 use super::choices::Choices;
 use super::lzma_wrapper::{self, LzmaData};
 use super::StoredGraph;
@@ -84,6 +85,23 @@ fn read_contig_names<R: Read>(
     Ok(Some(postcard::from_bytes(&lzma_wrapper::decompress(&lzma)?)?))
 }
 
+/// One bit per colour, set if the contig is reverse complemented; None if
+/// the section is empty (no contig is reversed).
+fn read_reversed<R: Read>(
+    input: &mut R,
+    n_bytes: u64,
+    n_colors: usize,
+) -> Result<Option<Vec<bool>>, E> {
+    let Some(bytes) = read_section::<Vec<u8>, R>(input, n_bytes)? else {
+        return Ok(None)
+    };
+    if bytes.len() != n_colors.div_ceil(8) {
+        return Err(Box::new(ArchiveError(format!("strand section has {} bytes for {} colours", bytes.len(), n_colors))))
+    }
+    let mut bits = BitReader::new(&bytes);
+    Ok(Some((0..n_colors).map(|_| bits.read_bits(1) == Some(1)).collect()))
+}
+
 /// Sections of an archive, in the order returned by [GraphDecoder::decode_from_read].
 pub type DecodedSections = (
     StoredGraph,
@@ -91,6 +109,7 @@ pub type DecodedSections = (
     Option<Vec<Hash>>,
     Option<Vec<Vec<u8>>>,
     Option<Vec<(Vec<u8>, Range<u32>)>>,
+    Option<Vec<bool>>,
 );
 
 /// Decodes the output from [GraphEncoder](super::encoder::GraphEncoder).
@@ -131,9 +150,10 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
         let graph: StoredGraph = read_required_section(reader, header.graph_bytes, "graph")?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
+        let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let choices: Choices = read_required_section(reader, header.choice_bytes, "choice")?;
 
-        Ok((graph, choices, hashes, contig_names, file_ranges))
+        Ok((graph, choices, hashes, contig_names, file_ranges, reversed))
     }
 }
 

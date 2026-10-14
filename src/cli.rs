@@ -99,6 +99,13 @@ pub enum Commands {
         #[arg(long = "collapse-chains", default_value_t = false, help = "Store linear chains of nodes as single edges.")]
         collapse_chains: bool,
 
+        // // Choose contig strands
+        #[arg(long = "reorient", default_value_t = false, help = "Store every contig on the strand that shares the most with the contigs before it.")]
+        reorient: bool,
+
+        #[arg(long = "reorient-sampling", default_value_t = 32, help = "Sample one in this many 31-mers for choosing the strands.")]
+        reorient_sampling: u64,
+
         // Decompression
         // // Toggle decompression
         #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]

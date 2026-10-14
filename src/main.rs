@@ -257,6 +257,8 @@ fn main() {
             fasta,
             fasta_columns,
             collapse_chains,
+            reorient,
+            reorient_sampling,
             colors,
             contigs,
         }) => {
@@ -271,7 +273,7 @@ fn main() {
 
                 let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
                 let header = decoder.header();
-                let (graph, choices, hashes, contig_names, file_ranges) = decoder.decode_from_read().unwrap();
+                let (graph, choices, hashes, contig_names, file_ranges, reversed) = decoder.decode_from_read().unwrap();
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
@@ -324,6 +326,12 @@ fn main() {
                     }).collect::<Vec<(u32, ntcomp::graph::SuffixLen)>>();
 
                     let sequence = ntcomp::graph::decode_path(dictionary, sequence_length as usize, &sbwt).unwrap();
+                    // Contigs stored on the other strand are reverse complemented back.
+                    let sequence = if reversed.as_ref().is_some_and(|r| r[idx]) {
+                        ntcomp::graph::orientation::reverse_complement(&sequence)
+                    } else {
+                        sequence
+                    };
 
                     // Not checked if the archive has no hashes.
                     let hash_match = hashes.as_ref().map(|hashes| hash(&sequence) == hashes[idx]);
@@ -353,7 +361,10 @@ fn main() {
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let mut builder = ntcomp::graph::GraphBuilder::new().collapse_chains(*collapse_chains);
+                let mut builder = ntcomp::graph::GraphBuilder::new()
+                    .collapse_chains(*collapse_chains)
+                    .reorient_contigs(*reorient)
+                    .reorient_sampling(*reorient_sampling);
 
                 // blake3 hash of every (normalized) input contig, checked after decoding
                 let mut hashes: Vec<Hash> = Vec::new();
@@ -371,10 +382,8 @@ fn main() {
                         let seqrec = rec.normalize(true);
                         hashes.push(hash(&seqrec));
 
-                        let (dictionary, implicit) = ntcomp::encode_sequence_flagged(&seqrec, &sbwt, &lcs).unwrap();
-                        info!("Encoded color {} with {} nodes", color, dictionary.len());
-
-                        let added = builder.add_path_with_flags(seqrec.len(), &dictionary, &implicit);
+                        let added = builder.add_contig(&seqrec, &sbwt, &lcs).unwrap();
+                        info!("Encoded color {}{}", color, if builder.reversed()[color as usize] { " (reverse complemented)" } else { "" });
                         assert_eq!(added, color);
                         color += 1;
                     }
@@ -386,12 +395,14 @@ fn main() {
                 }
                 progress.finish();
 
+                let reversed = builder.reversed().to_vec();
                 let (graph, choices) = builder.finish();
 
                 let encoder = ntcomp::graph::encoder::GraphEncoder::new(graph, choices)
                     .with_hashes(hashes)
                     .with_contig_names(contig_names)
-                    .with_file_ranges(file_ranges);
+                    .with_file_ranges(file_ranges)
+                    .with_reversed(reversed);
 
                 let sizes = encoder.encode_to_write(&mut stdout).unwrap();
                 info!("{}", sizes);
