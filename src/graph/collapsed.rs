@@ -39,6 +39,13 @@
 //! between inner nodes do not need to store the colour sets if they are stored
 //! in the choice stream.
 //!
+//! ## Stored colex ranks
+//!
+//! The colex ranks of the junctions and the inner nodes are bit-packed with the
+//! same width for every rank. The number of bits needed for the largest rank
+//! depends on the size of the SBWT. The dummy source and sink are always
+//! junctions 0 and 1 and are not stored.
+//!
 //! ## Stored suffix lengths
 //!
 //! The suffix lengths on the edges out of the dummy source node are the total
@@ -57,7 +64,9 @@ use super::{
     Csr,
     Choices,
     GraphDecodeError,
+    SINK_COLEX,
     SINK_NODE,
+    SOURCE_COLEX,
     SOURCE_NODE,
     take_edge,
     Walkable,
@@ -118,11 +127,19 @@ pub struct ChainCsr {
 /// Stored form of [ChainCsr], see the module docs.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct StoredChains {
-    /// Colex ranks of the junction nodes.
-    pub junction_weights: Vec<u32>,
+    /// Number of junction nodes, including the dummy source and sink.
+    pub n_junctions: u32,
 
-    /// Colex ranks of the linear chains, concatenated over all chains.
-    pub inner_weights: Vec<u32>,
+    /// Number of bits used for every stored colex rank.
+    pub colex_bits: u8,
+
+    /// Colex ranks of the junction nodes except the dummy source and sink,
+    /// `colex_bits` bits each.
+    pub junction_weights: Vec<u8>,
+
+    /// Colex ranks of the inner nodes, concatenated over all chains,
+    /// `colex_bits` bits each.
+    pub inner_weights: Vec<u8>,
 
     /// Suffix lengths of the edges out of the dummy source node (the contig lengths).
     pub sequence_lens: Vec<u32>,
@@ -141,6 +158,38 @@ pub struct StoredChains {
 
     /// Target of every chain.
     pub targets: Vec<u8>,
+}
+
+/// Number of bits needed for colex ranks up to `max_colex` (at least 1).
+fn colex_bits(
+    max_colex: u32,
+) -> u32 {
+    (32 - max_colex.leading_zeros()).max(1)
+}
+
+/// Packs `ranks` with `bits` bits each.
+fn pack_colex(
+    ranks: &[u32],
+    bits: u32,
+) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    for &rank in ranks {
+        writer.write_bits(rank as u64, bits);
+    }
+    writer.finish()
+}
+
+/// Unpacks `n` ranks of `bits` bits each; None unless `bytes` holds exactly that many.
+fn unpack_colex(
+    bytes: &[u8],
+    n: usize,
+    bits: u32,
+) -> Option<Vec<u32>> {
+    if bytes.len() != (n * bits as usize).div_ceil(8) {
+        return None
+    }
+    let mut reader = BitReader::new(bytes);
+    (0..n).map(|_| reader.read_bits(bits).map(|rank| rank as u32)).collect()
 }
 
 impl ChainCsr {
@@ -277,9 +326,18 @@ impl ChainCsr {
             }
         }
 
+        // Real colex ranks only; the dummy source and sink are junctions 0 and 1.
+        assert_eq!(self.junction_weights[..2], [SOURCE_COLEX, SINK_COLEX], "junctions 0 and 1 are not the source and sink");
+        let real_junctions = &self.junction_weights[2..];
+        let max_colex = real_junctions.iter().chain(&self.inner_weights).copied().max().unwrap_or(0);
+        assert!(max_colex < SOURCE_COLEX, "colex rank collides with dummy node ranks");
+        let colex_bits = colex_bits(max_colex);
+
         StoredChains {
-            junction_weights: self.junction_weights.clone(),
-            inner_weights: self.inner_weights.clone(),
+            n_junctions: n_junctions.try_into().expect("too many junctions"),
+            colex_bits: colex_bits as u8,
+            junction_weights: pack_colex(real_junctions, colex_bits),
+            inner_weights: pack_colex(&self.inner_weights, colex_bits),
             sequence_lens,
             suffix_code: code.lengths().to_vec(),
             suffix_lens: suffix_lens.finish(),
@@ -294,10 +352,16 @@ impl ChainCsr {
         stored: StoredChains,
     ) -> Result<Self, GraphDecodeError> {
         let truncated = |what: &str| GraphDecodeError(format!("stored chains: {} truncated or invalid", what));
-        let n_junctions = stored.junction_weights.len();
+        let n_junctions = stored.n_junctions as usize;
         if n_junctions < 2 {
             return Err(GraphDecodeError("stored chains: missing source or sink".to_string()))
         }
+        let colex_bits = stored.colex_bits as u32;
+        if !(1..=32).contains(&colex_bits) {
+            return Err(truncated("colex rank width"))
+        }
+        let mut junction_weights = vec![SOURCE_COLEX, SINK_COLEX];
+        junction_weights.extend(unpack_colex(&stored.junction_weights, n_junctions - 2, colex_bits).ok_or_else(|| truncated("junction colex ranks"))?);
 
         let mut row_ptrs = Vec::with_capacity(n_junctions + 1);
         row_ptrs.push(0_u32);
@@ -321,9 +385,8 @@ impl ChainCsr {
             let ptr = (*chain_ptrs.last().unwrap() as u64 + len).try_into().map_err(|_| truncated("chain lengths"))?;
             chain_ptrs.push(ptr);
         }
-        if *chain_ptrs.last().unwrap() as usize != stored.inner_weights.len() {
-            return Err(truncated("chain lengths"))
-        }
+        let n_inner = *chain_ptrs.last().unwrap() as usize;
+        let inner_weights = unpack_colex(&stored.inner_weights, n_inner, colex_bits).ok_or_else(|| truncated("inner colex ranks"))?;
 
         let n_source_chains = row_ptrs[1] as usize;
         if stored.sequence_lens.len() != n_source_chains {
@@ -331,7 +394,7 @@ impl ChainCsr {
         }
         let code = HuffmanCode::from_lengths(stored.suffix_code).map_err(|e| GraphDecodeError(format!("stored chains: {}", e)))?;
         let mut bits = BitReader::new(&stored.suffix_lens);
-        let mut suffix_lens = Vec::with_capacity(stored.inner_weights.len() + n_chains);
+        let mut suffix_lens = Vec::with_capacity(n_inner + n_chains);
         for chain in 0..n_chains {
             let n_edges = (chain_ptrs[chain + 1] - chain_ptrs[chain]) as usize + 1;
             for i in 0..n_edges {
@@ -367,11 +430,11 @@ impl ChainCsr {
         }
 
         Ok(ChainCsr {
-            junction_weights: stored.junction_weights,
+            junction_weights,
             row_ptrs,
             targets,
             chain_ptrs,
-            inner_weights: stored.inner_weights,
+            inner_weights,
             suffix_lens,
         })
     }
