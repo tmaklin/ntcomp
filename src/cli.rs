@@ -106,6 +106,22 @@ pub enum Commands {
         #[arg(long = "reorient-sampling", default_value_t = 32, help = "Sample one in this many 31-mers for choosing the strands.")]
         reorient_sampling: u64,
 
+        // // Edit SNPs towards the index
+        #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs against the index before encoding (reads the input twice).")]
+        edit_snps: bool,
+
+        #[arg(long = "edit-snps-max-shared", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..), help = "Edit only SNPs that at most this many contigs have.")]
+        edit_snps_max_shared: u64,
+
+        // Resources
+        // // Threads
+        #[arg(short = 't', long = "threads", default_value_t = 1, help = "Number of threads.")]
+        num_threads: usize,
+
+        // // Batch size
+        #[arg(long = "batch-size", default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..), help = "Read and process this many input files at a time (when decoding: this many files' worth of contigs).")]
+        batch_size: u64,
+
         // Decompression
         // // Toggle decompression
         #[arg(short = 'd', long = "decompress", default_value_t = false, help = "Force decompression", group = "mode")]

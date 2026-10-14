@@ -32,6 +32,9 @@ stderrlog = "0.6"
 ## collection
 indexmap = "2.14"
 
+## parallelism
+rayon = "1.12"
+
 ## graph
 blake3 = {version = "1.8", features = ["serde"] }
 petgraph = { version = "0.8", features = ["serde-1"] }
