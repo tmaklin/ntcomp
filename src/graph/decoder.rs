@@ -22,6 +22,7 @@ use crate::{
 };
 use super::bits::BitReader;
 use super::choices::Choices;
+use super::snps::SnpEdits;
 use super::lzma_wrapper::{self, LzmaData};
 use super::StoredGraph;
 
@@ -110,6 +111,7 @@ pub type DecodedSections = (
     Option<Vec<Vec<u8>>>,
     Option<Vec<(Vec<u8>, Range<u32>)>>,
     Option<Vec<bool>>,
+    Option<SnpEdits>,
 );
 
 /// Decodes the output from [GraphEncoder](super::encoder::GraphEncoder).
@@ -151,9 +153,13 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         let graph: StoredGraph = read_required_section(reader, header.graph_bytes, "graph")?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
+        let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;
+        if snp_edits.as_ref().is_some_and(|edits| edits.n_colors() != header.n_queries as usize) {
+            return Err(Box::new(ArchiveError(format!("SNP section does not have {} colours", header.n_queries))))
+        }
         let choices: Choices = read_required_section(reader, header.choice_bytes, "choice")?;
 
-        Ok((graph, choices, hashes, contig_names, file_ranges, reversed))
+        Ok((graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits))
     }
 }
 

@@ -44,9 +44,14 @@
 //!
 use core::ops::Range;
 
+use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::IndexSet;
+
+use rayon::prelude::*;
 
 use petgraph::EdgeType;
 use petgraph::graph::{
@@ -66,11 +71,13 @@ pub mod encoder;
 pub mod huffman;
 pub mod lzma_wrapper;
 pub mod orientation;
+pub mod snps;
 
 pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};
 use collapsed::ChainCsr;
 use orientation::StrandChooser;
+use snps::{CalledSnp, Snp, SnpEdits};
 
 type E = Box<dyn std::error::Error>;
 
@@ -217,6 +224,22 @@ pub struct GraphBuilder {
 
     /// Per colour: true if the contig is stored reverse complemented
     reversed: Vec<bool>,
+
+    /// Edit SNPs towards the index in [GraphBuilder::add_contig]
+    edit_snps: bool,
+
+    /// Edit SNPs shared by at most this many contigs, see [snps]
+    snp_max_shared: usize,
+
+    /// Per colour from [GraphBuilder::call_snps]: the chosen strand and the
+    /// SNPs on it, until the contig is added
+    called: Vec<(bool, Vec<CalledSnp>)>,
+
+    /// Number of contigs with each SNP (by [CalledSnp::key])
+    snp_counts: HashMap<u64, usize>,
+
+    /// Per colour: the edited SNPs
+    edited: Vec<Vec<Snp>>,
 }
 
 impl Default for GraphBuilder {
@@ -241,6 +264,11 @@ impl GraphBuilder {
             reorient_sampling: orientation::DEFAULT_SAMPLING,
             strand_chooser: None,
             reversed: Vec::new(),
+            edit_snps: false,
+            snp_max_shared: snps::DEFAULT_MAX_SHARED,
+            called: Vec::new(),
+            snp_counts: HashMap::new(),
+            edited: Vec::new(),
         }
     }
 
@@ -274,6 +302,31 @@ impl GraphBuilder {
         self
     }
 
+    /// Edit SNPs towards the index before encoding, see [snps].
+    ///
+    /// Needs two passes over the contigs: [GraphBuilder::call_snps] for every
+    /// contig first, then [GraphBuilder::add_contig] for every contig in the
+    /// same order. The edited SNPs, [GraphBuilder::snp_edits], have to be put
+    /// back after decoding.
+    pub fn edit_snps(
+        mut self,
+        edit: bool,
+    ) -> Self {
+        self.edit_snps = edit;
+        self
+    }
+
+    /// Edit only the SNPs that at most `max_shared` contigs have
+    /// ([snps::DEFAULT_MAX_SHARED] by default); panics if `max_shared` is 0.
+    pub fn edit_snps_max_shared(
+        mut self,
+        max_shared: usize,
+    ) -> Self {
+        assert!(max_shared > 0, "at least one contig must be able to have a SNP");
+        self.snp_max_shared = max_shared;
+        self
+    }
+
     /// Per colour: true if the contig is stored reverse complemented.
     ///
     /// Only contigs added with [GraphBuilder::add_contig] with
@@ -283,33 +336,159 @@ impl GraphBuilder {
         &self.reversed
     }
 
+    /// Edited SNPs of every colour, None if no SNP was edited.
+    ///
+    /// They are put back into the decoded contig with [SnpEdits::revert]
+    /// before reverse complementing it.
+    pub fn snp_edits(&self) -> Option<SnpEdits> {
+        if self.edited.iter().all(|snps| snps.is_empty()) {
+            return None
+        }
+        Some(SnpEdits::new(&self.edited))
+    }
+
+    /// Chooses the strands of `sequences`, in order, if
+    /// [GraphBuilder::reorient_contigs] is on. The _k_-mers are sampled in
+    /// parallel.
+    fn choose_strands(
+        &mut self,
+        sequences: &[&[u8]],
+    ) -> Vec<bool> {
+        if !self.reorient_contigs {
+            return vec![false; sequences.len()]
+        }
+        let sampling = self.reorient_sampling;
+        let chooser = self.strand_chooser.get_or_insert_with(|| StrandChooser::new(sampling));
+        let sketches: Vec<_> = sequences.par_iter().map(|sequence| chooser.sketch(sequence)).collect();
+        sketches.into_iter().map(|sketch| chooser.choose_sketched(sketch)).collect()
+    }
+
+    /// First pass of [GraphBuilder::edit_snps]: chooses the strand of the
+    /// next contig and calls its SNPs on that strand. Returns the colour the
+    /// contig will get from [GraphBuilder::add_contig].
+    ///
+    /// Arguments as in [GraphBuilder::add_contig].
+    pub fn call_snps(
+        &mut self,
+        sequence: &[u8],
+        sbwt: &SbwtIndexVariant,
+        lcs: &LcsArray,
+    ) -> u32 {
+        self.call_snps_batch(&[sequence], sbwt, lcs)[0]
+    }
+
+    /// Same as [GraphBuilder::call_snps] for the next `sequences.len()`
+    /// contigs, in order. The SNPs are called in parallel; the result is the
+    /// same as calling [GraphBuilder::call_snps] for each.
+    pub fn call_snps_batch(
+        &mut self,
+        sequences: &[&[u8]],
+        sbwt: &SbwtIndexVariant,
+        lcs: &LcsArray,
+    ) -> Vec<u32> {
+        let strands = self.choose_strands(sequences);
+        // kbo builds an SBWT of every contig in a thread pool of its own. A rayon
+        // worker waiting for that pool runs other tasks meanwhile, so with rayon
+        // most of the batch would be building at once. Plain threads, one per
+        // rayon thread, keep the number of calls in progress at the thread count.
+        let next = AtomicUsize::new(0);
+        let called: Vec<Mutex<Vec<CalledSnp>>> = (0..sequences.len()).map(|_| Mutex::new(Vec::new())).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..rayon::current_num_threads().min(sequences.len()) {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= sequences.len() {
+                        break
+                    }
+                    let snps = if strands[i] {
+                        snps::call_snps(&orientation::reverse_complement(sequences[i]), sbwt, lcs)
+                    } else {
+                        snps::call_snps(sequences[i], sbwt, lcs)
+                    };
+                    *called[i].lock().unwrap() = snps;
+                });
+            }
+        });
+        let called = called.into_iter().map(|snps| snps.into_inner().unwrap());
+        let first: u32 = self.called.len().try_into().unwrap();
+        for (snps, reversed) in called.zip(strands) {
+            for snp in &snps {
+                *self.snp_counts.entry(snp.key).or_default() += 1;
+            }
+            self.called.push((reversed, snps));
+        }
+        (first..(first + sequences.len() as u32)).collect()
+    }
+
     /// Encodes the next contig and adds its path.
     ///
     /// With [GraphBuilder::reorient_contigs] on, chooses the strand of the contig
-    /// first and encodes that strand. `sequence` is a normalized nucleotide
-    /// sequence, and `sbwt` and `lcs` are the index passed to
-    /// [crate::encode_sequence_flagged].
+    /// first and encodes that strand. With [GraphBuilder::edit_snps] on, the
+    /// strand comes from [GraphBuilder::call_snps], which must have been called
+    /// for this contig, and the SNPs that at most
+    /// [GraphBuilder::edit_snps_max_shared] contigs have are edited before
+    /// encoding. `sequence` is a normalized nucleotide sequence, and `sbwt`
+    /// and `lcs` are the index passed to [crate::encode_sequence_flagged].
     pub fn add_contig(
         &mut self,
         sequence: &[u8],
         sbwt: &SbwtIndexVariant,
         lcs: &LcsArray,
     ) -> Result<u32, E> {
-        let reversed = if self.reorient_contigs {
-            let sampling = self.reorient_sampling;
-            self.strand_chooser.get_or_insert_with(|| StrandChooser::new(sampling)).choose(sequence)
+        Ok(self.add_contigs(&[sequence], sbwt, lcs)?[0])
+    }
+
+    /// Same as [GraphBuilder::add_contig] for the next `sequences.len()`
+    /// contigs, in order. The contigs are encoded in parallel; the graph is
+    /// the same as from adding them one at a time.
+    pub fn add_contigs(
+        &mut self,
+        sequences: &[&[u8]],
+        sbwt: &SbwtIndexVariant,
+        lcs: &LcsArray,
+    ) -> Result<Vec<u32>, E> {
+        let first_color = self.paths.len();
+        // Strands and SNPs to edit, in order.
+        let prepared: Vec<(bool, Vec<Snp>)> = if self.edit_snps {
+            // The strands were chosen in the first pass.
+            self.strand_chooser = None;
+            if self.called.len() < first_color + sequences.len() {
+                return Err(format!("SNPs of colour {} were not called before adding it", self.called.len().max(first_color)).into())
+            }
+            let (counts, max_shared) = (&self.snp_counts, self.snp_max_shared);
+            self.called[first_color..(first_color + sequences.len())].iter_mut().map(|(reversed, called)| {
+                let edited = std::mem::take(called).into_iter()
+                    .filter(|snp| counts[&snp.key] <= max_shared)
+                    .map(|snp| snp.snp)
+                    .collect();
+                (*reversed, edited)
+            }).collect()
         } else {
-            false
+            self.choose_strands(sequences).into_iter().map(|reversed| (reversed, Vec::new())).collect()
         };
-        let oriented: std::borrow::Cow<[u8]> = if reversed {
-            std::borrow::Cow::Owned(orientation::reverse_complement(sequence))
-        } else {
-            std::borrow::Cow::Borrowed(sequence)
-        };
-        let (dictionary, implicit) = crate::encode_sequence_flagged(&oriented, sbwt, lcs)?;
-        let color = self.add_path_with_flags(oriented.len(), &dictionary, &implicit);
-        self.reversed[color as usize] = reversed;
-        Ok(color)
+
+        type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>);
+        let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(&prepared).enumerate().map(|(i, (sequence, (reversed, edited)))| {
+            let mut oriented = if *reversed { orientation::reverse_complement(sequence) } else { sequence.to_vec() };
+            if edited.iter().any(|snp| oriented.get(snp.pos as usize) != Some(&snp.base)) {
+                return Err(format!("contig {} differs from the one its SNPs were called on", first_color + i))
+            }
+            for snp in edited {
+                oriented[snp.pos as usize] = snp.index_base;
+            }
+            let (dictionary, implicit) = crate::encode_sequence_flagged(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
+            Ok((oriented.len(), dictionary, implicit))
+        }).collect();
+
+        let mut colors = Vec::with_capacity(sequences.len());
+        for (encoded, (reversed, edited)) in encoded.into_iter().zip(prepared) {
+            let (len, dictionary, implicit) = encoded?;
+            let color = self.add_path_with_flags(len, &dictionary, &implicit);
+            self.reversed[color as usize] = reversed;
+            self.edited[color as usize] = edited;
+            colors.push(color);
+        }
+        Ok(colors)
     }
 
     fn insert_node(
@@ -379,6 +558,7 @@ impl GraphBuilder {
 
         self.paths.push(path);
         self.reversed.push(false);
+        self.edited.push(Vec::new());
         color
     }
 

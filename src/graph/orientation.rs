@@ -129,11 +129,42 @@ impl StrandChooser {
         &mut self,
         sequence: &[u8],
     ) -> bool {
-        let forward = sketch(sequence, self.sampling);
-        let reverse = sketch(&reverse_complement(sequence), self.sampling);
+        let sketches = self.sketch(sequence);
+        self.choose_sketched(sketches)
+    }
+
+    /// Sampled _k_-mers of both strands of `sequence`, for
+    /// [StrandChooser::choose_sketched].
+    ///
+    /// Does not depend on the strands chosen so far, so the sketches of
+    /// several contigs can be computed in parallel.
+    pub fn sketch(
+        &self,
+        sequence: &[u8],
+    ) -> StrandSketches {
+        StrandSketches {
+            forward: sketch(sequence, self.sampling),
+            reverse: sketch(&reverse_complement(sequence), self.sampling),
+        }
+    }
+
+    /// Same as [StrandChooser::choose] for a contig sketched with
+    /// [StrandChooser::sketch]. Contigs must be chosen in input order.
+    pub fn choose_sketched(
+        &mut self,
+        sketches: StrandSketches,
+    ) -> bool {
+        let StrandSketches { forward, reverse } = sketches;
         let shared = |hashes: &[u64]| hashes.iter().filter(|h| self.seen.contains(h)).count();
         let reversed = shared(&reverse) > shared(&forward);
         self.seen.extend(if reversed { reverse } else { forward });
         reversed
     }
 }
+
+/// Sampled _k_-mers of both strands of a contig, see [StrandChooser::sketch].
+pub struct StrandSketches {
+    forward: Vec<u64>,
+    reverse: Vec<u64>,
+}
+

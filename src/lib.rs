@@ -43,6 +43,9 @@ pub struct FileHeader {
     /// Size of the section that marks the reverse complemented contigs.
     pub strand_bytes: u32,
 
+    /// Size of the section with the edited SNPs.
+    pub snp_bytes: u32,
+
     pub n_queries: u32,
 
     pub contig_name_bytes: u64,
@@ -52,7 +55,7 @@ pub struct FileHeader {
     pub choice_bytes: u64,
 }
 
-pub const FILE_HEADER_BYTES: usize = 46;
+pub const FILE_HEADER_BYTES: usize = 50;
 
 #[derive(Encode, Decode)]
 pub struct BlockHeader {
@@ -79,6 +82,7 @@ pub fn encode_file_header(
     let header_placeholder = FileHeader{
         nlz_header: [0_u8; 6],
         strand_bytes: 0_u32,
+        snp_bytes: 0_u32,
         n_queries: 0_u32,
         contig_name_bytes: 0_u64,
         graph_bytes: 0_u64,
