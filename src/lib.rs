@@ -225,6 +225,31 @@ pub fn left_extend_kmer2(
     kmer
 }
 
+/// LCS array value of `colex_rank` computed from the SBWT: the length of the
+/// longest common suffix of the _k_-mers at `colex_rank` - 1 and
+/// `colex_rank` (0 for rank 0). Takes one step per common character.
+///
+/// Requires the select support of the SBWT.
+pub fn lcs_from_sbwt(
+    sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
+    colex_rank: usize,
+) -> usize {
+    if colex_rank == 0 {
+        return 0
+    }
+    let (mut a, mut b) = (colex_rank - 1, colex_rank);
+    for len in 0..sbwt.k() {
+        match (sbwt.inlabel(a), sbwt.inlabel(b)) {
+            (Some(x), Some(y)) if x == y => {
+                a = sbwt.inverse_lf_step(a).unwrap();
+                b = sbwt.inverse_lf_step(b).unwrap();
+            },
+            _ => return len,
+        }
+    }
+    sbwt.k()
+}
+
 /// Left extension of `kmer_start` as right extensions of its reverse complement.
 ///
 /// The predecessors of a _k_-mer are the reverse complements of the successors

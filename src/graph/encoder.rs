@@ -28,11 +28,12 @@ use std::io::Write;
 
 use blake3::Hash;
 use postcard::to_allocvec;
+use sbwt::LcsArray;
 
 type E = Box<dyn std::error::Error>;
 
 /// Encodes the output from [GraphBuilder](super::GraphBuilder).
-pub struct GraphEncoder {
+pub struct GraphEncoder<'a> {
     /// Stored graph
     graph: StoredGraph,
 
@@ -53,6 +54,9 @@ pub struct GraphEncoder {
 
     /// Edited SNPs
     snp_edits: Option<SnpEdits>,
+
+    /// LCS array of the index, for coding the suffix lengths per LCS context
+    lcs: Option<&'a LcsArray>,
 }
 
 /// Serializes an optional section, 0 bytes if absent.
@@ -67,7 +71,7 @@ fn optional_section<T: serde::Serialize>(
     }
 }
 
-impl GraphEncoder {
+impl<'a> GraphEncoder<'a> {
     pub fn new(
         graph: StoredGraph,
         choices: Choices,
@@ -80,6 +84,7 @@ impl GraphEncoder {
             file_ranges: None,
             reversed: None,
             snp_edits: None,
+            lcs: None,
         }
     }
 
@@ -116,6 +121,17 @@ impl GraphEncoder {
         reversed: Vec<bool>,
     ) -> Self {
         self.reversed = Some(reversed);
+        self
+    }
+
+    /// Code the suffix lengths of the graph per LCS context with the LCS array
+    /// of the index, see [collapsed](super::collapsed). Decoding the archive then
+    /// needs the LCS array or the SBWT, see [LcsSource](super::LcsSource).
+    pub fn with_lcs(
+        mut self,
+        lcs: &'a LcsArray,
+    ) -> Self {
+        self.lcs = Some(lcs);
         self
     }
 
@@ -184,7 +200,7 @@ impl GraphEncoder {
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;
-        let graph_bytes = to_allocvec(&self.graph)?;
+        let graph_bytes = self.graph.to_bytes(self.lcs)?;
         let choice_bytes = to_allocvec(&self.choices)?;
 
         let header = FileHeader{

@@ -24,7 +24,7 @@ use super::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
 use super::lzma_wrapper::{self, LzmaData};
-use super::StoredGraph;
+use super::{LcsSource, StoredGraph};
 
 use core::ops::Range;
 
@@ -142,15 +142,31 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     }
 
     /// Reads and decodes every section, see [DecodedSections].
+    ///
+    /// Fails for an archive written with the LCS array, see
+    /// [GraphDecoder::decode_from_read_with].
     pub fn decode_from_read(
         self,
+    ) -> Result<DecodedSections, E> {
+        self.decode_from_read_with(None)
+    }
+
+    /// Same as [GraphDecoder::decode_from_read]; `lcs` gives the LCS array
+    /// values needed if the archive was written with the LCS array
+    /// ([GraphEncoder::with_lcs](super::encoder::GraphEncoder::with_lcs)).
+    pub fn decode_from_read_with(
+        self,
+        lcs: Option<LcsSource>,
     ) -> Result<DecodedSections, E> {
         let header = self.file_header;
         let reader = self.reader;
 
         let file_ranges = read_section(reader, header.file_range_bytes as u64)?;
         let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
-        let graph: StoredGraph = read_required_section(reader, header.graph_bytes, "graph")?;
+        if header.graph_bytes == 0 {
+            return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
+        }
+        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs)?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;

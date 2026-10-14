@@ -679,6 +679,44 @@ fn take_edge(
     }
 }
 
+/// Source of LCS array values for decoding chains stored with LCS contexts,
+/// see [collapsed].
+#[derive(Clone, Copy)]
+pub enum LcsSource<'a> {
+    /// The LCS array of the index.
+    Array(&'a LcsArray),
+
+    /// Computed from the index with [crate::lcs_from_sbwt] (slower).
+    Sbwt(&'a SbwtIndexVariant),
+}
+
+impl LcsSource<'_> {
+    /// LCS array value of `colex_rank`.
+    pub fn lcs(
+        &self,
+        colex_rank: u32,
+    ) -> u32 {
+        match self {
+            LcsSource::Array(lcs) => lcs.access(colex_rank as usize) as u32,
+            LcsSource::Sbwt(SbwtIndexVariant::SubsetMatrix(sbwt)) => crate::lcs_from_sbwt(sbwt, colex_rank as usize) as u32,
+        }
+    }
+}
+
+/// Serialized form of [StoredGraph] (the same bytes as its serde form).
+#[derive(serde::Serialize)]
+enum StoredGraphRef<'a> {
+    Csr(&'a Csr<u32>),
+    Chains(collapsed::StoredChains),
+}
+
+/// Deserialized form of [StoredGraph] before the chains are decoded.
+#[derive(serde::Deserialize)]
+enum StoredGraphOwned {
+    Csr(Csr<u32>),
+    Chains(collapsed::StoredChains),
+}
+
 /// Stored graph, either as is or with linear chains collapsed.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum StoredGraph {
@@ -687,6 +725,42 @@ pub enum StoredGraph {
 }
 
 impl StoredGraph {
+    /// Serializes the graph. With `lcs`, the suffix lengths of collapsed
+    /// chains are coded per LCS context, see [collapsed]; reading them back
+    /// then needs an [LcsSource].
+    pub fn to_bytes(
+        &self,
+        lcs: Option<&LcsArray>,
+    ) -> Result<Vec<u8>, postcard::Error> {
+        let repr = match self {
+            StoredGraph::Csr(csr) => StoredGraphRef::Csr(csr),
+            StoredGraph::Chains(chains) => match lcs {
+                Some(lcs) => {
+                    let lookup = |rank: u32| lcs.access(rank as usize) as u32;
+                    StoredGraphRef::Chains(chains.to_stored_with(Some(&lookup), collapsed::LCS_CONTEXT_CAP))
+                },
+                None => StoredGraphRef::Chains(chains.to_stored()),
+            },
+        };
+        postcard::to_allocvec(&repr)
+    }
+
+    /// Reads a graph written by [StoredGraph::to_bytes]; `lcs` is needed if
+    /// it was written with the LCS array.
+    pub fn from_bytes(
+        bytes: &[u8],
+        lcs: Option<LcsSource>,
+    ) -> Result<Self, E> {
+        Ok(match postcard::from_bytes(bytes)? {
+            StoredGraphOwned::Csr(csr) => StoredGraph::Csr(csr),
+            StoredGraphOwned::Chains(stored) => {
+                let lookup = lcs.map(|source| move |rank: u32| source.lcs(rank));
+                let lookup: Option<collapsed::LcsLookup> = lookup.as_ref().map(|f| f as collapsed::LcsLookup);
+                StoredGraph::Chains(ChainCsr::from_stored_with(stored, lookup)?)
+            },
+        })
+    }
+
     /// Uncollapsed graph.
     pub fn into_csr(self) -> Csr<u32> {
         match self {
