@@ -14,7 +14,6 @@
 
 use crate::graph::ColexGraphEdge;
 
-use eframe::CreationContext;
 use egui::CentralPanel;
 use egui_graphs::Graph;
 use petgraph::prelude::StableGraph;
@@ -43,7 +42,7 @@ fn compress_linear_chains(
     }
 
     // Helper closure to map old graph node indices to the new compressed graph indices
-    let mut get_or_create = |orig: NodeIndex, comp: &mut petgraph::Graph<u32, Vec<ColexGraphEdge>>, map: &mut HashMap<NodeIndex, NodeIndex>| -> NodeIndex {
+    let get_or_create = |orig: NodeIndex, comp: &mut petgraph::Graph<u32, Vec<ColexGraphEdge>>, map: &mut HashMap<NodeIndex, NodeIndex>| -> NodeIndex {
         *map.entry(orig).or_insert_with(|| comp.add_node(g[orig].clone()))
     };
 
@@ -85,7 +84,6 @@ impl BasicApp {
     pub fn new(
         graph: petgraph::Graph<u32, ColexGraphEdge>,
         color: u32,
-        cc: &CreationContext<'_>,
     ) -> Self {
 
         let filtered_edges = graph.edge_references()
@@ -99,7 +97,7 @@ impl BasicApp {
 
 
         let compressed = compress_linear_chains(&filtered_graph);
-        let mut stable_g: StableGraph<u32, Vec<ColexGraphEdge>> = StableGraph::from(compressed);
+        let stable_g: StableGraph<u32, Vec<ColexGraphEdge>> = StableGraph::from(compressed);
         let g = Graph::from(&stable_g);
         Self { g }
     }
@@ -111,7 +109,7 @@ type HState = LayoutStateHierarchical;
 
 impl eframe::App for BasicApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        CentralPanel::default().show_inside(ui, |ui| {
+        CentralPanel::default().show(ui, |ui| {
             // Render the interactive graph view
             GraphView::<HState, HLayout>::new()
                 .with_navigations(&egui_graphs::SettingsNavigation::default()

@@ -499,7 +499,6 @@ fn main() {
             color,
         }) => {
             init_log(2);
-            let mut stdout = BufWriter::new(std::io::stdout());
 
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
@@ -518,16 +517,16 @@ fn main() {
             let colors: Vec<u32> = (0..header.n_queries).collect();
 
             let native_options = eframe::NativeOptions::default();
-            eframe::run_native(
+            let ret = eframe::run_native(
                 "Interactive Graph Viewer",
                 native_options,
-                Box::new(|cc| Ok(Box::new
+                Box::new(|_| Ok(Box::new
                                  (ntcomp::graphview::BasicApp::new(
                                      graph,
                                      colors[*color],
-                                     cc,
                                  )))),
             );
+            ret.unwrap();
         },
         None => {},
     }
