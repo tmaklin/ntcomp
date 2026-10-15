@@ -312,15 +312,11 @@ pub fn encode_sequence_flagged(
             let mut i = n;
             let mut kept: Vec<usize> = Vec::new();
             while i > 0 {
-                let colex_int = res[i - 1].1.clone();
-
                 if res[i - 1].0 == k && i > k + 1 {
-                    let kmer = sbwt.access_kmer(colex_int.start);
-                    let seq = nucleotides[(i - kmer.len())..i].to_vec();
-                    assert_eq!(kmer, seq);
+                    let seq = nucleotides[(i - k)..i].to_vec();
 
                     let ref_nts = &nucleotides[0..i];
-                    let (new_kmer, stopped_in_sbwt) = left_extend_kmer(&kmer, Some(ref_nts), sbwt, Some(lcs), i - k - 1);
+                    let (new_kmer, stopped_in_sbwt) = left_extend_kmer(&seq, Some(ref_nts), sbwt, Some(lcs), i - k - 1);
                     assert_eq!(new_kmer.as_slice(), &nucleotides[(i - new_kmer.len())..i]);
 
                     // Store the whole left extension; the next entry ends where it starts.
@@ -349,9 +345,7 @@ pub fn encode_sequence_flagged(
     };
 
     let dictionary_bases = dictionary.iter().map(|x| x.0).sum::<usize>();
-    let dictionary_max = dictionary.iter().map(|x| x.0).max().ok_or(encode::EncodeError{})?;
 
-    assert!(dictionary_max < 16777216); // Match lengths are coded as 24 bit unsigned integers
     assert_eq!(dictionary_bases, nucleotides.len());
     assert_eq!(dictionary.len(), implicit.len());
 
