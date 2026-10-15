@@ -18,7 +18,7 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:csv", "dep:indicatif", "dep:log", "dep:needletail", "dep:stderrlog"]
+cli = ["dep:clap", "dep:csv", "dep:indicatif", "dep:log", "dep:needletail", "dep:stderrlog", "dep:petgraph"]
 graph-view = ["cli", "dep:egui", "dep:eframe", "dep:egui_graphs"]
 
 [dependencies]
@@ -38,7 +38,6 @@ rayon = "1.12"
 
 ## graph
 blake3 = {version = "1.8", features = ["serde"] }
-petgraph = { version = "0.8", features = ["serde-1"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
 lzma-rust2 = { version = "0.22", default-features = false, features = ["std", "encoder", "optimization"] }
 serde = "1"
@@ -54,6 +53,7 @@ csv = { version = "1", optional = true }
 indicatif = { version = "0.18", optional = true }
 log = { version = "0.4", optional = true }
 needletail = { version = "0.6", default-features = false, features = ["flate2"], optional = true }
+petgraph = { version = "0.8", features = ["serde-1"], optional = true }
 stderrlog = { version = "0.6", optional = true }
 
 [dev-dependencies]

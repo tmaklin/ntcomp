@@ -52,10 +52,13 @@ use indexmap::IndexSet;
 
 use rayon::prelude::*;
 
-use petgraph::EdgeType;
-use petgraph::graph::{
-    Graph,
-    NodeIndex,
+#[cfg(feature = "graph-view")]
+use petgraph::{
+    EdgeType,
+    graph::{
+        Graph,
+        NodeIndex,
+    },
 };
 
 use sbwt::LcsArray;
@@ -873,6 +876,7 @@ impl<N> Csr<N> {
     }
 
     /// Converts to a petgraph graph with `colorsets` from [Csr::colorsets] as the edge colours.
+    #[cfg(feature = "graph-view")]
     pub fn to_petgraph<Ty: EdgeType>(
         self,
         colorsets: &[Vec<u32>],
