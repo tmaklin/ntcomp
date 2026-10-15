@@ -23,15 +23,10 @@ graph-view = ["dep:egui", "dep:eframe", "dep:egui_graphs"]
 ## core
 bincode = { version = "2", features = ["serde"] }
 bitnuc = "0.2"
-csv = "1"
 dsi-bitstream = "0.8"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-iter-read = "1.1"
-kbo = "0.5.2"
-log = "0.4"
-needletail = { version = "0.6", default-features = false, features = ["flate2"] }
+kbo = { path = "vendor/kbo", version = "0.5.2" }
 sbwt = "=0.6.2"
-stderrlog = "0.6"
 
 ## collection
 indexmap = "2.14"
@@ -54,7 +49,11 @@ egui_graphs = { version = "0.32", optional = true }
 
 ## cli
 clap = { version = "4", features = ["derive"]}
+csv = "1"
 indicatif = "0.18"
+log = "0.4"
+needletail = { version = "0.6", default-features = false, features = ["flate2"] }
+stderrlog = "0.6"
 
 [dev-dependencies]
 random = "0.14"
@@ -62,5 +61,5 @@ random = "0.14"
 [profile.release]
 debug = true
 strip = false
-lto = true
-codegen-units = 1
+## lto = true
+## codegen-units = 1
