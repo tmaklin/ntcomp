@@ -126,11 +126,13 @@ pub fn decode_block_header(
     Ok(decode_from_slice(header_bytes, bincode::config::standard().with_fixed_int_encoding())?.0)
 }
 
-/// Left extends `kmer_start` while the extension is unique in the SBWT and
-/// matches `ref_nts`, by at most `max_extension_len` characters.
+/// Left extends `kmer_start` while the extension is unique in the SBWT, by at
+/// most `max_extension_len` characters.
+///
+/// If `ref_nts` is given, also checks that the extension matches `ref_nts`.
 ///
 /// Returns the extended k-mer and whether the extension stopped because the
-/// SBWT has no unique left extension, i.e. where [left_extend_kmer2] stops as
+/// SBWT has no unique left extension, i.e. where [left_extend_kmer] stops as
 /// well. False if it stopped because of a mismatch with `ref_nts` or because
 /// `max_extension_len` was reached.
 ///
@@ -141,15 +143,17 @@ pub fn decode_block_header(
 /// them), and gives the same result as without `lcs`.
 pub fn left_extend_kmer(
     kmer_start: &[u8],
-    ref_nts: &[u8],
+    ref_nts: Option<&[u8]>,
     sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
     lcs: Option<&LcsArray>,
     max_extension_len: usize,
 ) -> (Vec<u8>, bool) {
     assert!(!kmer_start.is_empty());
-    assert!(!ref_nts.is_empty());
+    if let Some(ref_nts) = ref_nts {
+        assert!(!ref_nts.is_empty());
+    }
 
-    if let Some(extended) = lcs.and_then(|lcs| left_extend_rc(kmer_start, Some(ref_nts), sbwt, lcs, max_extension_len)) {
+    if let Some(extended) = lcs.and_then(|lcs| left_extend_rc(kmer_start, ref_nts, sbwt, lcs, max_extension_len)) {
         return extended;
     }
 
@@ -168,7 +172,13 @@ pub fn left_extend_kmer(
         }).collect();
         if !new_kmers.is_empty() {
             let unique = new_kmers.len() == 1 && new_kmers[0].1.end - new_kmers[0].1.start == 1;
-            let seq_matches = new_kmers[0].0[0] == ref_nts[ref_nts.len() - kmer.len() - 1];
+
+            let seq_matches = if let Some(ref_nts) = ref_nts {
+                new_kmers[0].0[0] == ref_nts[ref_nts.len() - kmer.len() - 1]
+            } else {
+                true
+            };
+
             if seq_matches && unique {
                 kmer = [&[new_kmers[0].0[0]], kmer.as_slice()].concat();
             } else {
@@ -182,49 +192,6 @@ pub fn left_extend_kmer(
         left_extension_len += 1;
     }
     (kmer, stopped_in_sbwt)
-}
-
-/// Left extends `kmer_start` while the extension is unique in the SBWT, by at
-/// most `max_extension_len` characters.
-///
-/// If `lcs` is given, uses right extensions of the reverse complement like
-/// [left_extend_kmer].
-pub fn left_extend_kmer2(
-    kmer_start: &[u8],
-    sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
-    lcs: Option<&LcsArray>,
-    max_extension_len: usize,
-) -> Vec<u8> {
-    assert!(!kmer_start.is_empty());
-
-    if let Some((extended, _)) = lcs.and_then(|lcs| left_extend_rc(kmer_start, None, sbwt, lcs, max_extension_len)) {
-        return extended;
-    }
-
-    let mut left_extension_len = 0;
-    let mut kmer = kmer_start.to_vec();
-    while left_extension_len < max_extension_len {
-        let new_kmers: Vec<(Vec<u8>, Range<usize>)> = sbwt.alphabet().iter().filter_map(|c| {
-            let new_kmer: Vec<u8> = [&[*c], &kmer[0..(kmer.len() - (left_extension_len + 1))]].concat();
-            let res = sbwt.search(&new_kmer);
-            if res.as_ref().is_some() {
-                Some((new_kmer, res.unwrap()))
-            } else {
-                None
-            }
-        }).collect();
-        if !new_kmers.is_empty() {
-            if new_kmers.len() == 1 && new_kmers[0].1.end - new_kmers[0].1.start == 1 {
-                kmer = [&[new_kmers[0].0[0]], kmer.as_slice()].concat();
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-        left_extension_len += 1;
-    }
-    kmer
 }
 
 /// LCS array value of `colex_rank` computed from the SBWT: the length of the
@@ -263,7 +230,7 @@ pub fn lcs_from_sbwt(
 /// that group, found with the `lcs` array.
 ///
 /// Stops under the same conditions as [left_extend_kmer] (with `ref_nts`) or
-/// [left_extend_kmer2] (without) and returns the same values. Returns None if
+/// [left_extend_kmer] (without) and returns the same values. Returns None if
 /// the reverse complement of `kmer_start` is not in the SBWT.
 fn left_extend_rc(
     kmer_start: &[u8],
@@ -327,7 +294,7 @@ pub fn encode_sequence(
 
 /// Same as [encode_sequence], but also returns for every dictionary entry
 /// whether its suffix length is *implicit*: the entry is a left extended k-mer
-/// whose extension stopped where [left_extend_kmer2] stops as well, so the
+/// whose extension stopped where [left_extend_kmer] stops as well, so the
 /// decoder can recover the length by extending the k-mer as far as possible.
 pub fn encode_sequence_flagged(
     nucleotides: &[u8],
@@ -353,7 +320,7 @@ pub fn encode_sequence_flagged(
                     assert_eq!(kmer, seq);
 
                     let ref_nts = &nucleotides[0..i];
-                    let (new_kmer, stopped_in_sbwt) = left_extend_kmer(&kmer, ref_nts, sbwt, Some(lcs), i - k - 1);
+                    let (new_kmer, stopped_in_sbwt) = left_extend_kmer(&kmer, Some(ref_nts), sbwt, Some(lcs), i - k - 1);
                     assert_eq!(new_kmer.as_slice(), &nucleotides[(i - new_kmer.len())..i]);
 
                     // Store the whole left extension; the next entry ends where it starts.
@@ -446,7 +413,7 @@ pub fn decode_sequence(
 
                     let kmer = if suffix_len > k as u32 {
                         let kmer = sbwt.access_kmer(colex_rank as usize);
-                        let new_kmer = left_extend_kmer2(&kmer, sbwt, None, (suffix_len - k as u32) as usize);
+                        let (new_kmer, _) = left_extend_kmer(&kmer, None, sbwt, None, (suffix_len - k as u32) as usize);
                         assert_eq!(new_kmer.len(), suffix_len as usize);
                         new_kmer
                     } else {
@@ -519,7 +486,7 @@ pub fn decode_positions(
                     colex = Some(colex_rank);
                     let kmer = if suffix_len > k as u32 {
                         let kmer = sbwt.access_kmer(colex_rank as usize);
-                        let new_kmer = left_extend_kmer2(&kmer, sbwt, None, (suffix_len - k as u32) as usize);
+                        let (new_kmer, _) = left_extend_kmer(&kmer, None, sbwt, None, (suffix_len - k as u32) as usize);
                         assert_eq!(new_kmer.len(), suffix_len as usize);
                         encoding_type = 1;
                         new_kmer
@@ -646,11 +613,11 @@ mod tests {
             for end in k..=seq.len() {
                 let kmer = &seq[end - k..end];
                 let max = end - k;
-                let plain = left_extend_kmer2(kmer, sbwt, None, max);
-                assert_eq!(left_extend_kmer2(kmer, sbwt, Some(&lcs), max), plain);
+                let (plain, _) = left_extend_kmer(kmer, None, sbwt, None, max);
+                assert_eq!(left_extend_kmer(kmer, None, sbwt, Some(&lcs), max).0, plain);
                 if end > k {
                     let ref_nts = &seq[..end];
-                    assert_eq!(left_extend_kmer(kmer, ref_nts, sbwt, Some(&lcs), max), left_extend_kmer(kmer, ref_nts, sbwt, None, max));
+                    assert_eq!(left_extend_kmer(kmer, Some(ref_nts), sbwt, Some(&lcs), max), left_extend_kmer(kmer, Some(ref_nts), sbwt, None, max));
                 }
                 n_extended += (plain.len() > k) as usize;
             }

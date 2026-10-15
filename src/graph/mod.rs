@@ -115,7 +115,7 @@ pub trait Walkable {
 ///
 pub enum SuffixLen {
     /// The dictionary entry is a left extended _k_-mer whose extension stopped
-    /// where [crate::left_extend_kmer2] stops, so [decode_path] recovers the
+    /// where [crate::left_extend_kmer] stops, so [decode_path] recovers the
     /// length by extending the _k_-mer as far as possible.
     Implicit,
 
@@ -165,12 +165,12 @@ pub fn decode_path(
                 let (kmer, len) = match suffix_len {
                     SuffixLen::Implicit => {
                         // The encoder extends at most end - k - 1 characters.
-                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, lcs, end.saturating_sub(k + 1));
+                        let (new_kmer, _) = crate::left_extend_kmer(&kmer, None, sbwt, lcs, end.saturating_sub(k + 1));
                         let len = new_kmer.len();
                         (new_kmer, len)
                     },
                     SuffixLen::Explicit { suffix_len: len } => {
-                        let new_kmer = crate::left_extend_kmer2(&kmer, sbwt, lcs, (len - k as u32) as usize);
+                        let (new_kmer, _) = crate::left_extend_kmer(&kmer, None, sbwt, lcs, (len - k as u32) as usize);
                         assert_eq!(new_kmer.len(), len as usize);
                         (new_kmer, len as usize)
                     },
