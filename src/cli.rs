@@ -158,4 +158,19 @@ pub enum Commands {
         index_prefix: Option<String>,
 
     },
+    // Interactive graph visualization for Graph output
+        #[cfg(feature = "graph-view")]
+        GraphView {
+        // Inputs
+        // // Input fasta or fastq query file(s)
+        #[arg(group = "input", required = true, help = "File with encoded fastX data.")]
+        input_path: PathBuf,
+
+        // // Prebuilt index
+        #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
+        index_prefix: Option<String>,
+
+        #[arg(long = "color", required = true, help = "Color to plot")]
+        color: usize,
+    },
 }

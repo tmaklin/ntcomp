@@ -24,6 +24,8 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 pub mod encode;
 pub mod decode;
 pub mod graph;
+#[cfg(feature = "graph-view")]
+pub mod graphview;
 
 type E = Box<dyn std::error::Error>;
 

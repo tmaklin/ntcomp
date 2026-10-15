@@ -494,6 +494,43 @@ fn main() {
 
             let _ = stdout.flush();
         },
+        #[cfg(feature = "graph-view")]
+        Some(cli::Commands::GraphView {
+            input_path,
+            index_prefix,
+            color,
+        }) => {
+            init_log(2);
+            let mut stdout = BufWriter::new(std::io::stdout());
+
+            let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+
+            let mut input = std::io::BufReader::new(File::open(&input_path).unwrap());
+            let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
+            let header = decoder.header();
+            let (stored_graph, choices, _hashes, _contig_names, _file_ranges, _reversed, _snp_edits) = decoder.decode_from_read_with_index(&sbwt, Some(&lcs)).unwrap();
+
+            // Colour sets are not stored, recover them by walking every colour.
+            let graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = {
+                let csr = stored_graph.into_csr();
+                let colorsets = csr.colorsets(&choices, header.n_queries).unwrap();
+                csr.to_petgraph(&colorsets)
+            };
+
+            let colors: Vec<u32> = (0..header.n_queries).collect();
+
+            let native_options = eframe::NativeOptions::default();
+            eframe::run_native(
+                "Interactive Graph Viewer",
+                native_options,
+                Box::new(|cc| Ok(Box::new
+                                 (ntcomp::graphview::BasicApp::new(
+                                     graph,
+                                     colors[*color],
+                                     cc,
+                                 )))),
+            );
+        },
         None => {},
     }
 }
