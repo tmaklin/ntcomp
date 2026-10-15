@@ -149,18 +149,6 @@ pub fn call_snps(
     snps_from_variants(sequence, variants).into_iter().map(|snp| CalledSnp { snp, key: key(sequence, &snp) }).collect()
 }
 
-/// `sequence` with the index's base at every SNP.
-pub fn edit(
-    sequence: &[u8],
-    snps: &[Snp],
-) -> Vec<u8> {
-    let mut edited = sequence.to_vec();
-    for snp in snps {
-        edited[snp.pos as usize] = snp.index_base;
-    }
-    edited
-}
-
 /// Error from reading the stored SNPs.
 #[derive(Debug)]
 pub struct SnpDecodeError(pub String);
@@ -343,6 +331,18 @@ mod tests {
 
     fn snp(pos: u32, base: u8, index_base: u8) -> Snp {
         Snp { pos, base, index_base }
+    }
+
+    /// `sequence` with the index's base at every SNP.
+    fn edit(
+        sequence: &[u8],
+        snps: &[Snp],
+    ) -> Vec<u8> {
+        let mut edited = sequence.to_vec();
+        for snp in snps {
+            edited[snp.pos as usize] = snp.index_base;
+        }
+        edited
     }
 
     #[test]
