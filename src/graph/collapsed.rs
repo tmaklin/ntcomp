@@ -54,19 +54,21 @@
 //! Every other suffix length is a symbol of a canonical Huffman code, in
 //! chain order:
 //! - 0: the length is implicit, see [SuffixLen::Implicit](super::SuffixLen),
-//! - 1..=255: the length itself,
-//! - 256: a longer length, followed by the length - 255 (Elias gamma code).
+//! - 1..=D: the length itself,
+//! - D + 1: a longer length, followed by the length - D (Elias gamma code),
+//!
+//! where D = max(_k_, [MIN_DIRECT_SUFFIX_LEN]) (see [max_direct_suffix_len]),
+//! with _k_ taken from the SBWT when the graph is stored or read with the
+//! index, so every short entry (< _k_) has its own symbol. Without the index D
+//! is [MIN_DIRECT_SUFFIX_LEN], the same as for any _k_ ≤ 255.
 //!
 //! Without the LCS array there is one code for all edges. With it, there is
-//! one code per context min(LCS(r), [LCS_CONTEXT_CAP]), where r is the colex
+//! one code per context min(LCS(r), D), where r is the colex
 //! rank of the edge's source node: a short entry's rank is the start of the
 //! SBWT interval of its suffix, so its length is always larger than LCS(r),
 //! often by one. The code lengths of all contexts are LZMA compressed. The
 //! decoder takes LCS(r) from the LCS array or computes it from the SBWT with
 //! [crate::lcs_from_sbwt].
-//!
-//! TODO Do not hardcode 255 as the maximum length -- this value should be taken
-//! from the SBWT as it is equal to the _k_-mer length used.
 //!
 use super::{
     Csr,
@@ -82,23 +84,18 @@ use super::{
 use super::bits::{BitReader, BitWriter};
 use super::huffman::HuffmanCode;
 
-/// Longest suffix length that is its own Huffman symbol.
-///
-/// This is equal to the value of `k` from the SBWT that was used to generate
-/// the graph.
-///
-/// TODO Should be stored somewhere instead of being hardcoded here.
-///
-const MAX_DIRECT_SUFFIX_LEN: u32 = 255;
-/// Huffman symbol for longer suffix lengths, followed by the length in Elias gamma.
-///
-/// TODO Infer from MAX_DIRECT_SUFFIX_LEN once it's stored inside this graph.
-///
-const LONG_SUFFIX_SYMBOL: usize = MAX_DIRECT_SUFFIX_LEN as usize + 1;
+/// Smallest number of suffix lengths with their own Huffman symbol: lengths
+/// up to this are coded directly even when _k_ is smaller (left extensions
+/// longer than _k_ code better directly than escaped).
+pub const MIN_DIRECT_SUFFIX_LEN: u32 = 255;
 
-/// Largest LCS context of the suffix length codes; LCS values are below _k_,
-/// so with _k_ = 255 every value has its own code.
-pub const LCS_CONTEXT_CAP: u32 = MAX_DIRECT_SUFFIX_LEN;
+/// Longest suffix length with its own Huffman symbol for _k_-mer size `k`
+/// (None: unknown), see the module docs. Also the cap of the LCS contexts.
+pub fn max_direct_suffix_len(
+    k: Option<u32>,
+) -> u32 {
+    k.unwrap_or(0).max(MIN_DIRECT_SUFFIX_LEN)
+}
 
 /// LCS array value of a colex rank, see [super::LcsSource].
 pub type LcsLookup<'a> = &'a (dyn Fn(u32) -> u32 + Sync);
@@ -291,7 +288,7 @@ impl ChainCsr {
     pub fn to_stored(
         &self,
     ) -> StoredChains {
-        self.to_stored_with(None, 0)
+        self.to_stored_with(None, 0, None)
     }
 
     /// Colex rank of the source of every edge, in chain order (the junction
@@ -312,13 +309,17 @@ impl ChainCsr {
 
     /// Same as [ChainCsr::to_stored], with one suffix length code per LCS
     /// value of the edge's source rank (capped at `lcs_cap`) if `lcs` gives
-    /// the LCS array value of a colex rank, see the module docs.
+    /// the LCS array value of a colex rank, and direct suffix length symbols
+    /// for _k_-mer size `k`, see the module docs.
     pub fn to_stored_with(
         &self,
         lcs: Option<LcsLookup>,
         lcs_cap: u32,
+        k: Option<u32>,
     ) -> StoredChains {
         let lcs_cap = if lcs.is_some() { lcs_cap.max(1) } else { 0 };
+        let max_direct = max_direct_suffix_len(k);
+        let long_symbol = max_direct as usize + 1;
         let n_junctions = self.junction_weights.len();
 
         let mut out_degrees = BitWriter::new();
@@ -363,15 +364,15 @@ impl ChainCsr {
                     continue;
                 }
                 let context = if lcs_cap > 0 { lcs.unwrap()(source).min(lcs_cap) as usize } else { 0 };
-                if len > MAX_DIRECT_SUFFIX_LEN {
-                    symbols.push((context, LONG_SUFFIX_SYMBOL, len));
+                if len > max_direct {
+                    symbols.push((context, long_symbol, len));
                 } else {
                     symbols.push((context, len as usize, len));
                 }
             }
         }
         let n_contexts = lcs_cap as usize + 1;
-        let mut counts = vec![vec![0_u64; LONG_SUFFIX_SYMBOL + 1]; n_contexts];
+        let mut counts = vec![vec![0_u64; long_symbol + 1]; n_contexts];
         for &(context, symbol, _) in &symbols {
             counts[context][symbol] += 1;
         }
@@ -379,8 +380,8 @@ impl ChainCsr {
         let mut suffix_lens = BitWriter::new();
         for &(context, symbol, len) in &symbols {
             codes[context].write(symbol, &mut suffix_lens);
-            if symbol == LONG_SUFFIX_SYMBOL {
-                suffix_lens.write_gamma((len - MAX_DIRECT_SUFFIX_LEN) as u64);
+            if symbol == long_symbol {
+                suffix_lens.write_gamma((len - max_direct) as u64);
             }
         }
         let suffix_code = if lcs_cap == 0 {
@@ -416,15 +417,19 @@ impl ChainCsr {
     pub fn from_stored(
         stored: StoredChains,
     ) -> Result<Self, GraphDecodeError> {
-        Self::from_stored_with(stored, None)
+        Self::from_stored_with(stored, None, None)
     }
 
     /// Same as [ChainCsr::from_stored]; `lcs` must give the LCS array value
-    /// of a colex rank if the chains were stored with LCS contexts.
+    /// of a colex rank if the chains were stored with LCS contexts, and `k`
+    /// must be the _k_-mer size they were stored with (None for _k_ ≤ 255).
     pub fn from_stored_with(
         stored: StoredChains,
         lcs: Option<LcsLookup>,
+        k: Option<u32>,
     ) -> Result<Self, GraphDecodeError> {
+        let max_direct = max_direct_suffix_len(k);
+        let long_symbol = max_direct as usize + 1;
         let truncated = |what: &str| GraphDecodeError(format!("stored chains: {} truncated or invalid", what));
         let n_junctions = stored.n_junctions as usize;
         if n_junctions < 2 {
@@ -468,14 +473,17 @@ impl ChainCsr {
         }
         let lcs_cap = stored.lcs_cap as u32;
         let codes: Vec<HuffmanCode> = if lcs_cap == 0 {
+            if stored.suffix_code.len() != long_symbol + 1 {
+                return Err(GraphDecodeError(format!("stored chains: suffix code for {} symbols, expected {} (stored with another k?)", stored.suffix_code.len(), long_symbol + 1)))
+            }
             vec![HuffmanCode::from_lengths(stored.suffix_code).map_err(|e| GraphDecodeError(format!("stored chains: {}", e)))?]
         } else {
             let lzma: super::lzma_wrapper::LzmaData = postcard::from_bytes(&stored.suffix_code).map_err(|_| truncated("suffix codes"))?;
             let lengths = super::lzma_wrapper::decompress(&lzma).map_err(|_| truncated("suffix codes"))?;
-            if lengths.len() != (lcs_cap as usize + 1) * (LONG_SUFFIX_SYMBOL + 1) {
+            if lengths.len() != (lcs_cap as usize + 1) * (long_symbol + 1) {
                 return Err(truncated("suffix codes"))
             }
-            lengths.chunks(LONG_SUFFIX_SYMBOL + 1).map(|l| HuffmanCode::from_lengths(l.to_vec())).collect::<Result<_, _>>().map_err(|e| GraphDecodeError(format!("stored chains: {}", e)))?
+            lengths.chunks(long_symbol + 1).map(|l| HuffmanCode::from_lengths(l.to_vec())).collect::<Result<_, _>>().map_err(|e| GraphDecodeError(format!("stored chains: {}", e)))?
         };
         let lcs = match (lcs_cap, lcs) {
             (0, _) => None,
@@ -503,11 +511,11 @@ impl ChainCsr {
                     },
                 };
                 let len = match code.read(&mut bits).ok_or_else(|| truncated("suffix lengths"))? {
-                    LONG_SUFFIX_SYMBOL => {
-                        let long = bits.read_gamma().ok_or_else(|| truncated("suffix lengths"))? + MAX_DIRECT_SUFFIX_LEN as u64;
+                    symbol if symbol == long_symbol => {
+                        let long = bits.read_gamma().ok_or_else(|| truncated("suffix lengths"))? + max_direct as u64;
                         long.try_into().map_err(|_| truncated("suffix lengths"))?
                     },
-                    symbol if symbol < LONG_SUFFIX_SYMBOL => symbol as u32,
+                    symbol if symbol < long_symbol => symbol as u32,
                     _ => return Err(truncated("suffix lengths")),
                 };
                 suffix_lens.push(len);

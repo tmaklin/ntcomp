@@ -26,6 +26,9 @@ use super::snps::SnpEdits;
 use super::lzma_wrapper::{self, LzmaData};
 use super::{LcsSource, StoredGraph};
 
+use sbwt::LcsArray;
+use sbwt::sbwt_index_variant::SbwtIndexVariant;
+
 use core::ops::Range;
 
 use std::io::Read;
@@ -148,15 +151,33 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     pub fn decode_from_read(
         self,
     ) -> Result<DecodedSections, E> {
-        self.decode_from_read_with(None)
+        self.decode_from_read_with(None, None)
+    }
+
+    /// Same as [GraphDecoder::decode_from_read] for an archive written with
+    /// [GraphEncoder::with_index](super::encoder::GraphEncoder::with_index):
+    /// the _k_-mer size comes from `sbwt`, and the LCS values from `lcs` if
+    /// given, else they are computed from `sbwt` (slower).
+    pub fn decode_from_read_with_index(
+        self,
+        sbwt: &SbwtIndexVariant,
+        lcs: Option<&LcsArray>,
+    ) -> Result<DecodedSections, E> {
+        let SbwtIndexVariant::SubsetMatrix(index) = sbwt;
+        let source = match lcs {
+            Some(lcs) => LcsSource::Array(lcs),
+            None => LcsSource::Sbwt(sbwt),
+        };
+        self.decode_from_read_with(Some(source), Some(index.k().try_into()?))
     }
 
     /// Same as [GraphDecoder::decode_from_read]; `lcs` gives the LCS array
-    /// values needed if the archive was written with the LCS array
-    /// ([GraphEncoder::with_lcs](super::encoder::GraphEncoder::with_lcs)).
+    /// values needed if the archive was written with the LCS array, and `k`
+    /// the _k_-mer size it was written with (None works for _k_ ≤ 255).
     pub fn decode_from_read_with(
         self,
         lcs: Option<LcsSource>,
+        k: Option<u32>,
     ) -> Result<DecodedSections, E> {
         let header = self.file_header;
         let reader = self.reader;
@@ -166,7 +187,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
-        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs)?;
+        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs, k)?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;

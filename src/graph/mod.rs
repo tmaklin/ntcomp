@@ -727,36 +727,41 @@ pub enum StoredGraph {
 impl StoredGraph {
     /// Serializes the graph. With `lcs`, the suffix lengths of collapsed
     /// chains are coded per LCS context, see [collapsed]; reading them back
-    /// then needs an [LcsSource].
+    /// then needs an [LcsSource]. `k` is the _k_-mer size of the index (None
+    /// if unknown), which sets the direct suffix length symbols, see
+    /// [collapsed::max_direct_suffix_len].
     pub fn to_bytes(
         &self,
         lcs: Option<&LcsArray>,
+        k: Option<u32>,
     ) -> Result<Vec<u8>, postcard::Error> {
         let repr = match self {
             StoredGraph::Csr(csr) => StoredGraphRef::Csr(csr),
             StoredGraph::Chains(chains) => match lcs {
                 Some(lcs) => {
                     let lookup = |rank: u32| lcs.access(rank as usize) as u32;
-                    StoredGraphRef::Chains(chains.to_stored_with(Some(&lookup), collapsed::LCS_CONTEXT_CAP))
+                    StoredGraphRef::Chains(chains.to_stored_with(Some(&lookup), collapsed::max_direct_suffix_len(k), k))
                 },
-                None => StoredGraphRef::Chains(chains.to_stored()),
+                None => StoredGraphRef::Chains(chains.to_stored_with(None, 0, k)),
             },
         };
         postcard::to_allocvec(&repr)
     }
 
     /// Reads a graph written by [StoredGraph::to_bytes]; `lcs` is needed if
-    /// it was written with the LCS array.
+    /// it was written with the LCS array, and `k` must be the _k_-mer size it
+    /// was written with (None works for _k_ ≤ 255).
     pub fn from_bytes(
         bytes: &[u8],
         lcs: Option<LcsSource>,
+        k: Option<u32>,
     ) -> Result<Self, E> {
         Ok(match postcard::from_bytes(bytes)? {
             StoredGraphOwned::Csr(csr) => StoredGraph::Csr(csr),
             StoredGraphOwned::Chains(stored) => {
                 let lookup = lcs.map(|source| move |rank: u32| source.lcs(rank));
                 let lookup: Option<collapsed::LcsLookup> = lookup.as_ref().map(|f| f as collapsed::LcsLookup);
-                StoredGraph::Chains(ChainCsr::from_stored_with(stored, lookup)?)
+                StoredGraph::Chains(ChainCsr::from_stored_with(stored, lookup, k)?)
             },
         })
     }

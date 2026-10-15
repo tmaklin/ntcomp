@@ -351,7 +351,7 @@ fn main() {
 
                 let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
                 let header = decoder.header();
-                let (graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits) = decoder.decode_from_read_with(Some(ntcomp::graph::LcsSource::Array(&lcs))).unwrap();
+                let (graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits) = decoder.decode_from_read_with_index(&sbwt, Some(&lcs)).unwrap();
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
@@ -483,7 +483,7 @@ fn main() {
                     .with_contig_names(contig_names)
                     .with_file_ranges(file_ranges)
                     .with_reversed(reversed)
-                    .with_lcs(&lcs);
+                    .with_index(&sbwt, &lcs);
                 if let Some(snp_edits) = snp_edits {
                     encoder = encoder.with_snp_edits(snp_edits);
                 }

@@ -29,6 +29,7 @@ use std::io::Write;
 use blake3::Hash;
 use postcard::to_allocvec;
 use sbwt::LcsArray;
+use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 type E = Box<dyn std::error::Error>;
 
@@ -57,6 +58,9 @@ pub struct GraphEncoder<'a> {
 
     /// LCS array of the index, for coding the suffix lengths per LCS context
     lcs: Option<&'a LcsArray>,
+
+    /// _k_-mer size of the index, for the direct suffix length symbols
+    k: Option<u32>,
 }
 
 /// Serializes an optional section, 0 bytes if absent.
@@ -85,6 +89,7 @@ impl<'a> GraphEncoder<'a> {
             reversed: None,
             snp_edits: None,
             lcs: None,
+            k: None,
         }
     }
 
@@ -124,14 +129,19 @@ impl<'a> GraphEncoder<'a> {
         self
     }
 
-    /// Code the suffix lengths of the graph per LCS context with the LCS array
-    /// of the index, see [collapsed](super::collapsed). Decoding the archive then
-    /// needs the LCS array or the SBWT, see [LcsSource](super::LcsSource).
-    pub fn with_lcs(
+    /// Code the graph for the index the paths were encoded with: the
+    /// suffix lengths per LCS context of `lcs`, and the direct suffix length
+    /// symbols for the _k_-mer size of `sbwt`, see
+    /// [collapsed](super::collapsed). Decoding the archive then needs the
+    /// index, see [GraphDecoder::decode_from_read_with_index](super::decoder::GraphDecoder::decode_from_read_with_index).
+    pub fn with_index(
         mut self,
+        sbwt: &SbwtIndexVariant,
         lcs: &'a LcsArray,
     ) -> Self {
+        let SbwtIndexVariant::SubsetMatrix(index) = sbwt;
         self.lcs = Some(lcs);
+        self.k = Some(index.k().try_into().expect("k does not fit in u32"));
         self
     }
 
@@ -200,7 +210,7 @@ impl<'a> GraphEncoder<'a> {
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;
-        let graph_bytes = self.graph.to_bytes(self.lcs)?;
+        let graph_bytes = self.graph.to_bytes(self.lcs, self.k)?;
         let choice_bytes = to_allocvec(&self.choices)?;
 
         let header = FileHeader{
