@@ -284,19 +284,13 @@ fn left_extend_rc(
     Some((extension, stopped_in_sbwt))
 }
 
-pub fn encode_sequence(
-    nucleotides: &[u8],
-    sbwt: &SbwtIndexVariant,
-    lcs: &LcsArray,
-) -> Result<Vec<(usize, Range<usize>)>, E> {
-    Ok(encode_sequence_flagged(nucleotides, sbwt, lcs)?.0)
-}
-
-/// Same as [encode_sequence], but also returns for every dictionary entry
+/// Encode a nucleotide sequence against an SBWT index.
+///
+/// Returns the dictionary and, for every dictionary entry, a boolean denoting
 /// whether its suffix length is *implicit*: the entry is a left extended k-mer
 /// whose extension stopped where [left_extend_kmer] stops as well, so the
 /// decoder can recover the length by extending the k-mer as far as possible.
-pub fn encode_sequence_flagged(
+pub fn encode_sequence(
     nucleotides: &[u8],
     sbwt: &SbwtIndexVariant,
     lcs: &LcsArray,
@@ -617,7 +611,7 @@ mod tests {
             }
 
             // Both decoders recover the sequence from its encoding.
-            let (dictionary, implicit) = encode_sequence_flagged(seq, &variant, &lcs).unwrap();
+            let (dictionary, implicit) = encode_sequence(seq, &variant, &lcs).unwrap();
             let path = |_| dictionary.iter().zip(&implicit).map(|((len, colex), &imp)| {
                 let len = *len as u32;
                 let suffix_len = if imp {
@@ -672,7 +666,7 @@ mod tests {
         let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
         let mut builder = graph::GraphBuilder::new();
         for seq in &seqs {
-            let (dictionary, implicit) = encode_sequence_flagged(seq, &variant, &lcs).unwrap();
+            let (dictionary, implicit) = encode_sequence(seq, &variant, &lcs).unwrap();
             builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
         }
         let (chains, _) = builder.to_chains();

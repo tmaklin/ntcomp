@@ -474,7 +474,7 @@ impl GraphBuilder {
             for snp in edited {
                 oriented[snp.pos as usize] = snp.index_base;
             }
-            let (dictionary, implicit) = crate::encode_sequence_flagged(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
+            let (dictionary, implicit) = crate::encode_sequence(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
             Ok((oriented.len(), dictionary, implicit))
         }).collect();
 

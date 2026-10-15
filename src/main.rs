@@ -243,7 +243,7 @@ fn main() {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                dictionaries.push(ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap());
+                dictionaries.push(ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap().0);
 
                 if num_records % block_size == 0 {
                     let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
