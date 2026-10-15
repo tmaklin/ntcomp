@@ -42,7 +42,6 @@ petgraph = { version = "0.8", features = ["serde-1"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
 lzma-rust2 = { version = "0.22", default-features = false, features = ["std", "encoder", "optimization"] }
 serde = "1"
-stacker = "0.1"
 
 ## graphview
 egui = { version = "0.36", optional = true }
