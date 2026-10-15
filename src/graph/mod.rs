@@ -45,7 +45,6 @@
 use core::ops::Range;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,7 +57,6 @@ use petgraph::graph::{
     Graph,
     NodeIndex,
 };
-use petgraph::visit::EdgeRef;
 
 use sbwt::LcsArray;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;

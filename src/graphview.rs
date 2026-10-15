@@ -16,7 +16,7 @@ use crate::graph::ColexGraphEdge;
 
 use eframe::CreationContext;
 use egui::CentralPanel;
-use egui_graphs::{Graph, DefaultGraphView};
+use egui_graphs::Graph;
 use petgraph::prelude::StableGraph;
 
 use petgraph::Direction;

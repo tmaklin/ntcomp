@@ -27,8 +27,6 @@ use blake3::{
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 
-use petgraph::graph::Graph;
-
 use clap::Parser;
 use log::info;
 use needletail::Sequence;
@@ -511,7 +509,7 @@ fn main() {
             let (stored_graph, choices, _hashes, _contig_names, _file_ranges, _reversed, _snp_edits) = decoder.decode_from_read_with_index(&sbwt, Some(&lcs)).unwrap();
 
             // Colour sets are not stored, recover them by walking every colour.
-            let graph: Graph<u32, ntcomp::graph::ColexGraphEdge> = {
+            let graph: petgraph::graph::Graph<u32, ntcomp::graph::ColexGraphEdge> = {
                 let csr = stored_graph.into_csr();
                 let colorsets = csr.colorsets(&choices, header.n_queries).unwrap();
                 csr.to_petgraph(&colorsets)
