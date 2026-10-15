@@ -273,7 +273,7 @@ fn main() {
             let mut conn = std::fs::File::open(input_path).unwrap();
 
             // File header
-            let mut header_bytes: [u8; 32] = [0_u8; 32];
+            let mut header_bytes: [u8; ntcomp::FILE_HEADER_BYTES] = [0_u8; ntcomp::FILE_HEADER_BYTES];
             let _ = conn.read_exact(&mut header_bytes);
             let _file_header = ntcomp::decode_file_header(&header_bytes).unwrap();
 
