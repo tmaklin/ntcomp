@@ -140,3 +140,43 @@ impl<'a> BitReader<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_roundtrip() {
+        let gammas: Vec<u64> = (1..300).chain([1 << 20, u32::MAX as u64, u64::MAX]).collect();
+        let truncated: Vec<(u32, u32)> = (1..70).flat_map(|n| (0..n).map(move |v| (v, n))).collect();
+
+        let mut writer = BitWriter::new();
+        for &x in &gammas {
+            writer.write_gamma(x);
+        }
+        for &(v, n) in &truncated {
+            writer.write_truncated_binary(v, n);
+        }
+        writer.write_bits(0b101, 3);
+        let bytes = writer.finish();
+
+        let mut reader = BitReader::new(&bytes);
+        for &x in &gammas {
+            assert_eq!(reader.read_gamma(), Some(x));
+        }
+        for &(v, n) in &truncated {
+            assert_eq!(reader.read_truncated_binary(n), Some(v));
+        }
+        assert_eq!(reader.read_bits(3), Some(0b101));
+        assert_eq!(reader.read_bits(8), None);
+    }
+
+    #[test]
+    fn small_values_are_short() {
+        let mut writer = BitWriter::new();
+        writer.write_gamma(1); // 1
+        writer.write_gamma(2); // 010
+        writer.write_truncated_binary(1, 2); // 1
+        writer.write_truncated_binary(2, 3); // 11
+        assert_eq!(writer.finish(), vec![0b1010_1110]);
+    }
+}

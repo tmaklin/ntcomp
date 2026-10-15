@@ -168,3 +168,54 @@ pub struct StrandSketches {
     reverse: Vec<u64>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..len).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            b"ACGT"[(state >> 62) as usize]
+        }).collect()
+    }
+
+    #[test]
+    fn reverse_complement_roundtrip() {
+        assert_eq!(reverse_complement(b"AACGTN"), b"NACGTT".to_vec());
+        let seq = random_sequence(1000, 1);
+        assert_eq!(reverse_complement(&reverse_complement(&seq)), seq);
+    }
+
+    #[test]
+    fn homologous_contigs_get_the_same_strand() {
+        let first = random_sequence(20000, 2);
+        // A variant of the first contig on the opposite strand, and an unrelated contig.
+        let mut variant = first.clone();
+        for i in (500..variant.len()).step_by(2000) {
+            variant[i] = if variant[i] == b'A' { b'C' } else { b'A' };
+        }
+        let flipped = reverse_complement(&variant);
+        let unrelated = random_sequence(20000, 3);
+
+        let mut chooser = StrandChooser::new(DEFAULT_SAMPLING);
+        assert!(!chooser.choose(&first), "the first contig is kept as given");
+        assert!(chooser.choose(&flipped), "the reverse complemented variant is flipped back");
+        assert!(!chooser.choose(&variant), "the variant on the same strand is kept");
+        assert!(!chooser.choose(&unrelated), "an unrelated contig is kept as given");
+
+        // Sketching first and choosing later gives the same strands.
+        let mut sketched = StrandChooser::new(DEFAULT_SAMPLING);
+        let sketches: Vec<StrandSketches> = [&first, &flipped, &variant, &unrelated].iter().map(|seq| sketched.sketch(seq)).collect();
+        let strands: Vec<bool> = sketches.into_iter().map(|s| sketched.choose_sketched(s)).collect();
+        assert_eq!(strands, vec![false, true, false, false]);
+    }
+
+    #[test]
+    fn short_and_ambiguous_contigs_are_kept() {
+        let mut chooser = StrandChooser::new(DEFAULT_SAMPLING);
+        assert!(!chooser.choose(b"ACGT"));
+        assert!(!chooser.choose(&vec![b'N'; 1000]));
+        assert!(!chooser.choose(b""));
+    }
+}

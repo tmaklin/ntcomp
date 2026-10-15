@@ -148,3 +148,73 @@ impl<'de> serde::Deserialize<'de> for Choices {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(choices: &[Vec<(u32, u32)>]) -> Choices {
+        let streams = choices.iter().map(|colour| {
+            let mut writer = ChoiceWriter::new();
+            for &(rank, n) in colour {
+                writer.push(rank, n);
+            }
+            writer.finish()
+        }).collect();
+        Choices { streams }
+    }
+
+    #[test]
+    fn choices_roundtrip() {
+        // Every rank for 2..70 options, a large node and an empty colour.
+        let all: Vec<(u32, u32)> = (2..70).flat_map(|n| (0..n).map(move |rank| (rank, n))).collect();
+        let large = vec![(0, 100_000), (99_999, 100_000), (65_536, 70_000), (3, 4)];
+        let choices = vec![all, vec![], large];
+        let stored = encode(&choices);
+
+        let bytes = postcard::to_allocvec(&stored).unwrap();
+        let decoded: Choices = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, stored);
+
+        // Decode in reverse order to check that the colours are independent.
+        for (color, expected) in choices.iter().enumerate().rev() {
+            let mut reader = decoded.reader(color as u32).unwrap();
+            for &(rank, n) in expected {
+                assert_eq!(reader.next(n), Some(rank));
+            }
+            assert!(reader.is_finished());
+            assert_eq!(reader.next(2), None);
+        }
+        assert!(decoded.reader(3).is_none());
+    }
+
+    #[test]
+    fn two_options_cost_one_bit() {
+        let mut writer = ChoiceWriter::new();
+        for i in 0..16 {
+            writer.push(i % 2, 2);
+        }
+        assert_eq!(writer.finish().bits, vec![0b01010101, 0b01010101]);
+    }
+
+    #[test]
+    fn repeated_choices_compress() {
+        // Many colours making the same, mostly rank 0, choices.
+        let colour: Vec<(u32, u32)> = (0..2000).map(|i| ((i % 13 == 0) as u32, 2 + (i % 3))).collect();
+        let choices = encode(&vec![colour; 50]);
+        let uncompressed = postcard::to_allocvec(&choices.streams).unwrap().len();
+        let stored = postcard::to_allocvec(&choices).unwrap().len();
+        assert!(stored * 20 < uncompressed, "{} vs {}", stored, uncompressed);
+    }
+
+    #[test]
+    fn empty_and_corrupt_choices() {
+        let empty = Choices::default();
+        let decoded: Choices = postcard::from_bytes(&postcard::to_allocvec(&empty).unwrap()).unwrap();
+        assert_eq!(decoded, empty);
+
+        let colour: Vec<(u32, u32)> = (0..2000).map(|i| ((i * 7 % 5) as u32, 5)).collect();
+        let mut stored = encode(&[colour]).to_stored().unwrap();
+        stored.bytes.truncate(stored.bytes.len() / 2);
+        assert!(Choices::from_stored(stored).is_err());
+    }
+}

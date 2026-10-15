@@ -145,3 +145,35 @@ impl HuffmanCode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huffman_roundtrip() {
+        let counts: Vec<u64> = (0..300_u64).map(|s| if s % 7 == 3 { 0 } else { 1 + (s * s) % 1000 }).collect();
+        let message: Vec<usize> = (0..5000).map(|i| (i * 31 + i / 7) % 300).filter(|s| counts[*s] > 0).collect();
+
+        let code = HuffmanCode::from_counts(&counts);
+        let mut writer = BitWriter::new();
+        for &s in &message {
+            code.write(s, &mut writer);
+        }
+        let bytes = writer.finish();
+
+        let code = HuffmanCode::from_lengths(code.lengths().to_vec()).unwrap();
+        let mut reader = BitReader::new(&bytes);
+        for &s in &message {
+            assert_eq!(code.read(&mut reader), Some(s));
+        }
+    }
+
+    #[test]
+    fn frequent_symbols_get_short_codes() {
+        let code = HuffmanCode::from_counts(&[0, 100, 1, 1, 50]);
+        assert_eq!(code.lengths(), &[0, 1, 3, 3, 2]);
+        let single = HuffmanCode::from_counts(&[0, 0, 5]);
+        assert_eq!(single.lengths(), &[0, 0, 1]);
+        assert!(HuffmanCode::from_lengths(vec![1, 1, 1]).is_err());
+    }
+}

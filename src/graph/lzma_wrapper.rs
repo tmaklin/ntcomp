@@ -98,3 +98,29 @@ pub fn decompress(
     Ok(data)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lzma_roundtrip() {
+        for data in [Vec::new(), b"a".to_vec(), b"OZ038544.1 Escherichia coli isolate 30345_1#313".repeat(100)] {
+            let lzma = compress(&data).unwrap();
+            assert_eq!(decompress(&lzma).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn repeated_data_compresses() {
+        let data = b"OZ038544.1 Escherichia coli isolate 30345_1#313".repeat(1000);
+        assert!(compress(&data).unwrap().bytes.len() * 100 < data.len());
+    }
+
+    #[test]
+    fn truncated_stream_is_an_error() {
+        let data: Vec<u8> = (0..20000_u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let mut lzma = compress(&data).unwrap();
+        lzma.bytes.truncate(lzma.bytes.len() / 2);
+        assert!(decompress(&lzma).is_err());
+    }
+}

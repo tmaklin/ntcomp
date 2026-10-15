@@ -685,3 +685,261 @@ impl<'de> serde::Deserialize<'de> for ChainCsr {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use super::{max_direct_suffix_len, MIN_DIRECT_SUFFIX_LEN};
+
+    use core::ops::Range;
+
+    fn expected(dict: &[(usize, Range<usize>)]) -> Vec<(u32, u32)> {
+        dict.iter().map(|(s, r)| (r.start as u32, *s as u32)).collect()
+    }
+
+    // Shared linear stretches (50 -> 60 -> 70) and a repeat at node 10.
+    fn dicts() -> Vec<Vec<(usize, Range<usize>)>> {
+        vec![
+            vec![(5, 10..11), (1, 50..51), (2, 60..61), (3, 70..71), (5, 10..11), (4, 30..31), (5, 10..11), (3, 20..21)],
+            vec![(5, 10..11), (4, 30..31), (5, 10..11), (1, 50..51), (2, 60..61), (3, 70..71), (2, 40..41)],
+            vec![(6, 80..81), (1, 50..51), (2, 60..61), (3, 70..71), (2, 40..41), (7, 90..91)],
+            vec![(9, 95..96)],
+        ]
+    }
+
+    fn builder(dicts: &[Vec<(usize, Range<usize>)>]) -> GraphBuilder {
+        let mut builder = GraphBuilder::new();
+        for d in dicts {
+            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+        }
+        builder
+    }
+
+    #[test]
+    fn chain_walk_recovers_paths() {
+        let dicts = dicts();
+        let (chains, choices) = builder(&dicts).to_chains();
+        let (csr, plain_choices) = builder(&dicts).to_csr();
+
+        assert!(chains.n_chains() < csr.column_indices.len());
+        assert_eq!(chains.suffix_lens.len(), csr.suffix_lens.len());
+        assert_eq!(choices.n_choices(), plain_choices.n_choices());
+
+        let bytes = postcard::to_allocvec(&chains).unwrap();
+        let chains: ChainCsr = postcard::from_bytes(&bytes).unwrap();
+
+        for (color, d) in dicts.iter().enumerate().rev() {
+            let (len, decoded) = chains.walk_path(&choices, color as u32).unwrap();
+            assert_eq!(decoded, expected(d));
+            assert_eq!(len as usize, d.iter().map(|x| x.0).sum::<usize>());
+        }
+    }
+
+    #[test]
+    fn expanded_chains_decode_with_the_same_choices() {
+        let dicts = dicts();
+        let (chains, choices) = builder(&dicts).to_chains();
+        let expanded = chains.to_csr();
+
+        for (color, d) in dicts.iter().enumerate() {
+            let (_, decoded) = expanded.walk_path(&choices, color as u32).unwrap();
+            assert_eq!(decoded, expected(d));
+        }
+    }
+
+    #[test]
+    fn both_layouts_have_the_same_choices() {
+        let dicts = dicts();
+        let (_, chain_choices) = builder(&dicts).to_chains();
+        let (_, plain_choices) = builder(&dicts).to_csr();
+        assert_eq!(chain_choices.streams, plain_choices.streams);
+    }
+
+    #[test]
+    fn colorsets_are_recovered_from_the_walks() {
+        let dicts = dicts();
+        // (source colex, target colex, suffix length) -> colours, with the dummy
+        // nodes' colex ranks at the ends of every path.
+        let mut expected_sets: std::collections::HashMap<(u32, u32, u32), Vec<u32>> = std::collections::HashMap::new();
+        for (color, d) in dicts.iter().enumerate() {
+            let mut nodes = vec![SOURCE_COLEX];
+            nodes.extend(d.iter().map(|x| x.1.start as u32));
+            nodes.push(SINK_COLEX);
+            let mut weights = vec![d.iter().map(|x| x.0 as u32).sum::<u32>()];
+            weights.extend(d.iter().map(|x| x.0 as u32));
+            for (i, w) in weights.iter().enumerate() {
+                let colors = expected_sets.entry((nodes[i], nodes[i + 1], *w)).or_default();
+                if colors.last() != Some(&(color as u32)) {
+                    colors.push(color as u32);
+                }
+            }
+        }
+
+        let (csr, choices) = builder(&dicts).to_csr();
+        let (chains, chain_choices) = builder(&dicts).to_chains();
+        for (csr, choices) in [(csr, choices), (chains.to_csr(), chain_choices)] {
+            let colorsets = csr.colorsets(&choices, dicts.len() as u32).unwrap();
+            assert_eq!(colorsets.len(), expected_sets.len());
+            for node in 0..csr.node_weights.len() {
+                let (start, end) = csr.row(node);
+                for pos in start..end {
+                    let key = (csr.node_weights[node], csr.node_weights[csr.column_indices[pos] as usize], csr.suffix_lens[pos]);
+                    assert_eq!(colorsets[pos], expected_sets[&key]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stored_chains_roundtrip() {
+        let dicts = dicts();
+        let (chains, _) = builder(&dicts).to_chains();
+        assert_eq!(chains.junction_weights[..2], [SOURCE_COLEX, SINK_COLEX]);
+
+        let stored = chains.to_stored();
+        assert_eq!(ChainCsr::from_stored(stored).unwrap(), chains);
+
+        for field in 0..9 {
+            let mut stored = chains.to_stored();
+            match field {
+                0 => stored.out_degrees.clear(),
+                1 => stored.chain_lens.clear(),
+                2 => stored.suffix_lens.clear(),
+                3 => { stored.sequence_lens.pop(); },
+                4 => { stored.junction_weights.pop(); },
+                5 => { stored.inner_weights.pop(); },
+                6 => stored.colex_bits = 0,
+                7 => stored.colex_bits = 33,
+                _ => stored.targets.clear(),
+            }
+            assert!(ChainCsr::from_stored(stored).is_err());
+        }
+    }
+
+    #[test]
+    fn colex_ranks_use_the_bits_they_need() {
+        // Largest rank 95 needs 7 bits.
+        let (chains, _) = builder(&dicts()).to_chains();
+        let stored = chains.to_stored();
+        assert_eq!(stored.colex_bits, 7);
+        assert_eq!(stored.n_junctions as usize, chains.junction_weights.len());
+        assert_eq!(stored.junction_weights.len(), ((chains.junction_weights.len() - 2) * 7).div_ceil(8));
+        assert_eq!(stored.inner_weights.len(), (chains.inner_weights.len() * 7).div_ceil(8));
+
+        // Ranks of 0 only, and ranks just below the dummy ranks.
+        for (ranks, bits) in [(vec![0, 0], 1), (vec![1, SOURCE_COLEX - 1, 7], 32)] {
+            let d: Vec<Vec<(usize, Range<usize>)>> = vec![ranks.iter().map(|&r| (3, r as usize..r as usize + 1)).collect()];
+            let (chains, choices) = builder(&d).to_chains();
+            let stored = chains.to_stored();
+            assert_eq!(stored.colex_bits, bits);
+            let decoded = ChainCsr::from_stored(stored).unwrap();
+            assert_eq!(decoded, chains);
+            let (_, path) = decoded.walk_path(&choices, 0).unwrap();
+            assert_eq!(path.iter().map(|x| x.0).collect::<Vec<u32>>(), ranks);
+        }
+    }
+
+    #[test]
+    fn implicit_and_long_suffix_lengths_roundtrip() {
+        // Lengths around the direct/long symbol boundary, some flagged implicit.
+        // The edge 40 -> 50 with length 12 is used by both colours but flagged
+        // only by colour 1, so it is implicit for both.
+        let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
+            vec![(255, 10..11), (256, 20..21), (70000, 30..31), (12, 40..41), (300, 50..51)],
+            vec![(256, 20..21), (12, 40..41), (255, 10..11), (1, 60..61), (12, 40..41), (300, 50..51)],
+        ];
+        let flags = vec![
+            vec![false, true, true, false, false],
+            vec![true, false, false, false, true, false],
+        ];
+        let expected_implicit = vec![
+            vec![false, true, true, true, false],
+            vec![true, false, false, false, true, false],
+        ];
+        let mut builder = GraphBuilder::new();
+        for (d, f) in dicts.iter().zip(&flags) {
+            builder.add_path_with_flags(d.iter().map(|x| x.0).sum(), d, f);
+        }
+        let (chains, choices) = builder.to_chains();
+
+        let bytes = postcard::to_allocvec(&chains).unwrap();
+        let decoded: ChainCsr = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, chains);
+
+        for (color, (d, implicit)) in dicts.iter().zip(&expected_implicit).enumerate() {
+            let (len, path) = decoded.walk_path(&choices, color as u32).unwrap();
+            assert_eq!(len as usize, d.iter().map(|x| x.0).sum::<usize>());
+            let expected: Vec<(u32, u32)> = d.iter().zip(implicit).map(|((s, r), &imp)| {
+                (r.start as u32, if imp { IMPLICIT_SUFFIX_LEN } else { *s as u32 })
+            }).collect();
+            assert_eq!(path, expected);
+        }
+    }
+
+    #[test]
+    fn direct_suffix_symbols_follow_k() {
+        // Lengths around 255 and around a k of 300.
+        let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
+            vec![(254, 10..11), (256, 20..21), (299, 30..31), (300, 40..41), (301, 50..51), (5000, 60..61)],
+            vec![(256, 20..21), (300, 40..41), (12, 70..71)],
+        ];
+        let mut builder = GraphBuilder::new();
+        for d in &dicts {
+            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+        }
+        let (chains, _) = builder.to_chains();
+        let stored_len = |k: Option<u32>| postcard::to_allocvec(&chains.to_stored_with(None, 0, k)).unwrap().len();
+
+        // For k <= 255 the coding is the same as without k.
+        for k in [Some(31), Some(255)] {
+            assert_eq!(postcard::to_allocvec(&chains.to_stored_with(None, 0, k)).unwrap(), postcard::to_allocvec(&chains.to_stored()).unwrap());
+        }
+        assert_eq!(max_direct_suffix_len(Some(63)), MIN_DIRECT_SUFFIX_LEN);
+        assert_eq!(max_direct_suffix_len(Some(300)), 300);
+
+        // With k = 300 every length up to 300 has its own symbol, and the code
+        // only decodes with the same k.
+        let stored = chains.to_stored_with(None, 0, Some(300));
+        assert_eq!(stored.suffix_code.len(), 302);
+        assert_ne!(stored_len(Some(300)), stored_len(None));
+        assert_eq!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300)), None, Some(300)).unwrap(), chains);
+        assert!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300)), None, None).is_err());
+        assert!(ChainCsr::from_stored_with(chains.to_stored(), None, Some(300)).is_err());
+
+        // The same with LCS contexts.
+        let lcs = |rank: u32| rank % 7;
+        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300));
+        assert_eq!(ChainCsr::from_stored_with(stored, Some(&lcs), Some(300)).unwrap(), chains);
+        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300));
+        assert!(ChainCsr::from_stored_with(stored, Some(&lcs), None).is_err());
+    }
+
+    #[test]
+    fn walks_are_bounded_by_the_contig_length() {
+        // A corrupt graph: the source edge says 3 bases, then a node that loops to itself.
+        let csr = Csr {
+            node_weights: vec![SOURCE_COLEX, SINK_COLEX, 7],
+            row_ptrs: vec![0, 1, 1, 2],
+            column_indices: vec![2, 2],
+            suffix_lens: vec![3, 1],
+        };
+        let choices = Choices { streams: vec![Default::default()] };
+        assert!(csr.walk_path(&choices, 0).is_err());
+        let chains = ChainCsr::from_csr(&csr);
+        assert!(chains.walk_path(&choices, 0).is_err());
+    }
+
+    #[test]
+    fn stored_graph_roundtrip() {
+        let dicts = dicts();
+        for collapse in [false, true] {
+            let (graph, choices) = builder(&dicts).collapse_chains(collapse).finish();
+            let bytes = postcard::to_allocvec(&graph).unwrap();
+            let graph: StoredGraph = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(matches!(graph, StoredGraph::Chains(_)), collapse);
+            for (color, d) in dicts.iter().enumerate() {
+                let (_, decoded) = graph.walk_path(&choices, color as u32).unwrap();
+                assert_eq!(decoded, expected(d));
+            }
+        }
+    }
+}

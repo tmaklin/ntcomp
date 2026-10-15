@@ -200,5 +200,112 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::encoder::GraphEncoder;
+    use super::super::{GraphBuilder, Walkable};
+    use super::super::snps::Snp;
+
+    fn graph() -> (StoredGraph, Choices, Vec<Vec<(usize, Range<usize>)>>) {
+        let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
+            vec![(5, 10..11), (1, 50..51), (2, 60..61), (5, 10..11), (3, 20..21)],
+            vec![(5, 10..11), (3, 20..21), (2, 40..41)],
+        ];
+        let mut builder = GraphBuilder::new().collapse_chains(true);
+        for d in &dicts {
+            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+        }
+        let (graph, choices) = builder.finish();
+        (graph, choices, dicts)
+    }
+
+    fn encode(encoder: GraphEncoder) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        encoder.encode_to_write(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn archive_roundtrip() {
+        let (graph, choices, dicts) = graph();
+        let names = vec![b"contig one".to_vec(), b"contig two".to_vec()];
+        let hashes = vec![blake3::hash(b"one"), blake3::hash(b"two")];
+        let ranges = vec![(b"file".to_vec(), 0..2)];
+        let snps = SnpEdits::new(&[vec![], vec![Snp { pos: 3, base: b'A', index_base: b'G' }]]);
+        let bytes = encode(GraphEncoder::new(graph, choices)
+            .with_contig_names(names.clone())
+            .with_hashes(hashes.clone())
+            .with_file_ranges(ranges.clone())
+            .with_reversed(vec![false, true])
+            .with_snp_edits(snps.clone()));
+
+        let mut input = bytes.as_slice();
+        let decoder = GraphDecoder::new(&mut input).unwrap();
+        assert_eq!(decoder.header().n_queries, 2);
+        let (graph, choices, got_hashes, got_names, got_ranges, got_reversed, got_snps) = decoder.decode_from_read().unwrap();
+        assert_eq!(got_reversed, Some(vec![false, true]));
+        assert_eq!(got_snps, Some(snps));
+        assert_eq!(got_hashes, Some(hashes));
+        assert_eq!(got_names, Some(names));
+        assert_eq!(got_ranges, Some(ranges));
+        for (color, d) in dicts.iter().enumerate() {
+            let (len, _) = graph.walk_path(&choices, color as u32).unwrap();
+            assert_eq!(len as usize, d.iter().map(|x| x.0).sum::<usize>());
+        }
+    }
+
+    #[test]
+    fn absent_sections_are_none() {
+        let (graph, choices, _) = graph();
+        let bytes = encode(GraphEncoder::new(graph, choices));
+        let mut input = bytes.as_slice();
+        let (_, choices, hashes, names, ranges, reversed, snps) = GraphDecoder::new(&mut input).unwrap().decode_from_read().unwrap();
+        assert_eq!(choices.streams.len(), 2);
+        assert!(hashes.is_none() && names.is_none() && ranges.is_none() && reversed.is_none() && snps.is_none());
+    }
+
+    #[test]
+    fn strands_are_only_stored_if_a_contig_is_reversed() {
+        let (stored, choices, _) = graph();
+        let bytes = encode(GraphEncoder::new(stored, choices).with_reversed(vec![false, false]));
+        let mut input = bytes.as_slice();
+        let decoder = GraphDecoder::new(&mut input).unwrap();
+        assert_eq!(decoder.header().strand_bytes, 0);
+        assert!(decoder.decode_from_read().unwrap().5.is_none());
+
+        // One strand per colour is required.
+        let (stored, choices, _) = graph();
+        let mut bytes = Vec::new();
+        assert!(GraphEncoder::new(stored, choices).with_reversed(vec![true]).encode_to_write(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn snps_need_one_stream_per_colour() {
+        let (stored, choices, _) = graph();
+        let mut bytes = Vec::new();
+        let snps = SnpEdits::new(&[vec![Snp { pos: 0, base: b'C', index_base: b'T' }]]);
+        assert!(GraphEncoder::new(stored, choices).with_snp_edits(snps).encode_to_write(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn truncated_archives_are_errors() {
+        let (graph, choices, _) = graph();
+        let bytes = encode(GraphEncoder::new(graph, choices).with_contig_names(vec![b"a".to_vec(), b"b".to_vec()]));
+        for len in [0, 10, FILE_HEADER_BYTES, bytes.len() / 2, bytes.len() - 1] {
+            let mut input = &bytes[..len];
+            let decoded = GraphDecoder::new(&mut input).and_then(|decoder| decoder.decode_from_read());
+            assert!(decoded.is_err(), "archive truncated to {} bytes", len);
+        }
+    }
+
+    #[test]
+    fn missing_required_section_is_an_error() {
+        let (graph, choices, _) = graph();
+        let mut bytes = encode(GraphEncoder::new(graph, choices));
+        // Set the size of the choice section (last header field) to 0.
+        bytes[FILE_HEADER_BYTES - 8..FILE_HEADER_BYTES].copy_from_slice(&0_u64.to_le_bytes());
+        let mut input = bytes.as_slice();
+        assert!(GraphDecoder::new(&mut input).unwrap().decode_from_read().is_err());
     }
 }

@@ -606,3 +606,153 @@ pub fn read_block<R: std::io::Read>(
     Ok(decompressed)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..len).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            b"ACGT"[(state >> 62) as usize]
+        }).collect()
+    }
+
+    #[test]
+    fn left_extensions_with_and_without_lcs_agree() {
+        // Related sequences with substitutions, so the de Bruijn graph branches.
+        let base = random_sequence(3000, 1);
+        let mut seqs = vec![base.clone()];
+        for (seed, step) in [(2, 97), (3, 211), (4, 401)] {
+            let mut variant = base.clone();
+            let flips = random_sequence(variant.len() / step + 1, seed);
+            for (n, i) in (step / 2..variant.len()).step_by(step).enumerate() {
+                if flips[n] != variant[i] { variant[i] = flips[n]; }
+            }
+            seqs.push(variant);
+        }
+        let mut opts = kbo::BuildOpts::default();
+        opts.k = 15;
+        opts.add_revcomp = true;
+        opts.build_select = true;
+        let (variant, lcs) = kbo::build(&seqs, opts);
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let k = sbwt.k();
+
+        let mut n_extended = 0;
+        for seq in &seqs {
+            for end in k..=seq.len() {
+                let kmer = &seq[end - k..end];
+                let max = end - k;
+                let plain = left_extend_kmer2(kmer, sbwt, None, max);
+                assert_eq!(left_extend_kmer2(kmer, sbwt, Some(&lcs), max), plain);
+                if end > k {
+                    let ref_nts = &seq[..end];
+                    assert_eq!(left_extend_kmer(kmer, ref_nts, sbwt, Some(&lcs), max), left_extend_kmer(kmer, ref_nts, sbwt, None, max));
+                }
+                n_extended += (plain.len() > k) as usize;
+            }
+
+            // Both decoders recover the sequence from its encoding.
+            let (dictionary, implicit) = encode_sequence_flagged(seq, &variant, &lcs).unwrap();
+            let path = |_| dictionary.iter().zip(&implicit).map(|((len, colex), &imp)| {
+                let len = *len as u32;
+                let suffix_len = if imp {
+                    graph::SuffixLen::Implicit
+                } else if len > k as u32 {
+                    graph::SuffixLen::Explicit { suffix_len: len }
+                } else {
+                    graph::SuffixLen::Plain { suffix_len: len }
+                };
+                (colex.start as u32, suffix_len)
+            }).collect::<Vec<_>>();
+            assert_eq!(&graph::decode_path(path(()), seq.len(), &variant, None).unwrap(), seq);
+            assert_eq!(&graph::decode_path(path(()), seq.len(), &variant, Some(&lcs)).unwrap(), seq);
+        }
+        assert!(n_extended > 0, "no k-mer was left extended");
+    }
+
+    fn related_index(k: usize) -> (Vec<Vec<u8>>, SbwtIndexVariant, LcsArray) {
+        let base = random_sequence(3000, 1);
+        let mut seqs = vec![base.clone()];
+        for (seed, step) in [(2, 97), (3, 211), (4, 401)] {
+            let mut variant = base.clone();
+            let flips = random_sequence(variant.len() / step + 1, seed);
+            for (n, i) in (step / 2..variant.len()).step_by(step).enumerate() {
+                variant[i] = flips[n];
+            }
+            seqs.push(variant);
+        }
+        let mut opts = kbo::BuildOpts::default();
+        opts.k = k;
+        opts.add_revcomp = true;
+        opts.build_select = true;
+        let (variant, lcs) = kbo::build(&seqs, opts);
+        (seqs, variant, lcs)
+    }
+
+    #[test]
+    fn lcs_array_and_lcs_from_sbwt_agree() {
+        for k in [15, 31] {
+            let (_, variant, lcs) = related_index(k);
+            let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+            assert_eq!(lcs.len(), sbwt.n_sets());
+            for rank in 0..lcs.len() {
+                assert_eq!(lcs_from_sbwt(sbwt, rank), lcs.access(rank), "k {} rank {}", k, rank);
+            }
+        }
+    }
+
+    #[test]
+    fn lcs_context_suffix_codes_roundtrip() {
+        let (seqs, variant, lcs) = related_index(15);
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let mut builder = graph::GraphBuilder::new();
+        for seq in &seqs {
+            let (dictionary, implicit) = encode_sequence_flagged(seq, &variant, &lcs).unwrap();
+            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+        }
+        let (chains, _) = builder.to_chains();
+        let from_array = |rank: u32| lcs.access(rank as usize) as u32;
+        let from_sbwt = |rank: u32| lcs_from_sbwt(sbwt, rank as usize) as u32;
+        for cap in [1, 8, 255] {
+            let stored = chains.to_stored_with(Some(&from_array), cap, Some(15));
+            let bytes = postcard::to_allocvec(&stored).unwrap();
+            // Encoded with the array, decoded with values computed from the SBWT (and vice versa).
+            let decoded = graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_sbwt), Some(15)).unwrap();
+            assert_eq!(decoded, chains, "cap {}", cap);
+            let stored = chains.to_stored_with(Some(&from_sbwt), cap, Some(15));
+            assert_eq!(graph::collapsed::ChainCsr::from_stored_with(stored, Some(&from_array), Some(15)).unwrap(), chains);
+            // The LCS values are required to decode.
+            let stored: graph::collapsed::StoredChains = postcard::from_bytes(&bytes).unwrap();
+            assert!(graph::collapsed::ChainCsr::from_stored_with(stored, None, Some(15)).is_err());
+        }
+        // Without contexts nothing changes.
+        assert_eq!(graph::collapsed::ChainCsr::from_stored(chains.to_stored()).unwrap(), chains);
+    }
+
+    #[test]
+    fn archives_written_with_the_lcs_array_need_an_lcs_source() {
+        use graph::{LcsSource, StoredGraph, Walkable};
+        let (seqs, variant, lcs) = related_index(15);
+        let mut builder = graph::GraphBuilder::new().collapse_chains(true);
+        for seq in &seqs {
+            builder.add_contig(seq, &variant, &lcs).unwrap();
+        }
+        let (stored, choices) = builder.finish();
+        let walks: Vec<_> = (0..seqs.len() as u32).map(|c| stored.walk_path(&choices, c).unwrap()).collect();
+        let mut with_lcs = Vec::new();
+        graph::encoder::GraphEncoder::new(stored, choices).with_index(&variant, &lcs).encode_to_write(&mut with_lcs).unwrap();
+
+        for source in [LcsSource::Array(&lcs), LcsSource::Sbwt(&variant)] {
+            let mut input = with_lcs.as_slice();
+            let (graph, choices, ..) = graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(source), Some(15)).unwrap();
+            for (color, walk) in walks.iter().enumerate() {
+                assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
+            }
+            assert!(matches!(graph, StoredGraph::Chains(_)));
+        }
+        let mut input = with_lcs.as_slice();
+        assert!(graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read().is_err());
+    }
+}
