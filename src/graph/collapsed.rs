@@ -41,10 +41,12 @@
 //!
 //! ## Stored colex ranks
 //!
-//! The colex ranks of the junctions and the inner nodes are bit-packed with the
-//! same width for every rank. The number of bits needed for the largest rank
-//! depends on the size of the SBWT. The dummy source and sink are always
-//! junctions 0 and 1 and are not stored.
+//! The colex ranks of the junctions and the inner nodes are coded with the
+//! truncated binary code (also called minimal binary) for the bound
+//! `colex_bound` = largest stored rank + 1: with l = ⌊log2 bound⌋, the first
+//! 2^(l+1) − bound values take l bits and the others l + 1 bits, so a rank
+//! takes log2 of the bound bits on average instead of a whole number of bits.
+//! The dummy source and sink are always junctions 0 and 1 and are not stored.
 //!
 //! ## Stored suffix lengths
 //!
@@ -142,15 +144,15 @@ pub struct StoredChains {
     /// Number of junction nodes, including the dummy source and sink.
     pub n_junctions: u32,
 
-    /// Number of bits used for every stored colex rank.
-    pub colex_bits: u8,
+    /// Every stored colex rank is below this (largest rank + 1).
+    pub colex_bound: u32,
 
     /// Colex ranks of the junction nodes except the dummy source and sink,
-    /// `colex_bits` bits each.
+    /// truncated binary for `colex_bound`.
     pub junction_weights: Vec<u8>,
 
     /// Colex ranks of the inner nodes, concatenated over all chains,
-    /// `colex_bits` bits each.
+    /// truncated binary for `colex_bound`.
     pub inner_weights: Vec<u8>,
 
     /// Suffix lengths of the edges out of the dummy source node (the contig lengths).
@@ -178,36 +180,31 @@ pub struct StoredChains {
     pub targets: Vec<u8>,
 }
 
-/// Number of bits needed for colex ranks up to `max_colex` (at least 1).
-fn colex_bits(
-    max_colex: u32,
-) -> u32 {
-    (32 - max_colex.leading_zeros()).max(1)
-}
-
-/// Packs `ranks` with `bits` bits each.
+/// Codes `ranks`, all below `bound`, with the truncated binary code.
 fn pack_colex(
     ranks: &[u32],
-    bits: u32,
+    bound: u32,
 ) -> Vec<u8> {
     let mut writer = BitWriter::new();
     for &rank in ranks {
-        writer.write_bits(rank as u64, bits);
+        writer.write_truncated_binary(rank, bound);
     }
     writer.finish()
 }
 
-/// Unpacks `n` ranks of `bits` bits each; None unless `bytes` holds exactly that many.
+/// Reads `n` ranks coded by [pack_colex]; None unless `bytes` holds exactly
+/// that many (up to the padding of the last byte).
 fn unpack_colex(
     bytes: &[u8],
     n: usize,
-    bits: u32,
+    bound: u32,
 ) -> Option<Vec<u32>> {
-    if bytes.len() != (n * bits as usize).div_ceil(8) {
+    if bound == 0 {
         return None
     }
     let mut reader = BitReader::new(bytes);
-    (0..n).map(|_| reader.read_bits(bits).map(|rank| rank as u32)).collect()
+    let ranks = (0..n).map(|_| reader.read_truncated_binary(bound)).collect::<Option<Vec<u32>>>()?;
+    (reader.bits_read().div_ceil(8) == bytes.len()).then_some(ranks)
 }
 
 impl ChainCsr {
@@ -396,13 +393,13 @@ impl ChainCsr {
         let real_junctions = &self.junction_weights[2..];
         let max_colex = real_junctions.iter().chain(&self.inner_weights).copied().max().unwrap_or(0);
         assert!(max_colex < SOURCE_COLEX, "colex rank collides with dummy node ranks");
-        let colex_bits = colex_bits(max_colex);
+        let colex_bound = max_colex + 1;
 
         StoredChains {
             n_junctions: n_junctions.try_into().expect("too many junctions"),
-            colex_bits: colex_bits as u8,
-            junction_weights: pack_colex(real_junctions, colex_bits),
-            inner_weights: pack_colex(&self.inner_weights, colex_bits),
+            colex_bound,
+            junction_weights: pack_colex(real_junctions, colex_bound),
+            inner_weights: pack_colex(&self.inner_weights, colex_bound),
             sequence_lens,
             lcs_cap: lcs_cap as u16,
             suffix_code,
@@ -435,12 +432,12 @@ impl ChainCsr {
         if n_junctions < 2 {
             return Err(GraphDecodeError("stored chains: missing source or sink".to_string()))
         }
-        let colex_bits = stored.colex_bits as u32;
-        if !(1..=32).contains(&colex_bits) {
-            return Err(truncated("colex rank width"))
+        let colex_bound = stored.colex_bound;
+        if colex_bound == 0 || colex_bound > SOURCE_COLEX {
+            return Err(truncated("colex rank bound"))
         }
         let mut junction_weights = vec![SOURCE_COLEX, SINK_COLEX];
-        junction_weights.extend(unpack_colex(&stored.junction_weights, n_junctions - 2, colex_bits).ok_or_else(|| truncated("junction colex ranks"))?);
+        junction_weights.extend(unpack_colex(&stored.junction_weights, n_junctions - 2, colex_bound).ok_or_else(|| truncated("junction colex ranks"))?);
 
         let mut row_ptrs = Vec::with_capacity(n_junctions + 1);
         row_ptrs.push(0_u32);
@@ -465,7 +462,7 @@ impl ChainCsr {
             chain_ptrs.push(ptr);
         }
         let n_inner = *chain_ptrs.last().unwrap() as usize;
-        let inner_weights = unpack_colex(&stored.inner_weights, n_inner, colex_bits).ok_or_else(|| truncated("inner colex ranks"))?;
+        let inner_weights = unpack_colex(&stored.inner_weights, n_inner, colex_bound).ok_or_else(|| truncated("inner colex ranks"))?;
 
         let n_source_chains = row_ptrs[1] as usize;
         if stored.sequence_lens.len() != n_source_chains {
@@ -807,8 +804,8 @@ mod tests {
                 3 => { stored.sequence_lens.pop(); },
                 4 => { stored.junction_weights.pop(); },
                 5 => { stored.inner_weights.pop(); },
-                6 => stored.colex_bits = 0,
-                7 => stored.colex_bits = 33,
+                6 => stored.colex_bound = 0,
+                7 => stored.colex_bound = 1,
                 _ => stored.targets.clear(),
             }
             assert!(ChainCsr::from_stored(stored).is_err());
@@ -817,20 +814,24 @@ mod tests {
 
     #[test]
     fn colex_ranks_use_the_bits_they_need() {
-        // Largest rank 95 needs 7 bits.
+        // Largest rank 95: bound 96, so ranks below 32 take 6 bits and the others 7.
         let (chains, _) = builder(&dicts()).to_chains();
         let stored = chains.to_stored();
-        assert_eq!(stored.colex_bits, 7);
+        assert_eq!(stored.colex_bound, 96);
         assert_eq!(stored.n_junctions as usize, chains.junction_weights.len());
-        assert_eq!(stored.junction_weights.len(), ((chains.junction_weights.len() - 2) * 7).div_ceil(8));
-        assert_eq!(stored.inner_weights.len(), (chains.inner_weights.len() * 7).div_ceil(8));
+        let bits = |ranks: &[u32]| ranks.iter().map(|&r| if r < 32 { 6 } else { 7 }).sum::<usize>().div_ceil(8);
+        assert_eq!(stored.junction_weights.len(), bits(&chains.junction_weights[2..]));
+        assert_eq!(stored.inner_weights.len(), bits(&chains.inner_weights));
 
-        // Ranks of 0 only, and ranks just below the dummy ranks.
-        for (ranks, bits) in [(vec![0, 0], 1), (vec![1, SOURCE_COLEX - 1, 7], 32)] {
+        // Ranks of 0 only (no bits), a power-of-two bound, and ranks just below the dummy ranks.
+        for (ranks, bound) in [(vec![0, 0], 1), (vec![5, 63, 0], 64), (vec![1, SOURCE_COLEX - 1, 7], SOURCE_COLEX)] {
             let d: Vec<Vec<(usize, Range<usize>)>> = vec![ranks.iter().map(|&r| (3, r as usize..r as usize + 1)).collect()];
             let (chains, choices) = builder(&d).to_chains();
             let stored = chains.to_stored();
-            assert_eq!(stored.colex_bits, bits);
+            assert_eq!(stored.colex_bound, bound);
+            if bound == 1 {
+                assert!(stored.junction_weights.is_empty() && stored.inner_weights.is_empty());
+            }
             let decoded = ChainCsr::from_stored(stored).unwrap();
             assert_eq!(decoded, chains);
             let (_, path) = decoded.walk_path(&choices, 0).unwrap();

@@ -126,6 +126,11 @@ impl<'a> BitReader<'a> {
         Some((1 << n) | self.read_bits(n)?)
     }
 
+    /// Number of bits read so far.
+    pub fn bits_read(&self) -> usize {
+        self.bit
+    }
+
     pub fn read_truncated_binary(
         &mut self,
         n_symbols: u32,
