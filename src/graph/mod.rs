@@ -78,7 +78,7 @@ pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};
 use collapsed::ChainCsr;
 use orientation::StrandChooser;
-use snps::{CalledSnp, Snp, SnpEdits};
+use snps::{CalledSnp, SnpEdits};
 
 type E = Box<dyn std::error::Error>;
 
@@ -240,7 +240,7 @@ pub struct GraphBuilder {
     snp_counts: HashMap<u64, usize>,
 
     /// Per colour: the edited SNPs
-    edited: Vec<Vec<Snp>>,
+    edited: Vec<Vec<snps::EditedSnp>>,
 }
 
 impl Default for GraphBuilder {
@@ -345,7 +345,7 @@ impl GraphBuilder {
         if self.edited.iter().all(|snps| snps.is_empty()) {
             return None
         }
-        Some(SnpEdits::new(&self.edited))
+        Some(SnpEdits::with_repeats(&self.edited))
     }
 
     /// Chooses the strands of `sequences`, in order, if
@@ -450,7 +450,7 @@ impl GraphBuilder {
     ) -> Result<Vec<u32>, E> {
         let first_color = self.paths.len();
         // Strands and SNPs to edit, in order.
-        let prepared: Vec<(bool, Vec<Snp>)> = if self.edit_snps {
+        let prepared: Vec<(bool, Vec<snps::CalledSnp>)> = if self.edit_snps {
             // The strands were chosen in the first pass.
             self.strand_chooser = None;
             if self.called.len() < first_color + sequences.len() {
@@ -460,7 +460,6 @@ impl GraphBuilder {
             self.called[first_color..(first_color + sequences.len())].iter_mut().map(|(reversed, called)| {
                 let edited = std::mem::take(called).into_iter()
                     .filter(|snp| counts[&snp.key] <= max_shared)
-                    .map(|snp| snp.snp)
                     .collect();
                 (*reversed, edited)
             }).collect()
@@ -468,22 +467,25 @@ impl GraphBuilder {
             self.choose_strands(sequences).into_iter().map(|reversed| (reversed, Vec::new())).collect()
         };
 
-        type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>);
-        let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(&prepared).enumerate().map(|(i, (sequence, (reversed, edited)))| {
-            let mut oriented = if *reversed { orientation::reverse_complement(sequence) } else { sequence.to_vec() };
-            if edited.iter().any(|snp| oriented.get(snp.pos as usize) != Some(&snp.base)) {
+        let strands: Vec<bool> = prepared.iter().map(|(reversed, _)| *reversed).collect();
+        type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>, Vec<snps::EditedSnp>);
+        let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edited)))| {
+            let mut oriented = if reversed { orientation::reverse_complement(sequence) } else { sequence.to_vec() };
+            if edited.iter().any(|snp| oriented.get(snp.snp.pos as usize) != Some(&snp.snp.base)) {
                 return Err(format!("contig {} differs from the one its SNPs were called on", first_color + i))
             }
-            for snp in edited {
-                oriented[snp.pos as usize] = snp.index_base;
+            for snp in &edited {
+                oriented[snp.snp.pos as usize] = snp.snp.index_base;
             }
+            // Contexts in the edited contig, for storing shared SNPs once.
+            let edited = snps::with_contexts(&oriented, edited);
             let (dictionary, implicit) = crate::encode_sequence(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
-            Ok((oriented.len(), dictionary, implicit))
+            Ok((oriented.len(), dictionary, implicit, edited))
         }).collect();
 
         let mut colors = Vec::with_capacity(sequences.len());
-        for (encoded, (reversed, edited)) in encoded.into_iter().zip(prepared) {
-            let (len, dictionary, implicit) = encoded?;
+        for (encoded, reversed) in encoded.into_iter().zip(strands) {
+            let (len, dictionary, implicit, edited) = encoded?;
             let color = self.add_path_with_flags(len, &dictionary, &implicit);
             self.reversed[color as usize] = reversed;
             self.edited[color as usize] = edited;

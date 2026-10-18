@@ -114,23 +114,15 @@ fn read_contigs(
     contigs
 }
 
-/// Decodes `color` from the archive sections and checks its hash.
-///
-/// Returns the sequence, whether the hash matches (None if the archive has
-/// no hashes) and the time taken.
-#[allow(clippy::too_many_arguments)]
-fn decode_color(
+/// Decodes the stored (edited) sequence of `color` from the graph, before the
+/// SNPs are put back.
+fn decode_edited(
     color: u32,
     graph: &ntcomp::graph::StoredGraph,
     choices: &ntcomp::graph::Choices,
-    hashes: &Option<Vec<Hash>>,
-    reversed: &Option<Vec<bool>>,
-    snp_edits: &Option<ntcomp::graph::snps::SnpEdits>,
     sbwt: &sbwt::sbwt_index_variant::SbwtIndexVariant,
     lcs: &sbwt::LcsArray,
-) -> Result<(Vec<u8>, Option<bool>, f64), String> {
-    let idx = color as usize;
-    let start_time = std::time::Instant::now();
+) -> Result<Vec<u8>, String> {
     let sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(index) = sbwt;
 
     let (sequence_length, dictionary) = graph.walk_path(choices, color).map_err(|e| e.to_string())?;
@@ -151,10 +143,28 @@ fn decode_color(
         (colex_rank, suffix_len)
     }).collect::<Vec<(u32, ntcomp::graph::SuffixLen)>>();
 
-    let mut sequence = ntcomp::graph::decode_path(dictionary, sequence_length as usize, sbwt, Some(lcs)).map_err(|e| e.to_string())?;
+    ntcomp::graph::decode_path(dictionary, sequence_length as usize, sbwt, Some(lcs)).map_err(|e| e.to_string())
+}
+
+/// Contexts of SNPs in edited sequences, by colour and position, for putting
+/// back repeated SNPs (see [ntcomp::graph::snps]).
+type SnpContexts = std::collections::HashMap<(u32, u32), [u8; ntcomp::graph::snps::CONTEXT]>;
+
+/// Puts the SNPs of `color` back into its edited sequence, restores its
+/// strand and checks its hash. Returns the sequence and whether the hash
+/// matches (None if the archive has no hashes).
+fn finish_color(
+    color: u32,
+    mut sequence: Vec<u8>,
+    hashes: &Option<Vec<Hash>>,
+    reversed: &Option<Vec<bool>>,
+    snp_edits: &Option<ntcomp::graph::snps::SnpEdits>,
+    contexts: &SnpContexts,
+) -> Result<(Vec<u8>, Option<bool>), String> {
+    let idx = color as usize;
     // Edited SNPs are put back on the stored strand.
     if let Some(snp_edits) = snp_edits {
-        snp_edits.revert(color, &mut sequence).map_err(|e| e.to_string())?;
+        snp_edits.revert(color, &mut sequence, &|f, pos| contexts.get(&(f, pos)).copied()).map_err(|e| e.to_string())?;
     }
     // Contigs stored on the other strand are reverse complemented back.
     let sequence = if reversed.as_ref().is_some_and(|r| r[idx]) {
@@ -165,7 +175,7 @@ fn decode_color(
 
     // Not checked if the archive has no hashes.
     let hash_match = hashes.as_ref().map(|hashes| hash(&sequence) == hashes[idx]);
-    Ok((sequence, hash_match, start_time.elapsed().as_secs_f64()))
+    Ok((sequence, hash_match))
 }
 
 fn main() {
@@ -357,9 +367,42 @@ fn main() {
                 // files' worth of contigs, and written in the requested order.
                 let n_files = file_ranges.as_ref().map_or(0, |ranges| ranges.len()).max(1);
                 let chunk_size = batch_size * (header.n_queries as usize).div_ceil(n_files).max(1);
+                // Repeated SNPs are located by contexts from the edited sequences of
+                // earlier colours: the positions needed, by colour.
+                let mut wanted_contexts: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+                if let Some(edits) = &snp_edits {
+                    for &color in &want_colors {
+                        for (f, pos) in edits.context_sources(color) { wanted_contexts.entry(f).or_default().push(pos); }
+                    }
+                }
+                let mut contexts: SnpContexts = SnpContexts::new();
+                let record = |contexts: &mut SnpContexts, color: u32, edited: &[u8]| {
+                    for &pos in wanted_contexts.get(&color).map_or(&[][..], |v| v.as_slice()) {
+                        if let Some(context) = ntcomp::graph::snps::context_at(edited, pos as usize) { contexts.insert((color, pos), context); }
+                    }
+                };
                 for chunk in want_colors.chunks(chunk_size) {
-                    let decoded: Vec<Result<(Vec<u8>, Option<bool>, f64), String>> = chunk.par_iter().map(|&color| {
-                        decode_color(color, &graph, &choices, &hashes, &reversed, &snp_edits, &sbwt, &lcs)
+                    let start_time = std::time::Instant::now();
+                    let edited: Vec<Result<Vec<u8>, String>> = chunk.par_iter().map(|&color| {
+                        decode_edited(color, &graph, &choices, &sbwt, &lcs)
+                    }).collect();
+                    for (&color, sequence) in chunk.iter().zip(&edited) {
+                        if let Ok(sequence) = sequence { record(&mut contexts, color, sequence); }
+                    }
+                    // Contexts from colours not decoded yet (random access).
+                    if let Some(edits) = &snp_edits {
+                        let mut missing: Vec<u32> = chunk.iter().flat_map(|&c| edits.context_sources(c)).filter(|key| !contexts.contains_key(key)).map(|(f, _)| f).collect();
+                        missing.sort_unstable();
+                        missing.dedup();
+                        let sources: Vec<(u32, Result<Vec<u8>, String>)> = missing.par_iter().map(|&f| (f, decode_edited(f, &graph, &choices, &sbwt, &lcs))).collect();
+                        for (f, sequence) in sources {
+                            let sequence = sequence.unwrap_or_else(|e| panic!("decoding color {f} failed: {e}"));
+                            record(&mut contexts, f, &sequence);
+                        }
+                    }
+                    let seconds = start_time.elapsed().as_secs_f64() / chunk.len() as f64;
+                    let decoded: Vec<Result<(Vec<u8>, Option<bool>, f64), String>> = chunk.par_iter().zip(edited.into_par_iter()).map(|(&color, sequence)| {
+                        finish_color(color, sequence?, &hashes, &reversed, &snp_edits, &contexts).map(|(s, h)| (s, h, seconds))
                     }).collect();
 
                     for (&color, decoded) in chunk.iter().zip(decoded) {
