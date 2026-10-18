@@ -218,7 +218,7 @@ fn main() {
             info!("Building SBWT index from {} files...", in_files.len());
             let mut seq_data: Vec<Vec<u8>> = Vec::new();
             in_files.iter().for_each(|file| {
-                if file.ends_with(".tigs.lzma") {
+                if file.ends_with(".tigs.tac") {
                     // index tigs written by `ntcomp tigs`
                     let reader = std::io::BufReader::new(File::open(file).unwrap_or_else(|_| panic!("Expected tigs at {}", file)));
                     seq_data.append(&mut ntcomp::tigs::read_tigs(reader).unwrap_or_else(|e| panic!("Could not read tigs from {}: {}", file, e)));
@@ -296,10 +296,10 @@ fn main() {
             info!("{} tigs, {} bases, {} canonical k-mers ({} in the core); {} tigs reversed by the layout",
                   result.tigs.len(), bases, result.stats.kmers, result.stats.core_kmers, result.stats.reversed);
 
-            let tigs_path = format!("{}.tigs.lzma", output_prefix);
+            let tigs_path = format!("{}.tigs.tac", output_prefix);
             info!("Writing {}...", tigs_path);
             let out = BufWriter::new(File::create(&tigs_path).unwrap_or_else(|_| panic!("Could not create {}", tigs_path)));
-            ntcomp::tigs::write_tigs(&result.tigs, out).unwrap().flush().unwrap();
+            ntcomp::tigs::write_tigs(&result.tigs, *kmer_size, out).unwrap_or_else(|e| panic!("Could not write {}: {}", tigs_path, e)).flush().unwrap();
 
             if *fasta {
                 let fasta_path = format!("{}.tigs.fasta", output_prefix);

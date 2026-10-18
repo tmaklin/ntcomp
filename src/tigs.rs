@@ -32,15 +32,18 @@
 //!    (this is the final index) and its de Bruijn graph is covered by greedy
 //!    simplitigs. The inputs are scanned in order; each tig starts at the
 //!    first _k_-mer not used yet and is extended to the right, then to the
-//!    left, through unused _k_-mers, trying A, C, G and T in that order.
+//!    left, through unused _k_-mers. While a tig still follows the input it
+//!    was seeded from, it takes that input's next base if it can; otherwise
+//!    it tries A, C, G and T in that order.
 //! 4. **Layout**: the tigs are put on the strand [StrandChooser] picks for
 //!    them in the order they were made, and sorted longest first. This
 //!    changes only their compressed size, not their _k_-mers: the long,
 //!    core-like tigs come first and the short variant tigs are coded against
 //!    them.
 //!
-//! [write_tigs] stores the tigs one per line as an LZMA stream with a .lzma
-//! header, [read_tigs] reads them back.
+//! [write_tigs] stores the tigs with a DNA context-mixing coder (see
+//! [coder]), [read_tigs] reads them back (in the coder's order and
+//! orientation: the same _k_-mers).
 //!
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -54,6 +57,8 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
 use crate::graph::orientation::{reverse_complement, StrandChooser};
+
+pub mod coder;
 
 type E = Box<dyn std::error::Error>;
 
@@ -376,20 +381,25 @@ fn simplitigs<T: Sync>(
     let set_used = |used: &mut [u64], v: usize| used[v / 64] |= 1 << (v % 64);
     let complement = |c: u8| match c { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' };
     let mut neighbors: Vec<(Node, u8)> = Vec::new();
-    // Extends from `start` through unused k-mers, trying the labels in `order`;
-    // returns the labels taken.
-    let mut extend = |used: &mut Vec<u64>, start: usize, order: &[u8; 4]| -> Vec<u8> {
+    // Extends from `start` through unused k-mers; returns the labels taken.
+    // While the tig follows its seed input, `seed(j)` (the input's label at
+    // step j) is tried first; otherwise the labels in `order`.
+    let mut extend = |used: &mut Vec<u64>, start: usize, order: &[u8; 4], seed: &dyn Fn(usize) -> Option<u8>| -> Vec<u8> {
         let mut labels = Vec::new();
         let mut cur = start;
+        let mut on_seed = true;
         loop {
             neighbors.clear();
             dbg.push_out_neighbors(Node { id: cur }, &mut neighbors);
-            let next = order.iter().find_map(|&c| neighbors.iter().find(|(v, l)| *l == c && !is_used(used, v.id)).map(|(v, l)| (v.id, *l)));
+            let s = if on_seed { seed(labels.len()) } else { None };
+            let next = s.iter().chain(order.iter().filter(|&&c| Some(c) != s))
+                .find_map(|&c| neighbors.iter().find(|(v, l)| *l == c && !is_used(used, v.id)).map(|(v, l)| (v.id, *l)));
             match next {
                 Some((v, label)) => {
                     set_used(used, v);
                     set_used(used, rc[v] as usize);
                     labels.push(label);
+                    on_seed &= Some(label) == s;
                     cur = v;
                 },
                 None => break,
@@ -412,8 +422,8 @@ fn simplitigs<T: Sync>(
                 set_used(&mut used, rc[v] as usize);
                 // Right, then left as the right extension of the reverse
                 // complement: prepending A, C, G, T is appending T, G, C, A.
-                let right = extend(&mut used, v, b"ACGT");
-                let left = extend(&mut used, rc[v] as usize, b"TGCA");
+                let right = extend(&mut used, v, b"ACGT", &|j| seq.get(w + k + j).copied());
+                let left = extend(&mut used, rc[v] as usize, b"TGCA", &|j| (j < w).then(|| seq[w - 1 - j]).filter(|c| b"ACGT".contains(c)).map(complement));
                 let mut tig: Vec<u8> = left.iter().rev().map(|&c| complement(c)).collect();
                 tig.extend_from_slice(&seq[w..w + k]);
                 tig.extend_from_slice(&right);
@@ -496,51 +506,22 @@ pub fn build<T: Sync>(
 
 // Tig files -------------------------------------------------------------------
 
-/// LZMA preset for the tigs; extreme settings as `xz -9e`.
-const TIG_LZMA_PRESET: u32 = 9;
-const TIG_LZMA_NICE_LEN: u32 = 273;
-const TIG_LZMA_DEPTH: i32 = 512;
-const MIN_DICT_SIZE: u32 = 4096;
-
-/// Smallest dictionary size that covers `len` bytes and that `xz` accepts in
-/// a .lzma header (2^n or 2^n + 2^(n-1)).
-fn lzma_alone_dict_size(len: usize) -> u32 {
-    let len = u32::try_from(len).unwrap_or(u32::MAX).max(MIN_DICT_SIZE);
-    let pow = len.next_power_of_two();
-    if pow == len { return len }
-    let mid = pow / 2 + pow / 4;
-    if mid >= len { mid } else { pow }
-}
-
-/// Writes `tigs` one per line as an LZMA stream with a .lzma header
-/// (`xz --format=lzma -d` reads it). The dictionary covers the whole text and
-/// `pb = 0`, which suits single-byte symbols.
+/// Writes `tigs` (_k_-mers of length `k`, each tig at least `k` bases,
+/// longest first, no _k_-mer twice) with the DNA coder ([coder::encode]).
 pub fn write_tigs<W: Write>(
     tigs: &[Vec<u8>],
+    k: usize,
     out: W,
 ) -> Result<W, E> {
-    let len: usize = tigs.iter().map(|t| t.len() + 1).sum();
-    let mut options = lzma_rust2::LzmaOptions::with_preset(TIG_LZMA_PRESET);
-    options.pb = 0;
-    options.nice_len = TIG_LZMA_NICE_LEN;
-    options.depth_limit = TIG_LZMA_DEPTH;
-    options.dict_size = lzma_alone_dict_size(len);
-    let mut writer = lzma_rust2::LzmaWriter::new_use_header(out, &options, Some(len as u64))?;
-    for tig in tigs {
-        writer.write_all(tig)?;
-        writer.write_all(b"\n")?;
-    }
-    Ok(writer.finish()?)
+    coder::encode(tigs, k, out)
 }
 
-/// Reads tigs written by [write_tigs].
+/// Reads tigs written by [write_tigs], in the coder's order and orientation:
+/// the same _k_-mers, so the same SBWT.
 pub fn read_tigs<R: Read>(
     input: R,
 ) -> Result<Vec<Vec<u8>>, E> {
-    let mut reader = lzma_rust2::LzmaReader::new_mem_limit(input, u32::MAX, None)?;
-    let mut text = Vec::new();
-    reader.read_to_end(&mut text)?;
-    Ok(text.split(|&c| c == b'\n').filter(|t| !t.is_empty()).map(|t| t.to_vec()).collect())
+    coder::decode(input)
 }
 
 #[cfg(test)]
@@ -557,22 +538,6 @@ mod tests {
         rr.reverse();
         assert_eq!(f, rr);
         assert!(hashes(b"ACGTNACGTACG", 5).iter().take(5).all(|h| h.is_none()));
-    }
-
-    #[test]
-    fn tigs_roundtrip() {
-        let tigs = vec![b"ACGTACGT".to_vec(), b"GGGTTT".to_vec(), b"A".to_vec()];
-        let bytes = write_tigs(&tigs, Vec::new()).unwrap();
-        assert_eq!(read_tigs(bytes.as_slice()).unwrap(), tigs);
-    }
-
-    #[test]
-    fn dict_sizes_are_valid_for_lzma_alone() {
-        assert_eq!(lzma_alone_dict_size(10), 4096);
-        assert_eq!(lzma_alone_dict_size(4096), 4096);
-        assert_eq!(lzma_alone_dict_size(5000), 6144);
-        assert_eq!(lzma_alone_dict_size(7000), 8192);
-        assert_eq!(lzma_alone_dict_size(210_864_436), 268_435_456);
     }
 
     #[test]
@@ -641,5 +606,8 @@ mod tests {
         // every input has a gap there whose flanks are both core tig ends
         // (three joins); the tail is a tip.
         assert_eq!(result.stats.gaps, [3, 0, 0, 1]);
+        // The tig file restores the same k-mers.
+        let bytes = write_tigs(&result.tigs, k, Vec::new()).unwrap();
+        assert_eq!(kmer_set(&read_tigs(bytes.as_slice()).unwrap(), k), all);
     }
 }

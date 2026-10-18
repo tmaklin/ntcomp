@@ -75,7 +75,7 @@ pub enum Commands {
         input_list: Option<String>,
 
         // Outputs
-        #[arg(short = 'o', long = "output-prefix", required = true, help_heading = "Output", help = "Prefix for <prefix>.tigs.lzma (and the outputs below).")]
+        #[arg(short = 'o', long = "output-prefix", required = true, help_heading = "Output", help = "Prefix for <prefix>.tigs.tac (and the outputs below).")]
         output_prefix: String,
 
         #[arg(long = "fasta", default_value_t = false, help_heading = "Output", help = "Also write the tigs to <prefix>.tigs.fasta.")]
