@@ -65,6 +65,68 @@ pub enum Commands {
         verbose: bool,
     },
 
+    // Choose the index k-mers from a collection and write them as tigs
+    Tigs {
+        // Input fasta or fastq sequence file(s)
+        #[arg(group = "input", required = true, help = "Assembly file(s), one per input; the tigs are seeded in this order.")]
+        seq_files: Vec<String>,
+
+        #[arg(short = 'l', long = "input-list", group = "input", required = true, help_heading = "Input", help = "File with paths or tab separated name and path on each line.")]
+        input_list: Option<String>,
+
+        // Outputs
+        #[arg(short = 'o', long = "output-prefix", required = true, help_heading = "Output", help = "Prefix for <prefix>.tigs.lzma (and the outputs below).")]
+        output_prefix: String,
+
+        #[arg(long = "fasta", default_value_t = false, help_heading = "Output", help = "Also write the tigs to <prefix>.tigs.fasta.")]
+        fasta: bool,
+
+        #[arg(long = "index", default_value_t = false, help_heading = "Output", help = "Also write the index built from the tigs to <prefix>.sbwt and <prefix>.lcs.")]
+        index: bool,
+
+        // Tig parameters
+        #[arg(short = 'k', default_value_t = 255, help_heading = "Tig options", help = "k-mer size.")]
+        kmer_size: usize,
+
+        #[arg(short = 'T', long = "min-assemblies", default_value_t = 10, help_heading = "Tig options", help = "Core: canonical k-mers present in at least this many inputs.")]
+        min_assemblies: u32,
+
+        #[arg(long = "gap-join", default_value = "1-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths (in k-mers) of gaps between two core tig ends to fill: <min>-<max|inf> or none.")]
+        gap_join: ntcomp::tigs::GapRange,
+
+        #[arg(long = "gap-one-sided", default_value = "1500-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of gaps with exactly one flank a core tig end to fill.")]
+        gap_one_sided: ntcomp::tigs::GapRange,
+
+        #[arg(long = "gap-bubble", default_value = "1000-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of gaps with neither flank a core tig end to fill.")]
+        gap_bubble: ntcomp::tigs::GapRange,
+
+        #[arg(long = "gap-tip", default_value = "1000-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of runs at contig ends to fill.")]
+        gap_tip: ntcomp::tigs::GapRange,
+
+        #[arg(long = "orient-sampling", default_value_t = 8, help_heading = "Tig options", help = "Sample one in this many 31-mers for orienting the tigs.")]
+        orient_sampling: u64,
+
+        #[arg(long = "partitions", default_value_t = 16, help_heading = "Tig options", help = "Count the core in this many hash partitions (more use less memory but read the inputs more times).")]
+        partitions: u64,
+
+        // Index build parameters
+        #[arg(short = 'p', long = "prefix-precalc", default_value_t = 8, help_heading = "Build options", help = "Length of precalculated prefixes included in the index.")]
+        prefix_precalc: usize,
+
+        #[arg(short = 'm', long = "mem-gb", default_value_t = 4, help_heading = "Build options", help = "Memory for building the indexes on temporary disk space (in gigabytes).")]
+        mem_gb: usize,
+
+        #[arg(long = "temp-dir", required = false, help_heading = "Build options", help = "Temporary disk space for building the indexes [default: <prefix>.tmp].")]
+        temp_dir: Option<String>,
+
+        // Resources
+        #[arg(short = 't', long = "threads", default_value_t = 1, help = "Number of threads.")]
+        num_threads: usize,
+
+        #[arg(long = "verbose", default_value_t = false)]
+        verbose: bool,
+    },
+
     // Encode fastX data using an SBWT index
     Encode {
         // Inputs
@@ -160,4 +222,14 @@ pub enum Commands {
         #[arg(long = "color", required = true, help = "Color to plot")]
         color: usize,
     },
+}
+
+/// Parses a gap length range: `<min>-<max>`, `<min>-inf` or `none`.
+fn parse_gap_range(s: &str) -> Result<ntcomp::tigs::GapRange, String> {
+    if s == "none" { return Ok(None) }
+    let (lo, hi) = s.split_once('-').ok_or_else(|| format!("expected <min>-<max|inf> or none, got {}", s))?;
+    let lo: usize = lo.parse().map_err(|_| format!("invalid minimum in {}", s))?;
+    let hi: usize = if hi == "inf" { usize::MAX } else { hi.parse().map_err(|_| format!("invalid maximum in {}", s))? };
+    if lo > hi { return Err(format!("empty range {}", s)) }
+    Ok(Some((lo, hi)))
 }

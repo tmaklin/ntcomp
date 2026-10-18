@@ -218,7 +218,13 @@ fn main() {
             info!("Building SBWT index from {} files...", in_files.len());
             let mut seq_data: Vec<Vec<u8>> = Vec::new();
             in_files.iter().for_each(|file| {
-                seq_data.append(&mut read_fastx_file(file).into_iter().map(|(_, seq)| seq).collect::<Vec<Vec<u8>>>());
+                if file.ends_with(".tigs.lzma") {
+                    // index tigs written by `ntcomp tigs`
+                    let reader = std::io::BufReader::new(File::open(file).unwrap_or_else(|_| panic!("Expected tigs at {}", file)));
+                    seq_data.append(&mut ntcomp::tigs::read_tigs(reader).unwrap_or_else(|e| panic!("Could not read tigs from {}: {}", file, e)));
+                } else {
+                    seq_data.append(&mut read_fastx_file(file).into_iter().map(|(_, seq)| seq).collect::<Vec<Vec<u8>>>());
+                }
             });
 
             let (sbwt, lcs) = kbo::build(&seq_data, sbwt_build_options);
@@ -227,6 +233,88 @@ fn main() {
             info!("Serializing LCS array to {}.lcs ...", output_prefix.as_ref().unwrap());
             kbo::index::serialize_sbwt(output_prefix.as_ref().unwrap(), &sbwt, &lcs);
 
+        },
+        Some(cli::Commands::Tigs {
+            seq_files,
+            input_list,
+            output_prefix,
+            fasta,
+            index,
+            kmer_size,
+            min_assemblies,
+            gap_join,
+            gap_one_sided,
+            gap_bubble,
+            gap_tip,
+            orient_sampling,
+            partitions,
+            prefix_precalc,
+            mem_gb,
+            temp_dir,
+            num_threads,
+            verbose,
+        }) => {
+            init_log(if *verbose { 2 } else { 1 });
+
+            let mut in_files = seq_files.clone();
+            if let Some(list) = input_list {
+                let contents = read_input_list(list, b'\t');
+                in_files.extend(contents.iter().map(|(_, path)| path.to_str().unwrap().to_string()));
+            }
+
+            // The indexes are built on disk: in memory, sorting the k-mers takes
+            // k / 4 bytes each.
+            let (temp_dir, own_temp_dir) = match temp_dir {
+                Some(dir) => (dir.clone(), false),
+                None => (format!("{}.tmp", output_prefix), true),
+            };
+            std::fs::create_dir_all(&temp_dir).unwrap_or_else(|e| panic!("Could not create {}: {}", temp_dir, e));
+
+            let mut opts = ntcomp::tigs::TigOpts::default();
+            opts.min_assemblies = *min_assemblies;
+            opts.partitions = *partitions;
+            opts.orient_sampling = *orient_sampling;
+            opts.gaps = ntcomp::tigs::GapRules {
+                join: *gap_join,
+                one_sided: *gap_one_sided,
+                bubble: *gap_bubble,
+                tip: *gap_tip,
+            };
+            opts.build_opts.k = *kmer_size;
+            opts.build_opts.num_threads = *num_threads;
+            opts.build_opts.prefix_precalc = *prefix_precalc;
+            opts.build_opts.mem_gb = *mem_gb;
+            opts.build_opts.temp_dir = Some(temp_dir.clone());
+
+            info!("Choosing the index k-mers from {} inputs...", in_files.len());
+            let read = |file: &String| read_fastx_file(file).into_iter().map(|(_, seq)| seq).collect::<Vec<Vec<u8>>>();
+            let result = ntcomp::tigs::build(&in_files, &read, &opts, &|msg| info!("{}", msg));
+            if own_temp_dir {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+            }
+            let bases: usize = result.tigs.iter().map(|t| t.len()).sum();
+            info!("{} tigs, {} bases, {} canonical k-mers ({} in the core); {} tigs reversed by the layout",
+                  result.tigs.len(), bases, result.stats.kmers, result.stats.core_kmers, result.stats.reversed);
+
+            let tigs_path = format!("{}.tigs.lzma", output_prefix);
+            info!("Writing {}...", tigs_path);
+            let out = BufWriter::new(File::create(&tigs_path).unwrap_or_else(|_| panic!("Could not create {}", tigs_path)));
+            ntcomp::tigs::write_tigs(&result.tigs, out).unwrap().flush().unwrap();
+
+            if *fasta {
+                let fasta_path = format!("{}.tigs.fasta", output_prefix);
+                info!("Writing {}...", fasta_path);
+                let mut out = BufWriter::new(File::create(&fasta_path).unwrap_or_else(|_| panic!("Could not create {}", fasta_path)));
+                for (i, tig) in result.tigs.iter().enumerate() {
+                    writeln!(out, ">{}", i).unwrap();
+                    out.write_all(tig).unwrap();
+                    out.write_all(b"\n").unwrap();
+                }
+            }
+            if *index {
+                info!("Serializing the index to {}.sbwt and {}.lcs ...", output_prefix, output_prefix);
+                kbo::index::serialize_sbwt(output_prefix, &result.sbwt, &result.lcs);
+            }
         },
         Some(cli::Commands::Encode {
             query_file,
