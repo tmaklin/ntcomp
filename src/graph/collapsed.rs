@@ -77,6 +77,17 @@
 //! The decoder takes LCS(r) from the LCS array or computes it from the SBWT
 //! with [crate::lcs_from_sbwt].
 //!
+//! ## Stored out-degrees and chain lengths
+//!
+//! One arithmetic-coded stream ([crate::coder::arith]) holds the out-degree of
+//! every junction except the sink, in junction order, and then the number of
+//! inner nodes of every chain, in chain order. Each is an adaptive Elias-gamma
+//! code ([GammaModel]: of the degree, and of the number of inner nodes + 1).
+//! The chain lengths have one model per context: the out-degree of the
+//! chain's source junction (capped at 8) and the length of the previous chain
+//! of the same junction (in five classes, or none): the chains of a junction
+//! are alternative paths through the same region.
+//!
 //! ## Stored targets
 //!
 //! Junctions are numbered in breadth-first order, so the target of a chain is
@@ -183,11 +194,9 @@ pub struct StoredChains {
     /// Other suffix lengths, arithmetic coded, see the module docs.
     pub suffix_lens: Vec<u8>,
 
-    /// Out-degree of every junction except the sink.
-    pub out_degrees: Vec<u8>,
-
-    /// Number of inner nodes + 1 of every chain.
-    pub chain_lens: Vec<u8>,
+    /// Out-degree of every junction except the sink, then the number of
+    /// inner nodes of every chain, arithmetic coded, see the module docs.
+    pub topology: Vec<u8>,
 
     /// Target of every chain, arithmetic coded, see the module docs.
     pub targets: Vec<u8>,
@@ -242,6 +251,83 @@ fn code_targets<C: Coder>(
     Ok((out, next_new))
 }
 
+/// Adaptive Elias-gamma code of a number w ≥ 1: the bit length of w through a
+/// 6-bit adaptive tree and the bits below its top one, the first
+/// [GammaModel::MODELLED_BITS] adaptive given the bit length and the bits
+/// above them, the rest raw.
+struct GammaModel {
+    bits: Vec<u32>,
+    low: Vec<u32>,
+}
+
+impl GammaModel {
+    const MODELLED_BITS: u32 = 4;
+
+    fn new() -> Self {
+        GammaModel { bits: vec![C0; 64], low: vec![C0; 65 << Self::MODELLED_BITS] }
+    }
+
+    /// Codes (or decodes, `w` ignored) a number w ≥ 1.
+    fn code<C: Coder>(
+        &mut self,
+        c: &mut C,
+        w: u64,
+    ) -> u64 {
+        let n = code_tree(c, &mut self.bits, 6, 63 - w.max(1).leading_zeros()) + 1;
+        let mut x = 1_u64;
+        for (j, b) in (0..n - 1).rev().enumerate() {
+            let truth = ((w >> b) & 1) as u32;
+            let bit = if (j as u32) < Self::MODELLED_BITS {
+                code_bit(c, &mut self.low[((n as usize) << Self::MODELLED_BITS) + x as usize], truth)
+            } else {
+                c.code(truth, 32768)
+            };
+            x = (x << 1) | bit as u64;
+        }
+        x
+    }
+}
+
+/// Context of a chain length: the source junction's out-degree (capped at 8)
+/// and the number of inner nodes of the previous chain of the junction.
+fn chain_len_context(
+    degree: u64,
+    previous: Option<u64>,
+) -> usize {
+    let previous = match previous { None => 5, Some(0) => 0, Some(1) => 1, Some(2..=3) => 2, Some(4..=15) => 3, Some(_) => 4 };
+    degree.min(8) as usize * 6 + previous
+}
+
+/// Codes the out-degrees of the junctions (`degrees`, 0 for the sink) and the
+/// number of inner nodes of the chains (`inner`), or decodes them for
+/// `n_junctions` junctions (`shape` None), see the module docs. None if decoded
+/// values are out of range.
+fn code_topology<C: Coder>(
+    c: &mut C,
+    n_junctions: usize,
+    shape: Option<(&[u64], &[u64])>,
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    let mut degree_model = GammaModel::new();
+    let mut degrees = vec![0_u64; n_junctions];
+    let mut n_chains = 0_u64;
+    for junction in (0..n_junctions).filter(|&j| j != SINK_NODE as usize) {
+        degrees[junction] = degree_model.code(c, shape.map_or(1, |s| s.0[junction]));
+        n_chains += degrees[junction];
+        if n_chains > u32::MAX as u64 { return None }
+    }
+    let mut models: Vec<GammaModel> = (0..9 * 6).map(|_| GammaModel::new()).collect();
+    let mut inner = Vec::with_capacity(n_chains as usize);
+    for &degree in &degrees {
+        let mut previous = None;
+        for _ in 0..degree {
+            let w = models[chain_len_context(degree, previous)].code(c, shape.map_or(1, |s| s.1[inner.len()] + 1));
+            inner.push(w - 1);
+            previous = Some(w - 1);
+        }
+    }
+    Some((degrees, inner))
+}
+
 /// Adaptive models of the suffix lengths (see the module docs) for
 /// `n_contexts` contexts and direct lengths up to `max_direct`.
 struct SuffixModel {
@@ -251,14 +337,10 @@ struct SuffixModel {
     implicit: Vec<u32>,
     escaped: Vec<u32>,
     trees: Vec<u32>,
-    long_bits: Vec<u32>,
-    long_low: Vec<u32>,
+    long: GammaModel,
 }
 
 impl SuffixModel {
-    /// Low bits of a long length coded with adaptive models.
-    const LONG_MODELLED_BITS: u32 = 4;
-
     fn new(
         n_contexts: usize,
         max_direct: u32,
@@ -269,8 +351,7 @@ impl SuffixModel {
             implicit: vec![C0; n_contexts],
             escaped: vec![C0; n_contexts],
             trees: vec![C0; n_contexts << bits],
-            long_bits: vec![C0; 64],
-            long_low: vec![C0; 65 << Self::LONG_MODELLED_BITS],
+            long: GammaModel::new(),
         }
     }
 
@@ -289,21 +370,8 @@ impl SuffixModel {
             let value = code_tree(c, tree, self.bits, len.wrapping_sub(1)) + 1;
             return (value <= self.max_direct).then_some(value)
         }
-        // len - D has `n` bits.
-        let v = len.wrapping_sub(self.max_direct) as u64;
-        let n = code_tree(c, &mut self.long_bits, 6, 63 - v.max(1).leading_zeros()) + 1;
-        if n > 32 { return None }
-        let mut x = 1_u64;
-        for (j, b) in (0..n - 1).rev().enumerate() {
-            let truth = ((v >> b) & 1) as u32;
-            let bit = if (j as u32) < Self::LONG_MODELLED_BITS {
-                code_bit(c, &mut self.long_low[((n as usize) << Self::LONG_MODELLED_BITS) + x as usize], truth)
-            } else {
-                c.code(truth, 32768)
-            };
-            x = (x << 1) | bit as u64;
-        }
-        u32::try_from(self.max_direct as u64 + x).ok()
+        let x = self.long.code(c, len.wrapping_sub(self.max_direct) as u64);
+        u32::try_from(self.max_direct as u64).ok()?.checked_add(u32::try_from(x).ok()?)
     }
 }
 
@@ -445,18 +513,13 @@ impl ChainCsr {
         let max_direct = max_direct_suffix_len(k);
         let n_junctions = self.junction_weights.len();
 
-        let mut out_degrees = BitWriter::new();
-        for junction in (0..n_junctions).filter(|&j| j != SINK_NODE as usize) {
-            let (start, end) = self.row(junction);
-            out_degrees.write_gamma((end - start) as u64);
-        }
         let (sink_start, sink_end) = self.row(SINK_NODE as usize);
         assert_eq!(sink_start, sink_end, "sink has outgoing chains");
-
-        let mut chain_lens = BitWriter::new();
-        for chain in 0..self.n_chains() {
-            chain_lens.write_gamma(self.inner_nodes(chain).len() as u64 + 1);
-        }
+        let degrees: Vec<u64> = (0..n_junctions).map(|j| { let (start, end) = self.row(j); (end - start) as u64 }).collect();
+        assert!(degrees.iter().enumerate().all(|(j, &d)| d > 0 || j == SINK_NODE as usize), "a junction has no outgoing chains");
+        let inner: Vec<u64> = (0..self.n_chains()).map(|chain| self.inner_nodes(chain).len() as u64).collect();
+        let mut topology = Encoder::new();
+        code_topology(&mut topology, n_junctions, Some((&degrees, &inner))).expect("topology encode");
         let mut targets = Encoder::new();
         let (_, next_new) = code_targets(&mut targets, self.n_chains(), Some(&self.targets)).expect("targets encode");
         assert_eq!(next_new as usize, n_junctions, "junctions are not numbered in breadth-first order");
@@ -497,8 +560,7 @@ impl ChainCsr {
             lcs_cap: lcs_cap as u16,
             max_direct,
             suffix_lens: suffix_lens.finish(),
-            out_degrees: out_degrees.finish(),
-            chain_lens: chain_lens.finish(),
+            topology: topology.finish(),
             targets: targets.finish(),
         }
     }
@@ -534,15 +596,14 @@ impl ChainCsr {
         let mut junction_weights = vec![SOURCE_COLEX, SINK_COLEX];
         junction_weights.extend(unpack_colex(&stored.junction_weights, n_junctions - 2, colex_bound).ok_or_else(|| truncated("junction colex ranks"))?);
 
+        let mut coded = Decoder::new(&stored.topology);
+        let (degrees, inner) = code_topology(&mut coded, n_junctions, None).ok_or_else(|| truncated("out-degrees and chain lengths"))?;
+        if coded.overrun() {
+            return Err(truncated("out-degrees and chain lengths"))
+        }
         let mut row_ptrs = Vec::with_capacity(n_junctions + 1);
         row_ptrs.push(0_u32);
-        let mut degrees = BitReader::new(&stored.out_degrees);
-        for junction in 0..n_junctions {
-            let degree = if junction == SINK_NODE as usize {
-                0
-            } else {
-                degrees.read_gamma().ok_or_else(|| truncated("out-degrees"))?
-            };
+        for degree in degrees {
             let ptr = (*row_ptrs.last().unwrap() as u64 + degree).try_into().map_err(|_| truncated("out-degrees"))?;
             row_ptrs.push(ptr);
         }
@@ -550,9 +611,7 @@ impl ChainCsr {
 
         let mut chain_ptrs = Vec::with_capacity(n_chains + 1);
         chain_ptrs.push(0_u32);
-        let mut lens = BitReader::new(&stored.chain_lens);
-        for _ in 0..n_chains {
-            let len = lens.read_gamma().ok_or_else(|| truncated("chain lengths"))? - 1;
+        for len in inner {
             let ptr = (*chain_ptrs.last().unwrap() as u64 + len).try_into().map_err(|_| truncated("chain lengths"))?;
             chain_ptrs.push(ptr);
         }
@@ -868,8 +927,8 @@ mod tests {
         for field in 0..9 {
             let mut stored = chains.to_stored();
             match field {
-                0 => stored.out_degrees.clear(),
-                1 => stored.chain_lens.clear(),
+                0 => stored.topology.clear(),
+                1 => { stored.topology.pop(); },
                 2 => stored.suffix_lens.clear(),
                 3 => { stored.sequence_lens.pop(); },
                 4 => { stored.junction_weights.pop(); },
