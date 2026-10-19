@@ -88,7 +88,8 @@ impl Encoder {
 }
 
 /// Arithmetic decoder of bytes written by [Encoder]. Reading past the end
-/// yields zero bytes (corrupt input decodes to garbage, not a panic).
+/// yields zero bytes (corrupt input decodes to garbage, not a panic) and is
+/// reported by [Decoder::overrun].
 pub struct Decoder<'a> { x1: u32, x2: u32, x: u32, inp: &'a [u8], pos: usize }
 
 impl<'a> Decoder<'a> {
@@ -99,6 +100,11 @@ impl<'a> Decoder<'a> {
     }
 
     fn byte(&mut self) -> u32 { let b = self.inp.get(self.pos).copied().unwrap_or(0); self.pos += 1; b as u32 }
+
+    /// Whether more bytes were read than the input has: the input was
+    /// truncated (after decoding everything an [Encoder] wrote, the decoder
+    /// has read exactly its bytes).
+    pub fn overrun(&self) -> bool { self.pos > self.inp.len() }
 
     /// Decodes a bit coded with probability `p1` of a 1.
     pub fn bit(&mut self, p1: u32) -> u32 {
@@ -184,6 +190,13 @@ mod tests {
         let got_bits: Vec<u32> = bits.iter().map(|_| code_bit(&mut dec, &mut ctr, 0)).collect();
         assert_eq!(got, values);
         assert_eq!(got_bits, bits);
+        assert!(!dec.overrun());
+        // A truncated stream is noticed.
+        let mut short = Decoder::new(&bytes[..bytes.len() - 5]);
+        let (mut tree, mut ctr) = (vec![C0; 64], C0);
+        for _ in &values { code_gamma(&mut short, &mut tree, 0); }
+        for _ in &bits { code_bit(&mut short, &mut ctr, 0); }
+        assert!(short.overrun());
         // 500 bits with a 1-in-7 skew cost ~0.6 bits each (~37 bytes) plus the
         // values (~13 bytes), well below 500 / 8 + 13.
         assert!(bytes.len() < 60, "{} bytes", bytes.len());
