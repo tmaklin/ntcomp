@@ -23,22 +23,26 @@
 //! **Layout.** The long tigs (at least 2_k_ bases) come first, longest first.
 //! Then rounds of anchored short tigs: a short tig whose first or last _k_ - 1
 //! bases occur in the previous region (round 1: the long tigs; round _r_: the
-//! tigs of round _r_ - 1) is written with that end first, and each round is
-//! sorted by anchor position. Then the short tigs with no anchor, longest
+//! tigs of round _r_ - 1), on either strand, is written with that end first,
+//! and each round is sorted by anchor position. Anchors on the forward strand
+//! of the region are preferred. Then the short tigs with no anchor, longest
 //! first. [decode] returns the tigs in this order and orientation: the same
 //! _k_-mers, so the same SBWT.
 //!
-//! **Format.** Magic `TAC5`, _k_ (u16), end flags (u8, always 1), number of
+//! **Format.** Magic `TAC5`, _k_ (u16), options (u8: bit 0 end flags, always
+//! set; bit 1 reverse-strand anchors, set by [encode]), number of
 //! rounds (u8), total bases (u64), numbers of long tigs, of unanchored short
 //! tigs and of tigs in each round (u32 each, little-endian), then one
 //! arithmetic-coded stream:
 //! - the lengths of the long and of the unanchored tigs: the first raw, then
 //!   the differences from the previous one (adaptive Elias-gamma bucket plus
 //!   raw low bits);
-//! - per round, the anchor positions as differences, likewise;
+//! - per round, the anchor positions as differences, likewise, each followed
+//!   by its strand (an adaptive bit) if reverse-strand anchors are on;
 //! - the bases. An anchored tig's first _k_ - 1 bases are copied from its
-//!   anchor (the model still sees them); from base _k_ on, an end flag
-//!   precedes each of its bases.
+//!   anchor, reverse complemented for a reverse-strand anchor (the model
+//!   still sees them); from base _k_ on, an end flag precedes each of its
+//!   bases.
 //!
 //! **Model**, per base as two binary decisions (high bit, then low bit):
 //! - order-_n_ context counters for _n_ in [ORDERS] (direct tables while they
@@ -544,41 +548,55 @@ fn find_kmers(region: &[&[u8]], region_start: usize, w: usize, want: &mut HashMa
     }
 }
 
-/// The tigs in coding order, see the module docs.
-struct Plan { long: Vec<Vec<u8>>, rounds: Vec<Vec<(usize, Vec<u8>)>>, rest: Vec<Vec<u8>> }
+/// Options byte of the format: the anchored tigs' ends are coded as flags
+/// (always set); anchors may be on the reverse strand.
+const OPT_END_FLAGS: u8 = 1;
+const OPT_RC_ANCHORS: u8 = 2;
+
+/// The tigs in coding order, see the module docs; an anchored tig is
+/// (anchor position, on the reverse strand, sequence).
+struct Plan { long: Vec<Vec<u8>>, rounds: Vec<Vec<(usize, bool, Vec<u8>)>>, rest: Vec<Vec<u8>> }
 
 fn plan(tigs: Vec<Vec<u8>>, k: usize) -> Plan {
     let w = k - 1;
     let (long, mut rest): (Vec<Vec<u8>>, Vec<Vec<u8>>) = tigs.into_iter().partition(|t| t.len() >= 2 * k);
-    let mut rounds: Vec<Vec<(usize, Vec<u8>)>> = Vec::new();
+    let mut rounds: Vec<Vec<(usize, bool, Vec<u8>)>> = Vec::new();
     let mut region_start = 0usize;
     let mut region_len: usize = long.iter().map(|t| t.len()).sum();
     while rounds.len() < MAX_ROUNDS {
-        let region: Vec<&[u8]> = match rounds.last() { None => long.iter().map(|t| t.as_slice()).collect(), Some(r) => r.iter().map(|(_, t)| t.as_slice()).collect() };
+        let region: Vec<&[u8]> = match rounds.last() { None => long.iter().map(|t| t.as_slice()).collect(), Some(r) => r.iter().map(|(_, _, t)| t.as_slice()).collect() };
         let mut want: HashMap<u128, Vec<usize>> = HashMap::new();
-        for t in &rest { want.insert(khash(&t[..w]), Vec::new()); want.insert(khash(&rc_codes(&t[t.len() - w..])), Vec::new()); }
+        // Both ends of each tig, both strands.
+        for t in &rest {
+            let (head, tail) = (&t[..w], &t[t.len() - w..]);
+            for key in [khash(head), khash(&rc_codes(tail)), khash(&rc_codes(head)), khash(tail)] { want.insert(key, Vec::new()); }
+        }
         find_kmers(&region, region_start, w, &mut want);
-        let mut round: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut round: Vec<(usize, bool, Vec<u8>)> = Vec::new();
         let mut left: Vec<Vec<u8>> = Vec::new();
         for t in rest {
             let r = rc_codes(&t);
-            let hit = [&t, &r].into_iter().find_map(|s| want.get(&khash(&s[..w])).and_then(|v| v.first().copied()).map(|p| (p, s.clone())));
+            // Either end first: forward-strand anchors, then reverse-strand ones.
+            let first = |s: &[u8]| want.get(&khash(s)).and_then(|v| v.first().copied());
+            let hit = [&t, &r].into_iter().find_map(|s| first(&s[..w]).map(|p| (p, false, s.clone())))
+                .or_else(|| [&t, &r].into_iter().find_map(|s| first(&rc_codes(&s[..w])).map(|p| (p, true, s.clone()))));
             match hit { Some(h) => round.push(h), None => left.push(t) }
         }
         rest = left;
         if round.is_empty() { break }
         round.sort_by_key(|x| x.0);
         region_start += region_len;
-        region_len = round.iter().map(|(_, t)| t.len()).sum();
+        region_len = round.iter().map(|(_, _, t)| t.len()).sum();
         rounds.push(round);
     }
     Plan { long, rounds, rest }
 }
 
 /// One tig as coded: its anchor (its first k - 1 bases are at that position
-/// of the text), its length (when encoding, the true one), and whether the
-/// decoder knows the length (otherwise it is coded as end flags).
-struct Slot { anchor: Option<usize>, len: usize, known: bool }
+/// of the text, or their reverse complement if the flag is set), its length
+/// (when encoding, the true one), and whether the decoder knows the length
+/// (otherwise it is coded as end flags).
+struct Slot { anchor: Option<(usize, bool)>, len: usize, known: bool }
 
 /// Context of the end flag of an anchored tig before the base at `pos`: whether
 /// a copy model has matched k - 1 bases exactly, the longest match, the position.
@@ -615,7 +633,8 @@ fn code_bases<C: Coder>(c: &mut C, model: &mut Model, text: &mut Vec<u8>, slots:
             let tig_of = |p: usize| starts.partition_point(|&x| x <= p) - 1;
             let (pr, ex) = model.predict(text, i, pos, &tig_of);
             let sym = match slot.anchor {
-                Some(a) if pos < w => text[a + pos],
+                Some((a, false)) if pos < w => text[a + pos],
+                Some((a, true)) if pos < w => 3 - text[a + w - 1 - pos],
                 _ => {
                     if encode && ex >> text[i] & 1 == 1 { return Err(format!("the tigs repeat a {}-mer", k).into()) }
                     code_base(c, pr, ex, if encode { text[i] } else { 0 })
@@ -656,20 +675,26 @@ pub fn encode<W: Write>(
     let mut rl: Vec<usize> = plan.rest.iter().map(|t| t.len()).collect();
     code_lengths(&mut enc, &mut rl, plan.rest.len(), &div);
     let mut tpos = vec![C0; 128];
+    let mut tstrand = C0;
     for round in &plan.rounds {
         let mut prev = 0usize;
-        for (p, _) in round { code_gamma(&mut enc, &mut tpos, (p - prev) as u64, &div); prev = *p; }
+        for (p, rev, _) in round {
+            code_gamma(&mut enc, &mut tpos, (p - prev) as u64, &div);
+            prev = *p;
+            let bit = enc.code(*rev as u32, (tstrand >> 16).clamp(1, 65535));
+            cupd(&mut tstrand, bit, &div);
+        }
     }
     let mut text: Vec<u8> = Vec::with_capacity(n);
     let mut slots: Vec<Slot> = Vec::with_capacity(tigs.len());
     for t in &plan.long { text.extend_from_slice(t); slots.push(Slot { anchor: None, len: t.len(), known: true }); }
-    for round in &plan.rounds { for (p, t) in round { text.extend_from_slice(t); slots.push(Slot { anchor: Some(*p), len: t.len(), known: false }); } }
+    for round in &plan.rounds { for (p, rev, t) in round { text.extend_from_slice(t); slots.push(Slot { anchor: Some((*p, *rev)), len: t.len(), known: false }); } }
     for t in &plan.rest { text.extend_from_slice(t); slots.push(Slot { anchor: None, len: t.len(), known: true }); }
     code_bases(&mut enc, &mut model, &mut text, &mut slots, true)?;
     let body = enc.finish();
     out.write_all(MAGIC)?;
     out.write_all(&(k as u16).to_le_bytes())?;
-    out.write_all(&[1u8, plan.rounds.len() as u8])?;
+    out.write_all(&[OPT_END_FLAGS | OPT_RC_ANCHORS, plan.rounds.len() as u8])?;
     out.write_all(&(n as u64).to_le_bytes())?;
     for c in [plan.long.len(), plan.rest.len()].into_iter().chain(plan.rounds.iter().map(|r| r.len())) { out.write_all(&(c as u32).to_le_bytes())?; }
     out.write_all(&body)?;
@@ -685,8 +710,9 @@ pub fn decode<R: Read>(
     input.read_to_end(&mut data)?;
     if data.len() < 24 || &data[..4] != MAGIC { return Err("not a tigs file (TAC5)".into()) }
     let k = u16::from_le_bytes([data[4], data[5]]) as usize;
-    let (flags, n_rounds) = (data[6], data[7] as usize);
-    if flags != 1 { return Err("unsupported tigs file options".into()) }
+    let (options, n_rounds) = (data[6], data[7] as usize);
+    if options & OPT_END_FLAGS == 0 || options & !(OPT_END_FLAGS | OPT_RC_ANCHORS) != 0 { return Err("unsupported tigs file options".into()) }
+    let rc_anchors = options & OPT_RC_ANCHORS != 0;
     let n = u64::from_le_bytes(data[8..16].try_into()?) as usize;
     let u32_at = |o: usize| -> Result<usize, E> { Ok(u32::from_le_bytes(data.get(o..o + 4).ok_or("truncated tigs file")?.try_into()?) as usize) };
     let (n_long, n_rest) = (u32_at(16)?, u32_at(20)?);
@@ -699,13 +725,19 @@ pub fn decode<R: Read>(
     let mut rl = Vec::new();
     code_lengths(&mut dec, &mut rl, n_rest, &div);
     let mut tpos = vec![C0; 128];
+    let mut tstrand = C0;
     let mut slots: Vec<Slot> = ll.iter().map(|&l| Slot { anchor: None, len: l, known: true }).collect();
     for &c in &round_n {
         let mut prev = 0usize;
         for _ in 0..c {
             let p = prev + code_gamma(&mut dec, &mut tpos, 0, &div) as usize;
             prev = p;
-            slots.push(Slot { anchor: Some(p), len: 0, known: false });
+            let rev = rc_anchors && {
+                let bit = dec.code(0, (tstrand >> 16).clamp(1, 65535));
+                cupd(&mut tstrand, bit, &div);
+                bit == 1
+            };
+            slots.push(Slot { anchor: Some((p, rev)), len: 0, known: false });
         }
     }
     slots.extend(rl.iter().map(|&l| Slot { anchor: None, len: l, known: true }));
@@ -758,20 +790,27 @@ mod tests {
     #[test]
     fn roundtrip_with_anchors() {
         let k = 31;
-        // A spectrum-preserving set: two long tigs; a SNP variant of one, and a
-        // branch off the other on the reverse strand (anchored in the long
-        // tigs); a branch off the SNP variant (anchored in it); unrelated tigs.
+        // A spectrum-preserving set: two long tigs; a SNP variant of one, a
+        // branch off the other (written on its reverse strand), and a tig whose
+        // only anchor is on the reverse strand of the other (anchored in the
+        // long tigs); a branch off the SNP variant (anchored in it); unrelated
+        // tigs.
         let a = random_seq(900, 1);
         let b = random_seq(700, 2);
         let mut snp = a[300..300 + 2 * k - 1].to_vec();
         snp[k - 1] = if snp[k - 1] == b'A' { b'C' } else { b'A' };
         let branch_rc = reverse_complement(&branch(&b[100..100 + k - 1], random_seq(15, 3), b[100 + k - 1]));
+        let reverse_only = branch(&reverse_complement(&b[400..400 + k - 1]), random_seq(10, 7), reverse_complement(&b[399..400])[0]);
         let second = branch(&snp[1..k], random_seq(12, 4), snp[k]);
-        let mut tigs = vec![a, b, snp, branch_rc, second, random_seq(2 * k - 5, 5), random_seq(k, 6)];
+        let mut tigs = vec![a, b, snp, branch_rc, reverse_only, second, random_seq(2 * k - 5, 5), random_seq(k, 6)];
         tigs.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        let codes: Vec<Vec<u8>> = tigs.iter().map(|t| t.iter().map(|&c| b"ACGT".iter().position(|&x| x == c).unwrap() as u8).collect()).collect();
+        let p = plan(codes, k);
+        // Four anchored tigs in two rounds, one of them on the reverse strand.
+        assert_eq!(p.rounds.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![3, 1]);
+        assert_eq!(p.rounds[0].iter().filter(|x| x.1).count(), 1);
         let bytes = encode(&tigs, k, Vec::new()).unwrap();
-        // Two anchoring rounds.
-        assert_eq!(bytes[7], 2);
+        assert_eq!((bytes[6], bytes[7]), (OPT_END_FLAGS | OPT_RC_ANCHORS, 2));
         let decoded = decode(bytes.as_slice()).unwrap();
         assert_eq!(canonical_sorted(&decoded), canonical_sorted(&tigs));
     }
