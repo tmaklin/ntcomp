@@ -42,7 +42,7 @@
 //!    them.
 //!
 //! [write_tigs] stores the tigs with a DNA context-mixing coder (see
-//! [coder]), [read_tigs] reads them back (in the coder's order and
+//! [crate::coder::tigs]), [read_tigs] reads them back (in the coder's order and
 //! orientation: the same _k_-mers).
 //!
 use std::collections::{HashMap, HashSet};
@@ -58,7 +58,7 @@ use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
 use crate::graph::orientation::{reverse_complement, StrandChooser};
 
-pub mod coder;
+use crate::coder;
 
 type E = Box<dyn std::error::Error>;
 
@@ -507,13 +507,13 @@ pub fn build<T: Sync>(
 // Tig files -------------------------------------------------------------------
 
 /// Writes `tigs` (_k_-mers of length `k`, each tig at least `k` bases,
-/// longest first, no _k_-mer twice) with the DNA coder ([coder::encode]).
+/// longest first, no _k_-mer twice) with the DNA coder ([coder::tigs::encode]).
 pub fn write_tigs<W: Write>(
     tigs: &[Vec<u8>],
     k: usize,
     out: W,
 ) -> Result<W, E> {
-    coder::encode(tigs, k, out)
+    coder::tigs::encode(tigs, k, out)
 }
 
 /// Reads tigs written by [write_tigs], in the coder's order and orientation:
@@ -521,7 +521,7 @@ pub fn write_tigs<W: Write>(
 pub fn read_tigs<R: Read>(
     input: R,
 ) -> Result<Vec<Vec<u8>>, E> {
-    coder::decode(input)
+    coder::tigs::decode(input)
 }
 
 #[cfg(test)]

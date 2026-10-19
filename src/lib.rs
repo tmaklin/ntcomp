@@ -21,6 +21,7 @@ use sbwt::LcsArray;
 use sbwt::StreamingIndex;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
+pub mod coder;
 pub mod encode;
 pub mod decode;
 pub mod graph;

@@ -67,6 +67,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use super::arith::{code_gamma, update, Coder, Decoder, Encoder, C0};
+
 type E = Box<dyn std::error::Error>;
 
 const MAGIC: &[u8; 4] = b"TAC5";
@@ -81,8 +83,6 @@ const N_CONF: usize = ORDERS.len() - CONF_FROM;
 /// Largest table sizes (log2 of the number of contexts or buckets).
 const MAX_HASH_BITS: u32 = 25;
 const MAX_MATCH_BITS: u32 = 26;
-/// Count limit of the adaptive counters.
-const LIMIT: u32 = 255;
 /// Copy models: minimum match, forward and reverse-complement candidates.
 const MINLEN: usize = 20;
 const N_FWD: usize = 4;
@@ -192,17 +192,6 @@ impl Tables {
     #[inline] fn sq(&self, x: i32) -> u32 { self.squash[(x.clamp(-SMAX, SMAX) + SMAX) as usize] }
 }
 
-/// Counter: probability of a 1 in the high 22 bits, count in the low 10.
-const C0: u32 = (1 << 21) << 10;
-#[inline]
-fn cupd(c: &mut u32, bit: u32, div: &[u32]) {
-    let n = *c & 1023;
-    let p = (*c >> 10) as i64;
-    let target = if bit == 1 { (1i64 << 22) - 1 } else { 0 };
-    let p = p + (((target - p) * div[n as usize] as i64) >> 16);
-    *c = ((p as u32) << 10) | (n + 1).min(LIMIT);
-}
-
 fn hash64(x: u64, n: usize) -> u64 { (x ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15) }
 
 #[derive(Clone, Copy)]
@@ -235,7 +224,6 @@ impl HTab {
 struct Model {
     k: usize,
     t: Tables,
-    div: Vec<u32>,
     hash_bits: u32,
     n_direct: usize,
     direct: Vec<Vec<u32>>,
@@ -284,7 +272,6 @@ impl Model {
         models.push(CopyModel { rc: false, table: 1, slot: 0, m: m0 });
         Model {
             k, t,
-            div: (0..1024).map(|i| (65536.0 / (i as f64 + 1.5)) as u32).collect(),
             hash_bits, n_direct,
             direct: ORDERS[..n_direct].iter().map(|&o| vec![C0; 4usize.pow(o as u32) * 4]).collect(),
             hashed: ORDERS[n_direct..].iter().map(|_| vec![0u32; (1usize << hash_bits) * 4]).collect(),
@@ -416,17 +403,17 @@ impl Model {
             for (wi, &x) in w.iter_mut().zip(&self.finputs[node]) { *wi += ((x as i64 * err + round) >> LR_SHIFT) as i32; }
             let (b, fr) = self.apm_at[node];
             let (a, a2) = if fr < 64 { (b, self.apm2_at[node]) } else { (b + 1, self.apm2_at[node] + 1) };
-            cupd(&mut self.apm[a], bit, &self.div);
-            cupd(&mut self.apm2[a2], bit, &self.div);
+            update(&mut self.apm[a], bit);
+            update(&mut self.apm2[a2], bit);
             for oi in 0..ORDERS.len() {
                 let s = self.slots[oi] + node;
-                if oi < self.n_direct { cupd(&mut self.direct[oi][s], bit, &self.div) } else { cupd(&mut self.hashed[oi - self.n_direct][s], bit, &self.div) }
+                if oi < self.n_direct { update(&mut self.direct[oi][s], bit) } else { update(&mut self.hashed[oi - self.n_direct][s], bit) }
             }
             for j in 0..N_MODELS {
                 if let Some(e) = self.preds[j] {
                     if node == 0 || (node - 1) as u8 == e >> 1 {
                         let eb = if node == 0 { e >> 1 } else { e & 1 } as u32;
-                        cupd(&mut self.mprob[(j * 28 + self.models[j].bucket(k)) * 2 + (node > 0) as usize], (eb == bit) as u32, &self.div);
+                        update(&mut self.mprob[(j * 28 + self.models[j].bucket(k)) * 2 + (node > 0) as usize], (eb == bit) as u32);
                     }
                 }
             }
@@ -485,42 +472,6 @@ impl Model {
     }
 }
 
-// Binary arithmetic coder ------------------------------------------------------
-
-/// Carryless 32-bit binary arithmetic coder (as lpaq) with 16-bit probabilities of a 1.
-struct Encoder { x1: u32, x2: u32, out: Vec<u8> }
-impl Encoder {
-    fn new() -> Encoder { Encoder { x1: 0, x2: u32::MAX, out: Vec::new() } }
-    fn bit(&mut self, bit: u32, p1: u32) {
-        let xmid = self.x1 + (((self.x2 - self.x1) as u64 * p1 as u64) >> 16) as u32;
-        if bit == 1 { self.x2 = xmid } else { self.x1 = xmid + 1 }
-        while (self.x1 ^ self.x2) & 0xFF00_0000 == 0 { self.out.push((self.x2 >> 24) as u8); self.x1 <<= 8; self.x2 = (self.x2 << 8) | 255; }
-    }
-    fn finish(mut self) -> Vec<u8> { for _ in 0..4 { self.out.push((self.x1 >> 24) as u8); self.x1 <<= 8; } self.out }
-}
-struct Decoder<'a> { x1: u32, x2: u32, x: u32, inp: &'a [u8], pos: usize }
-impl<'a> Decoder<'a> {
-    fn new(inp: &'a [u8]) -> Decoder<'a> {
-        let mut d = Decoder { x1: 0, x2: u32::MAX, x: 0, inp, pos: 0 };
-        for _ in 0..4 { d.x = (d.x << 8) | d.byte(); }
-        d
-    }
-    fn byte(&mut self) -> u32 { let b = self.inp.get(self.pos).copied().unwrap_or(0); self.pos += 1; b as u32 }
-    fn bit(&mut self, p1: u32) -> u32 {
-        let xmid = self.x1 + (((self.x2 - self.x1) as u64 * p1 as u64) >> 16) as u32;
-        let bit = (self.x <= xmid) as u32;
-        if bit == 1 { self.x2 = xmid } else { self.x1 = xmid + 1 }
-        while (self.x1 ^ self.x2) & 0xFF00_0000 == 0 { self.x1 <<= 8; self.x2 = (self.x2 << 8) | 255; self.x = (self.x << 8) | self.byte(); }
-        bit
-    }
-}
-
-/// Either side of the coder: codes `bit` (ignored when decoding) with
-/// probability `p1` (16-bit) of a 1 and returns the bit.
-trait Coder { fn code(&mut self, bit: u32, p1: u32) -> u32; }
-impl Coder for Encoder { fn code(&mut self, bit: u32, p1: u32) -> u32 { self.bit(bit, p1); bit } }
-impl Coder for Decoder<'_> { fn code(&mut self, _bit: u32, p1: u32) -> u32 { self.bit(p1) } }
-
 /// Probabilities of the four bases with the excluded ones (bit mask) removed, and their sum.
 fn node_probs(p: [u32; 3], ex: u8) -> ([u64; 4], u64) {
     let mut q = [
@@ -550,30 +501,9 @@ fn code_base<C: Coder>(c: &mut C, p: [u32; 3], ex: u8, sym: u8) -> u8 {
     ((b1 << 1) | b0) as u8
 }
 
-/// Codes `v` (< 2^nbits) through an adaptive binary tree.
-fn code_tree<C: Coder>(c: &mut C, tree: &mut [u32], nbits: u32, v: u32, div: &[u32]) -> u32 {
-    let mut node = 1usize;
-    let mut got = 0u32;
-    for b in (0..nbits).rev() {
-        let bit = c.code((v >> b) & 1, (tree[node] >> 16).clamp(1, 65535));
-        cupd(&mut tree[node], bit, div);
-        node = node * 2 + bit as usize;
-        got = (got << 1) | bit;
-    }
-    got
-}
-
-/// Codes `v` as an adaptive Elias-gamma bucket (6-bit tree) plus raw low bits.
-fn code_gamma<C: Coder>(c: &mut C, tree: &mut [u32], v: u64, div: &[u32]) -> u64 {
-    let bucket = code_tree(c, tree, 6, 64 - (v + 1).leading_zeros() - 1, div) + 1;
-    let mut x = 1u64;
-    for b in (0..bucket - 1).rev() { x = (x << 1) | c.code((((v + 1) >> b) & 1) as u32, 32768) as u64; }
-    x - 1
-}
-
 /// Codes `n` lengths, longest first: the first as 32 raw bits, then the
 /// differences from the previous one. Decoding appends them to `lens`.
-fn code_lengths<C: Coder>(c: &mut C, lens: &mut Vec<usize>, n: usize, div: &[u32]) {
+fn code_lengths<C: Coder>(c: &mut C, lens: &mut Vec<usize>, n: usize) {
     let mut tree = vec![C0; 128];
     let mut prev = 0usize;
     for j in 0..n {
@@ -583,7 +513,7 @@ fn code_lengths<C: Coder>(c: &mut C, lens: &mut Vec<usize>, n: usize, div: &[u32
             v as usize
         } else {
             let d = if lens.len() > j { (prev - lens[j]) as u64 } else { 0 };
-            prev - code_gamma(c, &mut tree, d, div) as usize
+            prev - code_gamma(c, &mut tree, d) as usize
         };
         if lens.len() <= j { lens.push(v); }
         prev = v;
@@ -683,7 +613,6 @@ fn end_ctx(model: &Model, pos: usize) -> usize {
 fn code_bases<C: Coder>(c: &mut C, model: &mut Model, text: &mut Vec<u8>, slots: &mut [Slot], encode: bool) -> Result<(), E> {
     let k = model.k;
     let w = k - 1;
-    let div = model.div.clone();
     let mut end_tab = vec![C0; 2 * 7 * 7];
     let mut starts: Vec<usize> = Vec::with_capacity(slots.len() + 1);
     let mut i = 0usize;
@@ -697,7 +626,7 @@ fn code_bases<C: Coder>(c: &mut C, model: &mut Model, text: &mut Vec<u8>, slots:
                 if pos == 2 * k - 1 { slot.len = pos; break } // the longest short tig
                 let x = end_ctx(model, pos);
                 let bit = c.code((pos == slot.len) as u32, (end_tab[x] >> 16).clamp(1, 65535));
-                cupd(&mut end_tab[x], bit, &div);
+                update(&mut end_tab[x], bit);
                 if bit == 1 { slot.len = pos; break }
             }
             let tig_of = |p: usize| starts.partition_point(|&x| x <= p) - 1;
@@ -738,21 +667,20 @@ pub fn encode<W: Write>(
     let n: usize = codes.iter().map(|t| t.len()).sum();
     let plan = plan(codes, k);
     let mut model = Model::new(k, n);
-    let div = model.div.clone();
     let mut enc = Encoder::new();
     let mut ll: Vec<usize> = plan.long.iter().map(|t| t.len()).collect();
-    code_lengths(&mut enc, &mut ll, plan.long.len(), &div);
+    code_lengths(&mut enc, &mut ll, plan.long.len());
     let mut rl: Vec<usize> = plan.rest.iter().map(|t| t.len()).collect();
-    code_lengths(&mut enc, &mut rl, plan.rest.len(), &div);
+    code_lengths(&mut enc, &mut rl, plan.rest.len());
     let mut tpos = vec![C0; 128];
     let mut tstrand = C0;
     for round in &plan.rounds {
         let mut prev = 0usize;
         for (p, rev, _) in round {
-            code_gamma(&mut enc, &mut tpos, (p - prev) as u64, &div);
+            code_gamma(&mut enc, &mut tpos, (p - prev) as u64);
             prev = *p;
             let bit = enc.code(*rev as u32, (tstrand >> 16).clamp(1, 65535));
-            cupd(&mut tstrand, bit, &div);
+            update(&mut tstrand, bit);
         }
     }
     let mut text: Vec<u8> = Vec::with_capacity(n);
@@ -788,23 +716,22 @@ pub fn decode<R: Read>(
     let (n_long, n_rest) = (u32_at(16)?, u32_at(20)?);
     let round_n: Vec<usize> = (0..n_rounds).map(|r| u32_at(24 + 4 * r)).collect::<Result<_, _>>()?;
     let mut model = Model::new(k, n);
-    let div = model.div.clone();
     let mut dec = Decoder::new(&data[24 + 4 * n_rounds..]);
     let mut ll = Vec::new();
-    code_lengths(&mut dec, &mut ll, n_long, &div);
+    code_lengths(&mut dec, &mut ll, n_long);
     let mut rl = Vec::new();
-    code_lengths(&mut dec, &mut rl, n_rest, &div);
+    code_lengths(&mut dec, &mut rl, n_rest);
     let mut tpos = vec![C0; 128];
     let mut tstrand = C0;
     let mut slots: Vec<Slot> = ll.iter().map(|&l| Slot { anchor: None, len: l, known: true }).collect();
     for &c in &round_n {
         let mut prev = 0usize;
         for _ in 0..c {
-            let p = prev + code_gamma(&mut dec, &mut tpos, 0, &div) as usize;
+            let p = prev + code_gamma(&mut dec, &mut tpos, 0) as usize;
             prev = p;
             let rev = rc_anchors && {
                 let bit = dec.code(0, (tstrand >> 16).clamp(1, 65535));
-                cupd(&mut tstrand, bit, &div);
+                update(&mut tstrand, bit);
                 bit == 1
             };
             slots.push(Slot { anchor: Some((p, rev)), len: 0, known: false });
