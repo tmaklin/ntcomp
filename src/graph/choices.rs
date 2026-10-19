@@ -27,41 +27,39 @@
 //! The edges of every node are ordered by how many times the colours take
 //! them (see [GraphBuilder](super::GraphBuilder)), so rank 0 is the most common
 //! choice. Related colours also make the same choices through the same parts
-//! of the graph. The streams of all colours are therefore stored together as
-//! one LZMA stream ([LzmaData]), which is decompressed when the choices
-//! are loaded. Decoding a colour only reads its own stream.
+//! of the graph. In the archive the choices of all colours are coded together
+//! by a context-mixing model that predicts each colour's choices from those
+//! of earlier colours ([super::choice_model]); decoding needs the graph and
+//! rebuilds these streams.
 //!
 use super::bits::{BitReader, BitWriter};
-use super::lzma_wrapper::{self, LzmaData};
+use super::{choice_model, StoredGraph};
 
 /// Choice streams of every colour.
-///
-/// Serialized as [LzmaData] holding the postcard serialized streams.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Choices {
     pub streams: Vec<ChoiceStream>,
 }
 
 impl Choices {
-    /// Compresses the streams.
+    /// Codes the streams of the colours walking `graph`, see [choice_model].
     pub fn to_stored(
         &self,
-    ) -> Result<LzmaData, String> {
-        let streams = postcard::to_allocvec(&self.streams).map_err(|e| format!("choice streams: {}", e))?;
-        lzma_wrapper::compress(&streams).map_err(|e| format!("choice streams: {}", e))
+        graph: &StoredGraph,
+    ) -> Result<Vec<u8>, String> {
+        choice_model::encode(graph, self).map_err(|e| format!("choice streams: {}", e))
     }
 
-    /// Decompresses the streams.
+    /// Decodes the streams of `n_colors` colours walking `graph`, see [Choices::to_stored].
     pub fn from_stored(
-        stored: LzmaData,
+        stored: &[u8],
+        graph: &StoredGraph,
+        n_colors: usize,
     ) -> Result<Self, String> {
-        let streams = lzma_wrapper::decompress(&stored).map_err(|e| format!("choice streams: {}", e))?;
-        let streams = postcard::from_bytes(&streams).map_err(|e| format!("choice streams: {}", e))?;
-        Ok(Choices { streams })
+        choice_model::decode(graph, n_colors, stored).map_err(|e| format!("choice streams: {}", e))
     }
 
-    /// Total number of recorded choices (0 for decoded choices, see
-    /// [ChoiceStream::n_choices]).
+    /// Total number of recorded choices.
     pub fn n_choices(&self) -> usize {
         self.streams.iter().map(|x| x.n_choices as usize).sum()
     }
@@ -76,11 +74,9 @@ impl Choices {
 }
 
 /// Choices of one colour.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChoiceStream {
-    /// Number of choices in the stream, as written by [ChoiceWriter]; not
-    /// stored (0 in decoded streams).
-    #[serde(skip)]
+    /// Number of choices in the stream, as written by [ChoiceWriter].
     pub n_choices: u32,
 
     /// Truncated binary codes, most significant bit first.
@@ -143,19 +139,6 @@ impl ChoiceReader<'_> {
     }
 }
 
-impl serde::Serialize for Choices {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_stored().map_err(serde::ser::Error::custom)?.serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Choices {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let stored = LzmaData::deserialize(deserializer)?;
-        Choices::from_stored(stored).map_err(serde::de::Error::custom)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,16 +161,11 @@ mod tests {
         let large = vec![(0, 100_000), (99_999, 100_000), (65_536, 70_000), (3, 4)];
         let choices = vec![all, vec![], large];
         let stored = encode(&choices);
-
-        let bytes = postcard::to_allocvec(&stored).unwrap();
-        let decoded: Choices = postcard::from_bytes(&bytes).unwrap();
-        // The bits are stored, the counts are not.
-        assert_eq!(decoded.streams.iter().map(|s| &s.bits).collect::<Vec<_>>(), stored.streams.iter().map(|s| &s.bits).collect::<Vec<_>>());
-        assert!(decoded.streams.iter().all(|s| s.n_choices == 0));
+        assert_eq!(stored.n_choices(), choices.iter().map(|c| c.len()).sum::<usize>());
 
         // Decode in reverse order to check that the colours are independent.
         for (color, expected) in choices.iter().enumerate().rev() {
-            let mut reader = decoded.reader(color as u32).unwrap();
+            let mut reader = stored.reader(color as u32).unwrap();
             for (i, &(rank, n)) in expected.iter().enumerate() {
                 // Not finished while choices are left.
                 assert!(!reader.is_finished(), "colour {} finished after {} choices", color, i);
@@ -195,7 +173,7 @@ mod tests {
             }
             assert!(reader.is_finished());
         }
-        assert!(decoded.reader(3).is_none());
+        assert!(stored.reader(3).is_none());
     }
 
     #[test]
@@ -205,27 +183,5 @@ mod tests {
             writer.push(i % 2, 2);
         }
         assert_eq!(writer.finish().bits, vec![0b01010101, 0b01010101]);
-    }
-
-    #[test]
-    fn repeated_choices_compress() {
-        // Many colours making the same, mostly rank 0, choices.
-        let colour: Vec<(u32, u32)> = (0..2000).map(|i| ((i % 13 == 0) as u32, 2 + (i % 3))).collect();
-        let choices = encode(&vec![colour; 50]);
-        let uncompressed = postcard::to_allocvec(&choices.streams).unwrap().len();
-        let stored = postcard::to_allocvec(&choices).unwrap().len();
-        assert!(stored * 20 < uncompressed, "{} vs {}", stored, uncompressed);
-    }
-
-    #[test]
-    fn empty_and_corrupt_choices() {
-        let empty = Choices::default();
-        let decoded: Choices = postcard::from_bytes(&postcard::to_allocvec(&empty).unwrap()).unwrap();
-        assert_eq!(decoded, empty);
-
-        let colour: Vec<(u32, u32)> = (0..2000).map(|i| ((i * 7 % 5) as u32, 5)).collect();
-        let mut stored = encode(&[colour]).to_stored().unwrap();
-        stored.bytes.truncate(stored.bytes.len() / 2);
-        assert!(Choices::from_stored(stored).is_err());
     }
 }

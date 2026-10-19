@@ -65,6 +65,7 @@ use sbwt::LcsArray;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 pub mod bits;
+pub mod choice_model;
 pub mod choices;
 pub mod collapsed;
 pub mod decoder;

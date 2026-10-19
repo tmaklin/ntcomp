@@ -68,15 +68,6 @@ fn read_section<T: serde::de::DeserializeOwned, R: Read>(
     Ok(Some(postcard::from_bytes(&read_bytes(input, n_bytes)?)?))
 }
 
-/// Deserializes a section that must be present.
-fn read_required_section<T: serde::de::DeserializeOwned, R: Read>(
-    input: &mut R,
-    n_bytes: u64,
-    name: &str,
-) -> Result<T, E> {
-    read_section(input, n_bytes)?.ok_or_else(|| Box::new(ArchiveError(format!("the {} section is missing", name))) as E)
-}
-
 /// Contig names, LZMA compressed; None if the section is empty (absent).
 fn read_contig_names<R: Read>(
     input: &mut R,
@@ -219,7 +210,10 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if snp_edits.as_ref().is_some_and(|edits| edits.n_colors() != header.n_queries as usize) {
             return Err(Box::new(ArchiveError(format!("SNP section does not have {} colours", header.n_queries))))
         }
-        let choices: Choices = read_required_section(reader, header.choice_bytes, "choice")?;
+        if header.choice_bytes == 0 {
+            return Err(Box::new(ArchiveError("the choice section is missing".to_string())))
+        }
+        let choices = Choices::from_stored(&read_bytes(reader, header.choice_bytes)?, &graph, header.n_queries as usize)?;
 
         Ok((graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits))
     }

@@ -17,7 +17,10 @@
 //! - [arith]: a binary arithmetic coder with adaptive bit models and helpers
 //!   for coding numbers with them; used by the archive format
 //!   ([crate::graph]) and the tig coder.
+//! - [mix]: the stretch and squash tables of logistic mixing, computed in
+//!   integer arithmetic; used by the context-mixing models.
 //! - [tigs]: the context-mixing DNA coder that stores the index tigs
 //!   ([crate::tigs::write_tigs], [crate::tigs::read_tigs]).
 pub mod arith;
+pub mod mix;
 pub mod tigs;

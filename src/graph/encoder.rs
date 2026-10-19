@@ -228,7 +228,7 @@ impl<'a> GraphEncoder<'a> {
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;
         let graph_bytes = self.graph.to_bytes(self.lcs, self.k)?;
-        let choice_bytes = to_allocvec(&self.choices)?;
+        let choice_bytes = self.choices.to_stored(&self.graph)?;
 
         let header = FileHeader{
             nlz_header: [0_u8; 6],
