@@ -83,7 +83,7 @@
 //! every junction except the sink, in junction order, then the number of
 //! inner nodes of every chain, in chain order, then the contig lengths (the
 //! suffix lengths of the edges out of the dummy source, in chain order). Each
-//! is an adaptive Elias-gamma code ([GammaModel]: of the degree, of the number
+//! is an adaptive Elias-gamma code ([GammaModel](crate::coder::arith::GammaModel): of the degree, of the number
 //! of inner nodes + 1, of the contig length + 1).
 //! The chain lengths have one model per context: the out-degree of the
 //! chain's source junction (capped at 8) and the length of the previous chain
@@ -112,7 +112,7 @@ use super::{
     Walkable,
 };
 use super::bits::{BitReader, BitWriter};
-use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, C0};
+use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 
 /// Smallest number of suffix lengths coded directly (not escaped): lengths
 /// up to this are coded directly even when _k_ is smaller (left extensions
@@ -250,43 +250,6 @@ fn code_targets<C: Coder>(
         out.push(next_new - 1 - d as u32);
     }
     Ok((out, next_new))
-}
-
-/// Adaptive Elias-gamma code of a number w ≥ 1: the bit length of w through a
-/// 6-bit adaptive tree and the bits below its top one, the first
-/// [GammaModel::MODELLED_BITS] adaptive given the bit length and the bits
-/// above them, the rest raw.
-struct GammaModel {
-    bits: Vec<u32>,
-    low: Vec<u32>,
-}
-
-impl GammaModel {
-    const MODELLED_BITS: u32 = 4;
-
-    fn new() -> Self {
-        GammaModel { bits: vec![C0; 64], low: vec![C0; 65 << Self::MODELLED_BITS] }
-    }
-
-    /// Codes (or decodes, `w` ignored) a number w ≥ 1.
-    fn code<C: Coder>(
-        &mut self,
-        c: &mut C,
-        w: u64,
-    ) -> u64 {
-        let n = code_tree(c, &mut self.bits, 6, 63 - w.max(1).leading_zeros()) + 1;
-        let mut x = 1_u64;
-        for (j, b) in (0..n - 1).rev().enumerate() {
-            let truth = ((w >> b) & 1) as u32;
-            let bit = if (j as u32) < Self::MODELLED_BITS {
-                code_bit(c, &mut self.low[((n as usize) << Self::MODELLED_BITS) + x as usize], truth)
-            } else {
-                c.code(truth, 32768)
-            };
-            x = (x << 1) | bit as u64;
-        }
-        x
-    }
 }
 
 /// Context of a chain length: the source junction's out-degree (capped at 8)

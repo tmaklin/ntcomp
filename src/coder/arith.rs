@@ -165,6 +165,47 @@ pub fn code_gamma<C: Coder>(
     x - 1
 }
 
+/// Adaptive Elias-gamma code of a number w ≥ 1: the bit length of w through a
+/// 6-bit adaptive tree and the bits below its top one, the first
+/// [GammaModel::MODELLED_BITS] adaptive given the bit length and the bits
+/// above them, the rest raw.
+pub struct GammaModel {
+    bits: Vec<u32>,
+    low: Vec<u32>,
+}
+
+impl Default for GammaModel {
+    fn default() -> Self { Self::new() }
+}
+
+impl GammaModel {
+    pub const MODELLED_BITS: u32 = 4;
+
+    pub fn new() -> Self {
+        GammaModel { bits: vec![C0; 64], low: vec![C0; 65 << Self::MODELLED_BITS] }
+    }
+
+    /// Codes (or decodes, `w` ignored) a number w ≥ 1.
+    pub fn code<C: Coder>(
+        &mut self,
+        c: &mut C,
+        w: u64,
+    ) -> u64 {
+        let n = code_tree(c, &mut self.bits, 6, 63 - w.max(1).leading_zeros()) + 1;
+        let mut x = 1_u64;
+        for (j, b) in (0..n - 1).rev().enumerate() {
+            let truth = ((w >> b) & 1) as u32;
+            let bit = if (j as u32) < Self::MODELLED_BITS {
+                code_bit(c, &mut self.low[((n as usize) << Self::MODELLED_BITS) + x as usize], truth)
+            } else {
+                c.code(truth, 32768)
+            };
+            x = (x << 1) | bit as u64;
+        }
+        x
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,36 +34,38 @@
 //! is the same as there and occurs once in the contig.
 //!
 //! Every colour has an id list: its new SNPs in position order, then its
-//! repeats. A colour with repeats names a *reference*, an earlier colour, and
-//! which entries of the reference's id list it shares; its repeats are those
-//! entries. Related contigs share runs of SNPs, so this costs a few bits per
-//! repeat. Repeats of SNPs not in the reference are stored as new.
+//! repeats. A colour with repeats may name a *reference*, the earlier colour
+//! holding most of them, and which entries of the reference's id list it
+//! shares; related contigs share runs of SNPs, so this costs a fraction of a
+//! bit per entry. Its other repeats are *direct*: their ids.
 //!
-//! Per colour, in contig order, the bit stream has:
-//!
+//! All colours are coded as one stream with the arithmetic coder
+//! ([crate::coder::arith]): the number of colours, then per colour
+//! - the number of new SNPs (adaptive Elias gamma, by whether the previous
+//!   colour had none);
 //! - its new SNPs: the gap from the base after the previous new SNP (from the
-//!   start of the contig for the first one) as a Huffman-coded bit length
-//!   followed by the lower bits, and the original base as its distance from
-//!   the index's base (1, 2 or 3 in A, C, G, T order; 2 is a transition), also
-//!   Huffman coded. The index's base is read from the decoded (edited) contig.
-//! - with a reference: one bit for how the shared entries are coded, then
-//!   either a flag per entry of the reference's id list, or their number and
-//!   the gaps between their indices, both Elias gamma coded.
+//!   start of the contig for the first one), adaptive Elias gamma by the
+//!   bit length of the previous gap, and the original base as its distance
+//!   from the index's base (1, 2 or 3 in A, C, G, T order; 2 is a
+//!   transition), adaptive. The index's base is read from the decoded
+//!   (edited) contig;
+//! - whether it has a reference; if so the distance back to it and a flag per
+//!   entry of the reference's id list (adaptive, by the previous two flags,
+//!   whether the entry is one of the reference's new SNPs and whether it is
+//!   the last);
+//! - the number of direct repeats and their ids in increasing order: the
+//!   first as the distance back from the newest id of the earlier colours,
+//!   the others as differences (adaptive Elias gamma, by the bit length of
+//!   the previous one).
 //!
-//! The number of new SNPs and the distance back to the reference (0 for
-//! none) are stored per colour; the streams of all colours are compressed
-//! together with LZMA.
-//!
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use sbwt::LcsArray;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
-use super::bits::{BitReader, BitWriter};
-use super::huffman::HuffmanCode;
-use super::lzma_wrapper::{self, LzmaData};
+use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 
 /// Default for the largest number of contigs that may share a SNP for it to
 /// be edited.
@@ -75,12 +77,6 @@ pub const FLANK: usize = 32;
 /// Length of the context that locates a repeated SNP: [FLANK] bases on both
 /// sides of the index's base.
 pub const CONTEXT: usize = 2 * FLANK + 1;
-
-/// Number of gap symbols: the bit length of gap + 1, at most 64.
-const N_GAP_SYMBOLS: usize = 65;
-
-/// Number of base symbols: the distance from the index's base, 1..=3.
-const N_BASE_SYMBOLS: usize = 4;
 
 /// A SNP of a contig against the index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,88 +268,182 @@ pub fn with_contexts(
     }).collect()
 }
 
-/// Edited SNPs of one colour, as stored.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq, Eq)]
-pub struct SnpStream {
-    /// Number of new SNPs in the stream.
-    pub n_snps: u32,
-
-    /// Colours back to the reference (0: no repeats).
-    pub reference: u32,
-
-    /// New SNPs and the shared entries of the reference, most significant
-    /// bit first.
-    pub bits: Vec<u8>,
-}
-
-/// Edited SNPs of every colour, see the module docs.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq, Eq)]
-struct StoredSnps {
-    /// Huffman code lengths of the gap symbols.
-    gap_code: Vec<u8>,
-
-    /// Huffman code lengths of the base symbols.
-    base_code: Vec<u8>,
-
-    /// One stream per colour.
-    streams: Vec<SnpStream>,
-}
-
-/// SNPs of one colour, decoded.
+/// SNPs of one colour.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ColourSnps {
     /// New SNPs: position and the base's distance from the index's base.
     new: Vec<(u32, u8)>,
-    /// Ids of the repeated SNPs.
+    /// Colours back to the reference (0: none).
+    reference: u32,
+    /// Indices of the shared entries in the reference's id list, increasing.
+    shared: Vec<u32>,
+    /// Ids of the other repeated SNPs, increasing.
+    direct: Vec<u32>,
+    /// Ids of all repeated SNPs: the shared entries', then the direct ones.
     repeats: Vec<u32>,
 }
 
 /// Edited SNPs of every colour.
 ///
-/// Serialized as LZMA-compressed [StoredSnps].
+/// Serialized as the arithmetic-coded stream of [SnpEdits::to_bytes].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnpEdits {
-    gap_code: HuffmanCode,
-    base_code: HuffmanCode,
-    streams: Vec<SnpStream>,
     colours: Vec<ColourSnps>,
     /// Colour and index in its new SNPs of every id.
     ids: Vec<(u32, u32)>,
-}
-
-fn gap_symbol(
-    gap: u64,
-) -> usize {
-    (64 - (gap + 1).leading_zeros()) as usize
 }
 
 /// Distance of `base` from `index_base`, 1..=3.
 fn base_symbol(
     base: u8,
     index_base: u8,
+) -> u8 {
+    (base_code(base).unwrap() + 4 - base_code(index_base).unwrap()) % 4
+}
+
+fn bit_length(
+    x: u64,
 ) -> usize {
-    ((base_code(base).unwrap() + 4 - base_code(index_base).unwrap()) % 4) as usize
+    (64 - x.leading_zeros()) as usize
 }
 
-fn write_gamma(
-    bits: &mut BitWriter,
-    value: u64,
-) {
-    // value >= 1
-    let n = 64 - value.leading_zeros();
-    bits.write_bits(0, n - 1);
-    bits.write_bits(value, n);
+/// Adaptive models of the SNP stream, see the module docs.
+struct Models {
+    n_new: [GammaModel; 2],
+    has_reference: [u32; 2],
+    distance: GammaModel,
+    flags: [u32; 16],
+    gaps: Vec<GammaModel>,
+    bases: [u32; 4],
+    n_direct: [GammaModel; 2],
+    ids: Vec<GammaModel>,
 }
 
-fn read_gamma(
-    bits: &mut BitReader,
-) -> Option<u64> {
-    let mut zeros = 0;
-    while bits.read_bits(1)? == 0 {
-        zeros += 1;
-        if zeros > 63 { return None }
+/// Contexts of the gaps and the direct ids: the bit length of the previous
+/// value (0 for none), capped.
+const N_LENGTH_CONTEXTS: usize = 24;
+
+impl Models {
+    fn new() -> Self {
+        Models {
+            n_new: [GammaModel::new(), GammaModel::new()],
+            has_reference: [C0; 2],
+            distance: GammaModel::new(),
+            flags: [C0; 16],
+            gaps: (0..N_LENGTH_CONTEXTS).map(|_| GammaModel::new()).collect(),
+            bases: [C0; 4],
+            n_direct: [GammaModel::new(), GammaModel::new()],
+            ids: (0..N_LENGTH_CONTEXTS).map(|_| GammaModel::new()).collect(),
+        }
     }
-    Some((1_u64 << zeros) | bits.read_bits(zeros)?)
+}
+
+/// Codes (`colours` Some) or decodes the SNPs of every colour; returns them
+/// with the id of every new SNP.
+fn code_all<C: Coder>(
+    c: &mut C,
+    colours: Option<&[ColourSnps]>,
+    overrun: &dyn Fn(&C) -> bool,
+) -> Result<(Vec<ColourSnps>, Vec<(u32, u32)>), SnpDecodeError> {
+    let truncated = || SnpDecodeError("SNP stream truncated".to_string());
+    let mut m = Models::new();
+    let n_colors = GammaModel::new().code(c, colours.map_or(0, |x| x.len()) as u64 + 1) - 1;
+    let n_colors: usize = n_colors.try_into().map_err(|_| truncated())?;
+    let mut out: Vec<ColourSnps> = Vec::with_capacity(n_colors.min(1 << 20));
+    let mut lists: Vec<Vec<u32>> = Vec::with_capacity(n_colors.min(1 << 20));
+    let mut ids: Vec<(u32, u32)> = Vec::new();
+    let mut previous_empty = 1;
+    for col in 0..n_colors {
+        if overrun(c) {
+            return Err(truncated())
+        }
+        let truth = colours.map(|x| &x[col]);
+        let error = |what: &str| SnpDecodeError(format!("SNPs of colour {}: {}", col, what));
+        let n_new = m.n_new[previous_empty].code(c, truth.map_or(0, |t| t.new.len()) as u64 + 1) - 1;
+        let n_new: u32 = n_new.try_into().map_err(|_| error("too many SNPs"))?;
+        let empty = (n_new == 0) as usize;
+        previous_empty = empty;
+
+        // New SNPs: the gap from the base after the previous one, and the base.
+        let mut new: Vec<(u32, u8)> = Vec::with_capacity((n_new as usize).min(1 << 20));
+        let mut list: Vec<u32> = Vec::with_capacity((n_new as usize).min(1 << 20));
+        let (mut next, mut previous_length) = (0_u64, 0_usize);
+        for i in 0..n_new {
+            let (pos, distance) = truth.map_or((0, 1), |t| t.new[i as usize]);
+            let gap = m.gaps[previous_length.min(N_LENGTH_CONTEXTS - 1)].code(c, pos as u64 - next + 1) - 1;
+            previous_length = bit_length(gap + 1);
+            let pos: u32 = (next + gap).try_into().map_err(|_| error("position beyond 32 bits"))?;
+            let distance = code_tree(c, &mut m.bases, 2, distance as u32 - 1) + 1;
+            if distance > 3 {
+                return Err(error("a SNP does not change the base"))
+            }
+            new.push((pos, distance as u8));
+            list.push(ids.len() as u32);
+            ids.push((col as u32, i));
+            next = pos as u64 + 1;
+            if i % 1024 == 1023 && overrun(c) {
+                return Err(truncated())
+            }
+        }
+        let ids_before = (ids.len() - n_new as usize) as u64;
+
+        // The reference and its shared entries: a flag per entry of its id list.
+        let has_reference = code_bit(c, &mut m.has_reference[empty], truth.map_or(0, |t| (t.reference > 0) as u32));
+        let (mut reference, mut shared) = (0_u32, Vec::new());
+        let mut repeats: Vec<u32> = Vec::new();
+        if has_reference == 1 {
+            let distance = m.distance.code(c, truth.map_or(1, |t| t.reference as u64));
+            if distance == 0 || distance > col as u64 {
+                return Err(error("reference before the first colour"))
+            }
+            reference = distance as u32;
+            let r = col - distance as usize;
+            let n_new_reference = out[r].new.len();
+            let entries = &lists[r];
+            let wanted = truth.map(|t| &t.shared);
+            let (mut f1, mut f2, mut j) = (0, 0, 0);
+            for (i, &id) in entries.iter().enumerate() {
+                let flag = wanted.is_some_and(|w| j < w.len() && w[j] as usize == i);
+                if flag { j += 1; }
+                let context = ((f1 * 2 + f2) * 2 + (i < n_new_reference) as usize) * 2 + (i + 1 == entries.len()) as usize;
+                let flag = code_bit(c, &mut m.flags[context], flag as u32) as usize;
+                if flag == 1 {
+                    shared.push(i as u32);
+                    repeats.push(id);
+                }
+                (f2, f1) = (f1, flag);
+            }
+        }
+
+        // Direct repeats: ids, the first as the distance back from the newest
+        // earlier id, then the differences.
+        let n_direct = m.n_direct[empty].code(c, truth.map_or(0, |t| t.direct.len()) as u64 + 1) - 1;
+        if n_direct > ids_before {
+            return Err(error("more repeats than earlier SNPs"))
+        }
+        let mut direct: Vec<u32> = Vec::with_capacity(n_direct as usize);
+        let (mut previous, mut previous_length) = (None::<u64>, 0_usize);
+        for i in 0..n_direct as usize {
+            let id = truth.map_or(0, |t| t.direct[i] as u64);
+            let (context, value) = match previous {
+                None => (0, ids_before - id),
+                Some(p) => (1 + previous_length.min(N_LENGTH_CONTEXTS - 2), id - p),
+            };
+            let value = m.ids[context].code(c, value);
+            previous_length = bit_length(value);
+            let id = match previous {
+                None => ids_before.checked_sub(value),
+                Some(p) => p.checked_add(value),
+            }.filter(|&id| id < ids_before && value > 0).ok_or_else(|| error("invalid repeat id"))?;
+            direct.push(id as u32);
+            previous = Some(id);
+        }
+        repeats.extend_from_slice(&direct);
+        list.extend_from_slice(&repeats);
+        lists.push(list);
+        out.push(ColourSnps { new, reference, shared, direct, repeats });
+    }
+    Ok((out, ids))
 }
 
 impl SnpEdits {
@@ -375,9 +465,8 @@ impl SnpEdits {
         // Colours whose id list holds an id.
         let mut holders: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut lists: Vec<Vec<u32>> = Vec::with_capacity(snps.len());
-        let mut next_id = 0_u32;
-        // Per colour: new SNPs, reference distance and the shared entries' indices.
-        let mut plan: Vec<(Vec<Snp>, u32, Vec<u32>)> = Vec::with_capacity(snps.len());
+        let mut colours: Vec<ColourSnps> = Vec::with_capacity(snps.len());
+        let mut ids: Vec<(u32, u32)> = Vec::new();
         for (c, colour) in snps.iter().enumerate() {
             let c = c as u32;
             let candidate: Vec<Option<u32>> = colour.iter().map(|s| {
@@ -385,149 +474,65 @@ impl SnpEdits {
                 let (id, context) = first.get(&s.key)?;
                 (s.context.as_ref() == Some(context)).then_some(*id)
             }).collect();
+            let mut wanted: HashSet<u32> = candidate.iter().flatten().copied().collect();
+            // The reference: the earlier colour holding the most candidates.
             let mut votes: HashMap<u32, usize> = HashMap::new();
-            for id in candidate.iter().flatten() {
+            for id in &wanted {
                 for &r in holders.get(id).map_or(&[][..], |v| v.as_slice()) { *votes.entry(r).or_default() += 1; }
             }
             let reference = votes.into_iter().max_by_key(|&(r, v)| (v, r)).map(|(r, _)| r);
             let mut shared: Vec<u32> = Vec::new();
-            let mut repeat_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            if let Some(r) = reference {
-                let wanted: std::collections::HashSet<u32> = candidate.iter().flatten().copied().collect();
-                for (i, id) in lists[r as usize].iter().enumerate() {
-                    if wanted.contains(id) { shared.push(i as u32); repeat_ids.insert(*id); }
-                }
-            }
-            let mut list: Vec<u32> = Vec::new();
-            let mut new: Vec<Snp> = Vec::new();
-            for (s, cand) in colour.iter().zip(&candidate) {
-                if cand.is_some_and(|id| repeat_ids.contains(&id)) { continue }
-                new.push(s.snp);
-                if let (Some(context), false) = (s.context, first.contains_key(&s.key)) {
-                    first.insert(s.key, (next_id, context));
-                }
-                list.push(next_id);
-                next_id += 1;
-            }
-            if let Some(r) = reference {
-                list.extend(shared.iter().map(|&i| lists[r as usize][i as usize]));
-            }
-            for &id in &list { holders.entry(id).or_default().push(c); }
-            lists.push(list);
-            let distance = if shared.is_empty() { 0 } else { c - reference.unwrap() };
-            plan.push((new, distance, if distance == 0 { Vec::new() } else { shared }));
-        }
-
-        let mut gap_counts = vec![0_u64; N_GAP_SYMBOLS];
-        let mut base_counts = vec![0_u64; N_BASE_SYMBOLS];
-        for (new, _, _) in &plan {
-            let mut next = 0_u64;
-            for snp in new {
-                gap_counts[gap_symbol(snp.pos as u64 - next)] += 1;
-                base_counts[base_symbol(snp.base, snp.index_base)] += 1;
-                next = snp.pos as u64 + 1;
-            }
-        }
-        let gap_code = HuffmanCode::from_counts(&gap_counts);
-        let base_code = HuffmanCode::from_counts(&base_counts);
-
-        let streams: Vec<SnpStream> = plan.iter().enumerate().map(|(c, (new, distance, shared))| {
-            let mut bits = BitWriter::new();
-            let mut next = 0_u64;
-            for snp in new {
-                assert!(snp.pos as u64 >= next, "SNPs are not sorted by position");
-                let gap = snp.pos as u64 - next;
-                let symbol = gap_symbol(gap);
-                gap_code.write(symbol, &mut bits);
-                bits.write_bits(gap + 1, symbol as u32 - 1);
-                base_code.write(base_symbol(snp.base, snp.index_base), &mut bits);
-                next = snp.pos as u64 + 1;
-            }
-            if *distance > 0 {
-                let n_ref = lists[c - *distance as usize].len();
-                // a flag per entry, or the count and the gaps (Elias gamma)
-                let gaps_len: u64 = {
-                    let mut prev = 0_u64;
-                    let mut len = 2 * (64 - (shared.len() as u64).leading_zeros() as u64) - 1;
-                    for &i in shared.iter() { let g = i as u64 - prev + 1; len += 2 * (64 - g.leading_zeros() as u64) - 1; prev = i as u64 + 1; }
-                    len
-                };
-                if (n_ref as u64) <= gaps_len {
-                    bits.write_bits(0, 1);
-                    let mut j = 0;
-                    for i in 0..n_ref as u32 {
-                        let flag = j < shared.len() && shared[j] == i;
-                        if flag { j += 1; }
-                        bits.write_bits(flag as u64, 1);
-                    }
-                } else {
-                    bits.write_bits(1, 1);
-                    write_gamma(&mut bits, shared.len() as u64);
-                    let mut prev = 0_u64;
-                    for &i in shared.iter() { write_gamma(&mut bits, i as u64 - prev + 1); prev = i as u64 + 1; }
-                }
-            }
-            SnpStream { n_snps: new.len().try_into().expect("too many SNPs"), reference: *distance, bits: bits.finish() }
-        }).collect();
-
-        SnpEdits::from_streams(gap_code, base_code, streams).expect("SNP streams written above decode")
-    }
-
-    /// Decodes the streams into new SNPs and repeats per colour.
-    fn from_streams(
-        gap_code: HuffmanCode,
-        base_code: HuffmanCode,
-        streams: Vec<SnpStream>,
-    ) -> Result<Self, SnpDecodeError> {
-        let mut colours: Vec<ColourSnps> = Vec::with_capacity(streams.len());
-        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(streams.len());
-        let mut ids: Vec<(u32, u32)> = Vec::new();
-        for (c, stream) in streams.iter().enumerate() {
-            let truncated = || SnpDecodeError(format!("SNP stream of colour {} is truncated", c));
-            let mut bits = BitReader::new(&stream.bits);
-            let mut new: Vec<(u32, u8)> = Vec::with_capacity(stream.n_snps as usize);
-            let mut list: Vec<u32> = Vec::new();
-            let mut next = 0_u64;
-            for i in 0..stream.n_snps {
-                let symbol = gap_code.read(&mut bits).ok_or_else(truncated)?;
-                if symbol == 0 {
-                    return Err(truncated())
-                }
-                let gap = ((1_u64 << (symbol - 1)) | bits.read_bits(symbol as u32 - 1).ok_or_else(truncated)?) - 1;
-                let pos = next + gap;
-                let base = base_code.read(&mut bits).ok_or_else(truncated)?;
-                if base == 0 {
-                    return Err(SnpDecodeError(format!("SNP of colour {} at {} does not change the base", c, pos)))
-                }
-                let pos: u32 = pos.try_into().map_err(|_| truncated())?;
-                new.push((pos, base as u8));
-                list.push(ids.len() as u32);
-                ids.push((c as u32, i));
-                next = pos as u64 + 1;
-            }
             let mut repeats: Vec<u32> = Vec::new();
-            if stream.reference > 0 {
-                let r = c.checked_sub(stream.reference as usize).ok_or_else(|| SnpDecodeError(format!("SNP reference of colour {} is before the first colour", c)))?;
-                let reference = &lists[r];
-                if bits.read_bits(1).ok_or_else(truncated)? == 0 {
-                    for &id in reference.iter() {
-                        if bits.read_bits(1).ok_or_else(truncated)? == 1 { repeats.push(id); }
-                    }
-                } else {
-                    let n = read_gamma(&mut bits).ok_or_else(truncated)?;
-                    let mut prev = 0_u64;
-                    for _ in 0..n {
-                        let i = prev + read_gamma(&mut bits).ok_or_else(truncated)? - 1;
-                        repeats.push(*reference.get(i as usize).ok_or_else(truncated)?);
-                        prev = i + 1;
-                    }
+            if let Some(r) = reference {
+                for (i, id) in lists[r as usize].iter().enumerate() {
+                    if wanted.remove(id) { shared.push(i as u32); repeats.push(*id); }
                 }
+            }
+            // The candidates the reference does not hold are direct repeats.
+            let mut direct: Vec<u32> = wanted.into_iter().collect();
+            direct.sort_unstable();
+            repeats.extend_from_slice(&direct);
+            let repeated: HashSet<u32> = repeats.iter().copied().collect();
+            let mut list: Vec<u32> = Vec::new();
+            let mut new: Vec<(u32, u8)> = Vec::new();
+            for (s, cand) in colour.iter().zip(&candidate) {
+                if cand.is_some_and(|id| repeated.contains(&id)) { continue }
+                let id = ids.len() as u32;
+                if let (Some(context), false) = (s.context, first.contains_key(&s.key)) {
+                    first.insert(s.key, (id, context));
+                }
+                list.push(id);
+                ids.push((c, new.len() as u32));
+                new.push((s.snp.pos, base_symbol(s.snp.base, s.snp.index_base)));
             }
             list.extend_from_slice(&repeats);
+            for &id in &list { holders.entry(id).or_default().push(c); }
             lists.push(list);
-            colours.push(ColourSnps { new, repeats });
+            let reference = if shared.is_empty() { 0 } else { c - reference.unwrap() };
+            colours.push(ColourSnps { new, reference, shared, direct, repeats });
         }
-        Ok(SnpEdits { gap_code, base_code, streams, colours, ids })
+        SnpEdits { colours, ids }
+    }
+
+    /// The arithmetic-coded stream (see the module docs).
+    pub fn to_bytes(
+        &self,
+    ) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        code_all(&mut encoder, Some(&self.colours), &|_| false).expect("valid SNPs");
+        encoder.finish()
+    }
+
+    /// Decodes the stream written by [SnpEdits::to_bytes].
+    pub fn from_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, SnpDecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let (colours, ids) = code_all(&mut decoder, None, &|d: &Decoder| d.overrun())?;
+        if decoder.overrun() {
+            return Err(SnpDecodeError("SNP stream truncated".to_string()))
+        }
+        Ok(SnpEdits { colours, ids })
     }
 
     /// Number of colours.
@@ -592,45 +597,18 @@ impl SnpEdits {
         }
         Ok(())
     }
-
-    fn to_stored(
-        &self,
-    ) -> Result<LzmaData, String> {
-        let stored = StoredSnps {
-            gap_code: self.gap_code.lengths().to_vec(),
-            base_code: self.base_code.lengths().to_vec(),
-            streams: self.streams.clone(),
-        };
-        let bytes = postcard::to_allocvec(&stored).map_err(|e| format!("SNPs: {}", e))?;
-        lzma_wrapper::compress(&bytes).map_err(|e| format!("SNPs: {}", e))
-    }
-
-    fn from_stored(
-        stored: LzmaData,
-    ) -> Result<Self, String> {
-        let bytes = lzma_wrapper::decompress(&stored).map_err(|e| format!("SNPs: {}", e))?;
-        let stored: StoredSnps = postcard::from_bytes(&bytes).map_err(|e| format!("SNPs: {}", e))?;
-        if stored.gap_code.len() != N_GAP_SYMBOLS || stored.base_code.len() != N_BASE_SYMBOLS {
-            return Err("SNPs: invalid code tables".to_string())
-        }
-        SnpEdits::from_streams(
-            HuffmanCode::from_lengths(stored.gap_code).map_err(|e| format!("SNP gaps: {}", e))?,
-            HuffmanCode::from_lengths(stored.base_code).map_err(|e| format!("SNP bases: {}", e))?,
-            stored.streams,
-        ).map_err(|e| e.to_string())
-    }
 }
 
 impl serde::Serialize for SnpEdits {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_stored().map_err(serde::ser::Error::custom)?.serialize(serializer)
+        self.to_bytes().serialize(serializer)
     }
 }
 
 impl<'de> serde::Deserialize<'de> for SnpEdits {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let stored = LzmaData::deserialize(deserializer)?;
-        SnpEdits::from_stored(stored).map_err(serde::de::Error::custom)
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        SnpEdits::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -682,9 +660,11 @@ mod tests {
         let edits = SnpEdits::new(&[vec![snp(3, b'A', b'C'), snp(1000, b'G', b'A')]]);
         // The contig is too short for the second SNP.
         assert!(edits.revert(0, &mut b"ACGTACGT".to_vec(), &|_, _| None).is_err());
-        let mut streams = edits.streams.clone();
-        streams[0].bits.truncate(1);
-        assert!(SnpEdits::from_streams(edits.gap_code.clone(), edits.base_code.clone(), streams).is_err());
+        let colours: Vec<Vec<Snp>> = (0..50).map(|c| (0..40).map(|i| snp(i * 97 + c, b'A', b"CGT"[(i % 3) as usize])).collect()).collect();
+        let bytes = SnpEdits::new(&colours).to_bytes();
+        assert!(SnpEdits::from_bytes(&bytes).is_ok());
+        assert!(SnpEdits::from_bytes(&bytes[..bytes.len() / 2]).is_err());
+        assert!(SnpEdits::from_bytes(&[]).is_err());
     }
 
     #[test]
@@ -696,7 +676,7 @@ mod tests {
                       snp(900, original[900], b"ACGT"[(base_code(original[900]).unwrap() as usize + 2) % 4])];
         let own = snp(1500, original[1500], b"ACGT"[(base_code(original[1500]).unwrap() as usize + 3) % 4]);
         let colours: Vec<Vec<Snp>> = vec![shared.to_vec(), shared.to_vec(), vec![shared[0], shared[1], own]];
-        let contigs: Vec<Vec<u8>> = colours.iter().map(|c| original.clone()).collect();
+        let contigs: Vec<Vec<u8>> = colours.iter().map(|_| original.clone()).collect();
         let edited_seqs: Vec<Vec<u8>> = colours.iter().zip(&contigs).map(|(c, s)| edit(s, c)).collect();
         let called: Vec<Vec<EditedSnp>> = colours.iter().zip(&contigs).zip(&edited_seqs).map(|((c, s), e)| {
             with_contexts(e, c.iter().map(|&snp| CalledSnp { snp, key: key(s, &snp) }).collect())
@@ -714,6 +694,34 @@ mod tests {
         }
         // Without the contexts the repeats cannot be put back.
         assert!(edits.revert(1, &mut edited_seqs[1].clone(), &|_, _| None).is_err());
+    }
+
+    #[test]
+    fn repeats_from_colours_other_than_the_reference() {
+        // Colour 2 shares one SNP with colour 0 and one with colour 1: one is
+        // in its reference's list, the other a direct repeat.
+        let original = random_sequence(2000, 13);
+        let change = |pos: usize, by: usize| snp(pos as u32, original[pos], b"ACGT"[(base_code(original[pos]).unwrap() as usize + by) % 4]);
+        let (a, b) = (change(400, 1), change(1200, 2));
+        let colours: Vec<Vec<Snp>> = vec![vec![a], vec![b], vec![a, b]];
+        let edited_seqs: Vec<Vec<u8>> = colours.iter().map(|c| edit(&original, c)).collect();
+        let called: Vec<Vec<EditedSnp>> = colours.iter().zip(&edited_seqs).map(|(c, e)| {
+            with_contexts(e, c.iter().map(|&snp| CalledSnp { snp, key: key(&original, &snp) }).collect())
+        }).collect();
+        let edits = SnpEdits::with_repeats(&called);
+        assert_eq!(edits.n_repeats(), 2);
+        assert_eq!(edits.colours[2].shared.len(), 1);
+        assert_eq!(edits.colours[2].direct.len(), 1);
+        let edits: SnpEdits = postcard::from_bytes(&postcard::to_allocvec(&edits).unwrap()).unwrap();
+        let mut sources = edits.context_sources(2);
+        sources.sort();
+        assert_eq!(sources, vec![(0, 400), (1, 1200)]);
+        let context = |f: u32, pos: u32| context_at(&edited_seqs[f as usize], pos as usize);
+        for color in 0..3 {
+            let mut sequence = edited_seqs[color].clone();
+            edits.revert(color as u32, &mut sequence, &context).unwrap();
+            assert_eq!(sequence, original, "colour {}", color);
+        }
     }
 
     fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
