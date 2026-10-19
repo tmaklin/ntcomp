@@ -82,6 +82,23 @@ use snps::{CalledSnp, SnpEdits};
 
 type E = Box<dyn std::error::Error>;
 
+/// Bytes of a contig's blake3 hash kept in archives (enough to check a
+/// decoded contig; the full 32 bytes were 6% of an archive).
+pub const CONTIG_HASH_BYTES: usize = 8;
+
+/// A contig's hash as stored in archives: the first [CONTIG_HASH_BYTES] bytes
+/// of its blake3 hash.
+pub type ContigHash = [u8; CONTIG_HASH_BYTES];
+
+/// [ContigHash] of a (normalized) contig sequence.
+pub fn contig_hash(
+    sequence: &[u8],
+) -> ContigHash {
+    let mut out = [0u8; CONTIG_HASH_BYTES];
+    out.copy_from_slice(&blake3::hash(sequence).as_bytes()[..CONTIG_HASH_BYTES]);
+    out
+}
+
 /// Node index of the dummy source node.
 const SOURCE_NODE: u32 = 0;
 /// Node index of the dummy sink node.

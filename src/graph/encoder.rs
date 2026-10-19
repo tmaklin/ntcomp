@@ -26,7 +26,6 @@ use core::ops::Range;
 
 use std::io::Write;
 
-use blake3::Hash;
 use postcard::to_allocvec;
 use sbwt::LcsArray;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
@@ -41,8 +40,8 @@ pub struct GraphEncoder<'a> {
     /// Choice stream
     choices: Choices,
 
-    /// Hashes
-    hashes: Option<Vec<Hash>>,
+    /// Hashes of the contigs, see [ContigHash](super::ContigHash)
+    hashes: Option<Vec<super::ContigHash>>,
 
     /// Contig names
     contig_names: Option<Vec<Vec<u8>>>,
@@ -93,10 +92,10 @@ impl<'a> GraphEncoder<'a> {
         }
     }
 
-    /// Add hashes
+    /// Add the contigs' hashes ([contig_hash](super::contig_hash))
     pub fn with_hashes(
         mut self,
-        hashes: Vec<Hash>,
+        hashes: Vec<super::ContigHash>,
     ) -> Self {
         self.hashes = Some(hashes);
         self

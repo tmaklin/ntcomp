@@ -33,7 +33,6 @@ use core::ops::Range;
 
 use std::io::Read;
 
-use blake3::Hash;
 
 type E = Box<dyn std::error::Error>;
 
@@ -67,6 +66,26 @@ fn read_section<T: serde::de::DeserializeOwned, R: Read>(
         return Ok(None)
     }
     Ok(Some(postcard::from_bytes(&read_bytes(input, n_bytes)?)?))
+}
+
+/// Reads the contig hash section: [ContigHash](super::ContigHash) values,
+/// or the full 32-byte blake3 hashes of archives written before they were
+/// truncated, which are truncated on reading.
+fn read_hashes<R: Read>(
+    input: &mut R,
+    n_bytes: u64,
+) -> Result<Option<Vec<super::ContigHash>>, E> {
+    if n_bytes == 0 {
+        return Ok(None)
+    }
+    let bytes = read_bytes(input, n_bytes)?;
+    match postcard::take_from_bytes::<Vec<super::ContigHash>>(&bytes) {
+        Ok((hashes, rest)) if rest.is_empty() => Ok(Some(hashes)),
+        _ => {
+            let full: Vec<[u8; 32]> = postcard::from_bytes(&bytes)?;
+            Ok(Some(full.iter().map(|h| { let mut out = [0u8; super::CONTIG_HASH_BYTES]; out.copy_from_slice(&h[..super::CONTIG_HASH_BYTES]); out }).collect()))
+        },
+    }
 }
 
 /// Deserializes a section that must be present.
@@ -110,7 +129,7 @@ fn read_reversed<R: Read>(
 pub type DecodedSections = (
     StoredGraph,
     Choices,
-    Option<Vec<Hash>>,
+    Option<Vec<super::ContigHash>>,
     Option<Vec<Vec<u8>>>,
     Option<Vec<(Vec<u8>, Range<u32>)>>,
     Option<Vec<bool>>,
@@ -188,7 +207,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
         let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs, k)?;
-        let hashes = read_section(reader, header.hash_bytes as u64)?;
+        let hashes = read_hashes(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;
         if snp_edits.as_ref().is_some_and(|edits| edits.n_colors() != header.n_queries as usize) {
@@ -206,6 +225,21 @@ mod tests {
     use super::super::encoder::GraphEncoder;
     use super::super::{GraphBuilder, Walkable};
     use super::super::snps::Snp;
+
+    #[test]
+    fn hash_sections_new_and_full_length() {
+        let seqs: [&[u8]; 3] = [b"ACGT", b"GGCCAATT", b""];
+        let short: Vec<super::super::ContigHash> = seqs.iter().map(|s| super::super::contig_hash(s)).collect();
+        // Current: 8-byte hashes.
+        let bytes = postcard::to_allocvec(&short).unwrap();
+        assert_eq!(bytes.len(), 1 + 3 * super::super::CONTIG_HASH_BYTES);
+        assert_eq!(read_hashes(&mut bytes.as_slice(), bytes.len() as u64).unwrap(), Some(short.clone()));
+        // Archives written with the full 32-byte blake3 hashes read as their first 8 bytes.
+        let full: Vec<blake3::Hash> = seqs.iter().map(|s| blake3::hash(s)).collect();
+        let bytes = postcard::to_allocvec(&full).unwrap();
+        assert_eq!(read_hashes(&mut bytes.as_slice(), bytes.len() as u64).unwrap(), Some(short));
+        assert_eq!(read_hashes(&mut [].as_slice(), 0).unwrap(), None);
+    }
 
     fn graph() -> (StoredGraph, Choices, Vec<Vec<(usize, Range<usize>)>>) {
         let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
@@ -230,7 +264,7 @@ mod tests {
     fn archive_roundtrip() {
         let (graph, choices, dicts) = graph();
         let names = vec![b"contig one".to_vec(), b"contig two".to_vec()];
-        let hashes = vec![blake3::hash(b"one"), blake3::hash(b"two")];
+        let hashes = vec![super::super::contig_hash(b"one"), super::super::contig_hash(b"two")];
         let ranges = vec![(b"file".to_vec(), 0..2)];
         let snps = SnpEdits::new(&[vec![], vec![Snp { pos: 3, base: b'A', index_base: b'G' }]]);
         let bytes = encode(GraphEncoder::new(graph, choices)

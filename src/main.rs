@@ -19,10 +19,7 @@ use std::path::PathBuf;
 
 use std::fs::File;
 
-use blake3::{
-    hash,
-    Hash,
-};
+use ntcomp::graph::{contig_hash, ContigHash};
 
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
@@ -156,7 +153,7 @@ type SnpContexts = std::collections::HashMap<(u32, u32), [u8; ntcomp::graph::snp
 fn finish_color(
     color: u32,
     mut sequence: Vec<u8>,
-    hashes: &Option<Vec<Hash>>,
+    hashes: &Option<Vec<ContigHash>>,
     reversed: &Option<Vec<bool>>,
     snp_edits: &Option<ntcomp::graph::snps::SnpEdits>,
     contexts: &SnpContexts,
@@ -174,7 +171,7 @@ fn finish_color(
     };
 
     // Not checked if the archive has no hashes.
-    let hash_match = hashes.as_ref().map(|hashes| hash(&sequence) == hashes[idx]);
+    let hash_match = hashes.as_ref().map(|hashes| contig_hash(&sequence) == hashes[idx]);
     Ok((sequence, hash_match))
 }
 
@@ -545,8 +542,8 @@ fn main() {
                     progress.finish();
                 }
 
-                // blake3 hash of every (normalized) input contig, checked after decoding
-                let mut hashes: Vec<Hash> = Vec::new();
+                // Hash of every (normalized) input contig, checked after decoding
+                let mut hashes: Vec<ContigHash> = Vec::new();
 
                 let mut contig_names: Vec<Vec<u8>> = Vec::with_capacity(n_queries);
                 let mut file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = Vec::with_capacity(n_queries);
@@ -555,7 +552,7 @@ fn main() {
                 for batch in query_files.chunks(batch_size) {
                     let contigs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = batch.par_iter().map(read_contigs).collect();
                     let sequences: Vec<&[u8]> = contigs.iter().flatten().map(|(_, seq)| seq.as_slice()).collect();
-                    hashes.par_extend(sequences.par_iter().map(|seq| hash(seq)));
+                    hashes.par_extend(sequences.par_iter().map(|seq| contig_hash(seq)));
 
                     let added = builder.add_contigs(&sequences, &sbwt, &lcs).unwrap();
                     for &added in &added {
