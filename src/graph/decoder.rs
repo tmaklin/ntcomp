@@ -88,6 +88,29 @@ fn read_contig_names<R: Read>(
     Ok(Some(postcard::from_bytes(&lzma_wrapper::decompress(&lzma)?)?))
 }
 
+/// Reads the file ranges written by the encoder (file names and contig counts,
+/// LZMA compressed); the ranges are contiguous from colour 0.
+fn read_file_ranges<R: Read>(
+    input: &mut R,
+    n_bytes: u64,
+) -> Result<Option<Vec<(Vec<u8>, Range<u32>)>>, E> {
+    let Some(lzma) = read_section::<LzmaData, R>(input, n_bytes)? else {
+        return Ok(None)
+    };
+    let (names, counts): (Vec<Vec<u8>>, Vec<u32>) = postcard::from_bytes(&lzma_wrapper::decompress(&lzma)?)?;
+    if names.len() != counts.len() {
+        return Err(Box::new(ArchiveError("file ranges: names and counts differ".to_string())))
+    }
+    let mut start = 0_u32;
+    let mut ranges = Vec::with_capacity(names.len());
+    for (name, count) in names.into_iter().zip(counts) {
+        let end = start.checked_add(count).ok_or_else(|| ArchiveError("file ranges: too many contigs".to_string()))?;
+        ranges.push((name, start..end));
+        start = end;
+    }
+    Ok(Some(ranges))
+}
+
 /// One bit per colour, set if the contig is reverse complemented; None if
 /// the section is empty (no contig is reversed).
 fn read_reversed<R: Read>(
@@ -181,7 +204,10 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         let header = self.file_header;
         let reader = self.reader;
 
-        let file_ranges = read_section(reader, header.file_range_bytes as u64)?;
+        let file_ranges = read_file_ranges(reader, header.file_range_bytes as u64)?;
+        if file_ranges.as_ref().is_some_and(|r| r.last().map_or(0, |(_, range)| range.end) != header.n_queries) {
+            return Err(Box::new(ArchiveError(format!("file ranges do not cover {} contigs", header.n_queries))))
+        }
         let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))

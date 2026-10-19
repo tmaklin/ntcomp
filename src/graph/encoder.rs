@@ -184,6 +184,24 @@ impl<'a> GraphEncoder<'a> {
         }
     }
 
+    /// File ranges as stored: the file names and the number of contigs in each
+    /// file (the ranges are contiguous from colour 0), LZMA compressed.
+    fn encode_file_ranges(
+        &self,
+    ) -> Result<Vec<u8>, E> {
+        let Some(ranges) = &self.file_ranges else { return Ok(Vec::new()) };
+        let mut next = 0;
+        for (_, range) in ranges {
+            if range.start != next || range.end < range.start {
+                return Err("file ranges are not contiguous from colour 0".into())
+            }
+            next = range.end;
+        }
+        let names: Vec<&Vec<u8>> = ranges.iter().map(|(name, _)| name).collect();
+        let counts: Vec<u32> = ranges.iter().map(|(_, range)| range.end - range.start).collect();
+        Ok(to_allocvec(&lzma_wrapper::compress(&to_allocvec(&(names, counts))?)?)?)
+    }
+
     /// Contig names are compressed with LZMA.
     fn encode_contig_names(
         &self,
@@ -204,7 +222,7 @@ impl<'a> GraphEncoder<'a> {
     ) -> Result<String, E> {
         let n_colors: u32 = self.choices.streams.len().try_into()?;
 
-        let file_range_bytes = optional_section(&self.file_ranges)?;
+        let file_range_bytes = self.encode_file_ranges()?;
         let contig_name_bytes = self.encode_contig_names()?;
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;

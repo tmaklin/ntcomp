@@ -80,9 +80,11 @@
 //! ## Stored out-degrees and chain lengths
 //!
 //! One arithmetic-coded stream ([crate::coder::arith]) holds the out-degree of
-//! every junction except the sink, in junction order, and then the number of
-//! inner nodes of every chain, in chain order. Each is an adaptive Elias-gamma
-//! code ([GammaModel]: of the degree, and of the number of inner nodes + 1).
+//! every junction except the sink, in junction order, then the number of
+//! inner nodes of every chain, in chain order, then the contig lengths (the
+//! suffix lengths of the edges out of the dummy source, in chain order). Each
+//! is an adaptive Elias-gamma code ([GammaModel]: of the degree, of the number
+//! of inner nodes + 1, of the contig length + 1).
 //! The chain lengths have one model per context: the out-degree of the
 //! chain's source junction (capped at 8) and the length of the previous chain
 //! of the same junction (in five classes, or none): the chains of a junction
@@ -181,8 +183,6 @@ pub struct StoredChains {
     /// truncated binary for `colex_bound`.
     pub inner_weights: Vec<u8>,
 
-    /// Suffix lengths of the edges out of the dummy source node (the contig lengths).
-    pub sequence_lens: Vec<u32>,
 
     /// Largest LCS context of the suffix length models; 0: one context for
     /// all. Otherwise the context is min(LCS(source rank), lcs_cap).
@@ -194,8 +194,9 @@ pub struct StoredChains {
     /// Other suffix lengths, arithmetic coded, see the module docs.
     pub suffix_lens: Vec<u8>,
 
-    /// Out-degree of every junction except the sink, then the number of
-    /// inner nodes of every chain, arithmetic coded, see the module docs.
+    /// Out-degree of every junction except the sink, the number of inner
+    /// nodes of every chain and the contig lengths (suffix lengths of the
+    /// edges out of the dummy source), arithmetic coded, see the module docs.
     pub topology: Vec<u8>,
 
     /// Target of every chain, arithmetic coded, see the module docs.
@@ -298,15 +299,19 @@ fn chain_len_context(
     degree.min(8) as usize * 6 + previous
 }
 
-/// Codes the out-degrees of the junctions (`degrees`, 0 for the sink) and the
-/// number of inner nodes of the chains (`inner`), or decodes them for
-/// `n_junctions` junctions (`shape` None), see the module docs. None if decoded
-/// values are out of range.
+/// Out-degrees of the junctions (0 for the sink), the number of inner nodes of
+/// every chain and the contig lengths, see [code_topology].
+type Topology = (Vec<u64>, Vec<u64>, Vec<u64>);
+
+/// Codes the out-degrees of the junctions, the number of inner nodes of the
+/// chains and the contig lengths (`shape`), or decodes them for `n_junctions`
+/// junctions (`shape` None), see the module docs. None if decoded values are
+/// out of range.
 fn code_topology<C: Coder>(
     c: &mut C,
     n_junctions: usize,
-    shape: Option<(&[u64], &[u64])>,
-) -> Option<(Vec<u64>, Vec<u64>)> {
+    shape: Option<(&[u64], &[u64], &[u64])>,
+) -> Option<Topology> {
     let mut degree_model = GammaModel::new();
     let mut degrees = vec![0_u64; n_junctions];
     let mut n_chains = 0_u64;
@@ -325,7 +330,14 @@ fn code_topology<C: Coder>(
             previous = Some(w - 1);
         }
     }
-    Some((degrees, inner))
+    let mut length_model = GammaModel::new();
+    let mut contig_lens = Vec::with_capacity(degrees[SOURCE_NODE as usize] as usize);
+    for i in 0..degrees[SOURCE_NODE as usize] as usize {
+        let w = length_model.code(c, shape.map_or(1, |s| s.2[i] + 1));
+        if w - 1 > u32::MAX as u64 { return None }
+        contig_lens.push(w - 1);
+    }
+    Some((degrees, inner, contig_lens))
 }
 
 /// Adaptive models of the suffix lengths (see the module docs) for
@@ -518,16 +530,16 @@ impl ChainCsr {
         let degrees: Vec<u64> = (0..n_junctions).map(|j| { let (start, end) = self.row(j); (end - start) as u64 }).collect();
         assert!(degrees.iter().enumerate().all(|(j, &d)| d > 0 || j == SINK_NODE as usize), "a junction has no outgoing chains");
         let inner: Vec<u64> = (0..self.n_chains()).map(|chain| self.inner_nodes(chain).len() as u64).collect();
+        // Chains out of the source come first; their first edge holds the contig length.
+        let n_source_chains = self.row(SOURCE_NODE as usize).1;
+        let contig_lens: Vec<u64> = (0..n_source_chains).map(|chain| self.chain_suffix_lens(chain)[0] as u64).collect();
         let mut topology = Encoder::new();
-        code_topology(&mut topology, n_junctions, Some((&degrees, &inner))).expect("topology encode");
+        code_topology(&mut topology, n_junctions, Some((&degrees, &inner, &contig_lens))).expect("topology encode");
         let mut targets = Encoder::new();
         let (_, next_new) = code_targets(&mut targets, self.n_chains(), Some(&self.targets)).expect("targets encode");
         assert_eq!(next_new as usize, n_junctions, "junctions are not numbered in breadth-first order");
 
-        // Chains out of the source come first; their first edge holds the contig length.
-        let n_source_chains = self.row(SOURCE_NODE as usize).1;
         let sources = if lcs_cap > 0 { self.edge_sources() } else { Vec::new() };
-        let mut sequence_lens = Vec::with_capacity(n_source_chains);
         let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
         let mut suffix_lens = Encoder::new();
         let mut edge = 0;
@@ -536,7 +548,6 @@ impl ChainCsr {
                 let source = if lcs_cap > 0 { sources[edge] } else { 0 };
                 edge += 1;
                 if chain < n_source_chains && i == 0 {
-                    sequence_lens.push(len);
                     continue;
                 }
                 let context = if lcs_cap > 0 { lcs.unwrap()(source).min(lcs_cap) as usize } else { 0 };
@@ -556,7 +567,6 @@ impl ChainCsr {
             colex_bound,
             junction_weights: pack_colex(real_junctions, colex_bound),
             inner_weights: pack_colex(&self.inner_weights, colex_bound),
-            sequence_lens,
             lcs_cap: lcs_cap as u16,
             max_direct,
             suffix_lens: suffix_lens.finish(),
@@ -597,9 +607,9 @@ impl ChainCsr {
         junction_weights.extend(unpack_colex(&stored.junction_weights, n_junctions - 2, colex_bound).ok_or_else(|| truncated("junction colex ranks"))?);
 
         let mut coded = Decoder::new(&stored.topology);
-        let (degrees, inner) = code_topology(&mut coded, n_junctions, None).ok_or_else(|| truncated("out-degrees and chain lengths"))?;
+        let (degrees, inner, contig_lens) = code_topology(&mut coded, n_junctions, None).ok_or_else(|| truncated("out-degrees, chain lengths and contig lengths"))?;
         if coded.overrun() {
-            return Err(truncated("out-degrees and chain lengths"))
+            return Err(truncated("out-degrees, chain lengths and contig lengths"))
         }
         let mut row_ptrs = Vec::with_capacity(n_junctions + 1);
         row_ptrs.push(0_u32);
@@ -619,9 +629,6 @@ impl ChainCsr {
         let inner_weights = unpack_colex(&stored.inner_weights, n_inner, colex_bound).ok_or_else(|| truncated("inner colex ranks"))?;
 
         let n_source_chains = row_ptrs[1] as usize;
-        if stored.sequence_lens.len() != n_source_chains {
-            return Err(truncated("contig lengths"))
-        }
         let lcs_cap = stored.lcs_cap as u32;
         let lcs = match (lcs_cap, lcs) {
             (0, _) => None,
@@ -639,7 +646,7 @@ impl ChainCsr {
             let n_edges = (chain_ptrs[chain + 1] - chain_ptrs[chain]) as usize + 1;
             for i in 0..n_edges {
                 if chain < n_source_chains && i == 0 {
-                    suffix_lens.push(stored.sequence_lens[chain]);
+                    suffix_lens.push(contig_lens[chain] as u32);
                     continue;
                 }
                 let context = match lcs {
@@ -930,7 +937,7 @@ mod tests {
                 0 => stored.topology.clear(),
                 1 => { stored.topology.pop(); },
                 2 => stored.suffix_lens.clear(),
-                3 => { stored.sequence_lens.pop(); },
+                3 => { stored.topology.truncate(stored.topology.len() / 2); },
                 4 => { stored.junction_weights.pop(); },
                 5 => { stored.inner_weights.pop(); },
                 6 => stored.colex_bound = 0,

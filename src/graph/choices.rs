@@ -19,6 +19,8 @@
 //! bit. The decoder knows `n` at every step, so the codes need no separators.
 //!
 //! Each colour has its own stream so any contig can be decoded on its own.
+//! A stream stores only its bits: the decoder stops at the sink, and then at
+//! most the zero bits that pad the last byte are left.
 //!
 //! ## Compression
 //!
@@ -58,7 +60,8 @@ impl Choices {
         Ok(Choices { streams })
     }
 
-    /// Total number of recorded choices.
+    /// Total number of recorded choices (0 for decoded choices, see
+    /// [ChoiceStream::n_choices]).
     pub fn n_choices(&self) -> usize {
         self.streams.iter().map(|x| x.n_choices as usize).sum()
     }
@@ -68,14 +71,16 @@ impl Choices {
         &self,
         color: u32,
     ) -> Option<ChoiceReader<'_>> {
-        self.streams.get(color as usize).map(|stream| ChoiceReader { stream, bits: BitReader::new(&stream.bits), n_read: 0 })
+        self.streams.get(color as usize).map(|stream| ChoiceReader { stream, bits: BitReader::new(&stream.bits) })
     }
 }
 
 /// Choices of one colour.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChoiceStream {
-    /// Number of choices in the stream.
+    /// Number of choices in the stream, as written by [ChoiceWriter]; not
+    /// stored (0 in decoded streams).
+    #[serde(skip)]
     pub n_choices: u32,
 
     /// Truncated binary codes, most significant bit first.
@@ -112,7 +117,6 @@ impl ChoiceWriter {
 pub struct ChoiceReader<'a> {
     stream: &'a ChoiceStream,
     bits: BitReader<'a>,
-    n_read: u32,
 }
 
 impl ChoiceReader<'_> {
@@ -121,17 +125,21 @@ impl ChoiceReader<'_> {
         &mut self,
         n_options: u32,
     ) -> Option<u32> {
-        if self.n_read == self.stream.n_choices {
-            return None
-        }
-        let rank = self.bits.read_truncated_binary(n_options)?;
-        self.n_read += 1;
-        Some(rank)
+        self.bits.read_truncated_binary(n_options)
     }
 
-    /// True if every choice in the stream has been read.
+    /// True if what is left of the stream are fewer than 8 zero bits (the
+    /// padding of the last byte). Meant for the check after the walk reached
+    /// the sink: before that, choices whose codes are only zero bits and fit
+    /// in the padding cannot be told from it.
     pub fn is_finished(&self) -> bool {
-        self.n_read == self.stream.n_choices
+        let total = self.stream.bits.len() * 8;
+        let read = self.bits.bits_read();
+        if read > total || total - read >= 8 {
+            return false
+        }
+        let left = total - read;
+        left == 0 || self.stream.bits.last().is_some_and(|&b| b & ((1_u8 << left) - 1) == 0)
     }
 }
 
@@ -173,16 +181,19 @@ mod tests {
 
         let bytes = postcard::to_allocvec(&stored).unwrap();
         let decoded: Choices = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, stored);
+        // The bits are stored, the counts are not.
+        assert_eq!(decoded.streams.iter().map(|s| &s.bits).collect::<Vec<_>>(), stored.streams.iter().map(|s| &s.bits).collect::<Vec<_>>());
+        assert!(decoded.streams.iter().all(|s| s.n_choices == 0));
 
         // Decode in reverse order to check that the colours are independent.
         for (color, expected) in choices.iter().enumerate().rev() {
             let mut reader = decoded.reader(color as u32).unwrap();
-            for &(rank, n) in expected {
+            for (i, &(rank, n)) in expected.iter().enumerate() {
+                // Not finished while choices are left.
+                assert!(!reader.is_finished(), "colour {} finished after {} choices", color, i);
                 assert_eq!(reader.next(n), Some(rank));
             }
             assert!(reader.is_finished());
-            assert_eq!(reader.next(2), None);
         }
         assert!(decoded.reader(3).is_none());
     }

@@ -29,6 +29,10 @@ const LZMA_PRESET: u32 = 9;
 /// Smallest LZMA dictionary used for compressing.
 const MIN_DICT_SIZE: u32 = 4096;
 
+/// Match finder settings of `xz -9e` (the extreme presets).
+const NICE_LEN: u32 = 273;
+const DEPTH_LIMIT: i32 = 512;
+
 #[derive(Debug)]
 pub struct LzmaError(pub String);
 
@@ -59,8 +63,9 @@ pub struct LzmaData {
 /// Compresses `data`.
 ///
 /// Uses no literal context bits (lc = lp = pb = 0): this is best for the
-/// bit-packed sections and as good as the defaults for the contig names. The
-/// dictionary is not larger than the data.
+/// bit-packed sections and as good as the defaults for the contig names; and
+/// the match finder settings of `xz -9e` (−16% on the contig names, −0.3% on
+/// the choices). The dictionary is not larger than the data.
 pub fn compress(
     data: &[u8],
 ) -> Result<LzmaData, E> {
@@ -68,6 +73,8 @@ pub fn compress(
     options.lc = 0;
     options.lp = 0;
     options.pb = 0;
+    options.nice_len = NICE_LEN;
+    options.depth_limit = DEPTH_LIMIT;
     let len: u32 = data.len().try_into().unwrap_or(u32::MAX);
     options.dict_size = options.dict_size.min(len.max(MIN_DICT_SIZE));
 
