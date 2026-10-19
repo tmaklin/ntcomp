@@ -72,6 +72,16 @@
 //! decoder takes LCS(r) from the LCS array or computes it from the SBWT with
 //! [crate::lcs_from_sbwt].
 //!
+//! ## Stored targets
+//!
+//! Junctions are numbered in breadth-first order, so the target of a chain is
+//! either the next junction not reached yet or one reached before. Each target
+//! is coded with the binary arithmetic coder of [crate::coder::arith]: an adaptive
+//! flag "the next new junction"; otherwise the distance d from the newest
+//! junction reached so far, as the bit length of d + 1 (a 6-bit adaptive tree)
+//! and the bits below its top one, the first [TARGET_MODELLED_BITS] of them
+//! adaptive given the bit length and the bits above them, the rest raw.
+//!
 use super::{
     Csr,
     Choices,
@@ -84,6 +94,7 @@ use super::{
     Walkable,
 };
 use super::bits::{BitReader, BitWriter};
+use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, C0};
 use super::huffman::HuffmanCode;
 
 /// Smallest number of suffix lengths with their own Huffman symbol: lengths
@@ -176,8 +187,57 @@ pub struct StoredChains {
     /// Number of inner nodes + 1 of every chain.
     pub chain_lens: Vec<u8>,
 
-    /// Target of every chain.
+    /// Target of every chain, arithmetic coded, see the module docs.
     pub targets: Vec<u8>,
+}
+
+/// Low bits of a target distance coded with adaptive models (the others raw).
+pub const TARGET_MODELLED_BITS: u32 = 8;
+
+/// Codes the `targets` of chains with the arithmetic coder, or decodes `n`
+/// of them (`targets` None), see the module docs. Returns the targets and the
+/// number of junctions they reach (the next new junction); fails if decoded
+/// targets are not in breadth-first order.
+fn code_targets<C: Coder>(
+    c: &mut C,
+    n: usize,
+    targets: Option<&[u32]>,
+) -> Result<(Vec<u32>, u32), GraphDecodeError> {
+    let invalid = || GraphDecodeError("stored chains: targets truncated or invalid".to_string());
+    let mut is_new = C0;
+    let mut length_tree = vec![C0; 64];
+    let mut low = vec![C0; 34 << TARGET_MODELLED_BITS];
+    let mut out = Vec::with_capacity(n);
+    let mut next_new = 2_u32;
+    for i in 0..n {
+        let target = targets.map_or(0, |t| t[i]);
+        if targets.is_some() {
+            assert!(target <= next_new, "junctions are not numbered in breadth-first order");
+        }
+        if code_bit(c, &mut is_new, (target == next_new) as u32) == 1 {
+            out.push(next_new);
+            next_new += 1;
+            continue
+        }
+        // d + 1 (d = distance from the newest junction) has `bits` bits.
+        let d = next_new.wrapping_sub(1).wrapping_sub(target) as u64;
+        let bits = code_tree(c, &mut length_tree, 6, 63 - (d + 1).leading_zeros()) + 1;
+        if bits > 33 { return Err(invalid()) }
+        let mut x = 1_u64;
+        for (j, b) in (0..bits - 1).rev().enumerate() {
+            let truth = (((d + 1) >> b) & 1) as u32;
+            let bit = if (j as u32) < TARGET_MODELLED_BITS {
+                code_bit(c, &mut low[((bits as usize) << TARGET_MODELLED_BITS) + x as usize], truth)
+            } else {
+                c.code(truth, 32768)
+            };
+            x = (x << 1) | bit as u64;
+        }
+        let d = x - 1;
+        if d >= next_new as u64 - 1 { return Err(invalid()) }
+        out.push(next_new - 1 - d as u32);
+    }
+    Ok((out, next_new))
 }
 
 /// Codes `ranks`, all below `bound`, with the truncated binary code.
@@ -328,21 +388,11 @@ impl ChainCsr {
         assert_eq!(sink_start, sink_end, "sink has outgoing chains");
 
         let mut chain_lens = BitWriter::new();
-        let mut targets = BitWriter::new();
-        let mut next_new = 2_u32;
         for chain in 0..self.n_chains() {
             chain_lens.write_gamma(self.inner_nodes(chain).len() as u64 + 1);
-
-            let target = self.targets[chain];
-            if target == next_new {
-                targets.write_bits(1, 1);
-                next_new += 1;
-            } else {
-                assert!(target < next_new, "junctions are not numbered in breadth-first order");
-                targets.write_bits(0, 1);
-                targets.write_truncated_binary(target, next_new);
-            }
         }
+        let mut targets = Encoder::new();
+        let (_, next_new) = code_targets(&mut targets, self.n_chains(), Some(&self.targets)).expect("targets encode");
         assert_eq!(next_new as usize, n_junctions, "junctions are not numbered in breadth-first order");
 
         // Chains out of the source come first; their first edge holds the contig length.
@@ -519,17 +569,7 @@ impl ChainCsr {
             }
         }
 
-        let mut targets = Vec::with_capacity(n_chains);
-        let mut bits = BitReader::new(&stored.targets);
-        let mut next_new = 2_u32;
-        for _ in 0..n_chains {
-            if bits.read_bits(1).ok_or_else(|| truncated("targets"))? == 1 {
-                targets.push(next_new);
-                next_new += 1;
-            } else {
-                targets.push(bits.read_truncated_binary(next_new).ok_or_else(|| truncated("targets"))?);
-            }
-        }
+        let (targets, next_new) = code_targets(&mut Decoder::new(&stored.targets), n_chains, None)?;
         if next_new as usize != n_junctions {
             return Err(truncated("targets"))
         }
@@ -927,6 +967,29 @@ mod tests {
         assert!(csr.walk_path(&choices, 0).is_err());
         let chains = ChainCsr::from_csr(&csr);
         assert!(chains.walk_path(&choices, 0).is_err());
+    }
+
+    /// Random walks over many paths: chains with many back-references.
+    fn many_paths() -> Vec<Vec<(usize, Range<usize>)>> {
+        let mut x = 12345_u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        (0..60).map(|_| (0..40).map(|_| { let r = (next() % 300) as usize; (1 + (next() % 5) as usize, r..r + 1) }).collect()).collect()
+    }
+
+    #[test]
+    fn targets_roundtrip() {
+        for dicts in [dicts(), many_paths()] {
+            let (chains, choices) = builder(&dicts).to_chains();
+            let decoded = ChainCsr::from_stored(chains.to_stored()).unwrap();
+            assert_eq!(decoded, chains);
+            for (color, d) in dicts.iter().enumerate() {
+                assert_eq!(decoded.walk_path(&choices, color as u32).unwrap().1, expected(d));
+            }
+            // Corrupt targets give an error, not a panic.
+            let mut bad = chains.to_stored();
+            for b in bad.targets.iter_mut() { *b = !*b; }
+            let _ = ChainCsr::from_stored(bad);
+        }
     }
 
     #[test]
