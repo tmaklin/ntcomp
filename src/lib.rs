@@ -675,19 +675,52 @@ mod tests {
         let from_array = |rank: u32| lcs.access(rank as usize) as u32;
         let from_sbwt = |rank: u32| lcs_from_sbwt(sbwt, rank as usize) as u32;
         for cap in [1, 8, 255] {
-            let stored = chains.to_stored_with(Some(&from_array), cap, Some(15));
+            let stored = chains.to_stored_with(Some(&from_array), cap, Some(15), None);
             let bytes = postcard::to_allocvec(&stored).unwrap();
             // Encoded with the array, decoded with values computed from the SBWT (and vice versa).
-            let decoded = graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_sbwt), Some(15)).unwrap();
+            let decoded = graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_sbwt), Some(15), None).unwrap();
             assert_eq!(decoded, chains, "cap {}", cap);
-            let stored = chains.to_stored_with(Some(&from_sbwt), cap, Some(15));
-            assert_eq!(graph::collapsed::ChainCsr::from_stored_with(stored, Some(&from_array), Some(15)).unwrap(), chains);
+            let stored = chains.to_stored_with(Some(&from_sbwt), cap, Some(15), None);
+            assert_eq!(graph::collapsed::ChainCsr::from_stored_with(stored, Some(&from_array), Some(15), None).unwrap(), chains);
             // The LCS values are required to decode.
             let stored: graph::collapsed::StoredChains = postcard::from_bytes(&bytes).unwrap();
-            assert!(graph::collapsed::ChainCsr::from_stored_with(stored, None, Some(15)).is_err());
+            assert!(graph::collapsed::ChainCsr::from_stored_with(stored, None, Some(15), None).is_err());
         }
         // Without contexts nothing changes.
         assert_eq!(graph::collapsed::ChainCsr::from_stored(chains.to_stored()).unwrap(), chains);
+    }
+
+    #[test]
+    fn nodes_derived_by_walks_roundtrip() {
+        let (seqs, variant, lcs) = related_index(15);
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let mut builder = graph::GraphBuilder::new();
+        for seq in &seqs {
+            let (dictionary, implicit) = encode_sequence(seq, &variant, &lcs).unwrap();
+            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+        }
+        let (chains, _) = builder.to_chains();
+        let from_array = |rank: u32| lcs.access(rank as usize) as u32;
+        let from_sbwt = |rank: u32| lcs_from_sbwt(sbwt, rank as usize) as u32;
+        let walk = graph::collapsed::WalkIndex { sbwt, lcs: Some(&lcs) };
+        let plain = chains.to_stored_with(Some(&from_array), 255, Some(15), None);
+        let stored = chains.to_stored_with(Some(&from_array), 255, Some(15), Some(walk));
+        assert!(stored.derived && !plain.derived);
+        // Some nodes are derived: fewer ranks are stored.
+        assert!(stored.node_ranks.len() < plain.node_ranks.len(), "{} vs {}", stored.node_ranks.len(), plain.node_ranks.len());
+        let bytes = postcard::to_allocvec(&stored).unwrap();
+        // Decoded with the LCS array, and with LCS values computed from the SBWT (no array).
+        let decoded = graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_array), Some(15), Some(walk)).unwrap();
+        assert_eq!(decoded, chains);
+        let no_array = graph::collapsed::WalkIndex { sbwt, lcs: None };
+        let decoded = graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_sbwt), Some(15), Some(no_array)).unwrap();
+        assert_eq!(decoded, chains);
+        // The derived nodes need the index.
+        assert!(graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_array), Some(15), None).is_err());
+        // A corrupt walk stream is an error, not a panic.
+        let mut bad: graph::collapsed::StoredChains = postcard::from_bytes(&bytes).unwrap();
+        bad.node_walks.truncate(bad.node_walks.len() / 2);
+        let _ = graph::collapsed::ChainCsr::from_stored_with(bad, Some(&from_array), Some(15), Some(walk));
     }
 
     #[test]
@@ -705,7 +738,7 @@ mod tests {
 
         for source in [LcsSource::Array(&lcs), LcsSource::Sbwt(&variant)] {
             let mut input = with_lcs.as_slice();
-            let (graph, choices, ..) = graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(source), Some(15)).unwrap();
+            let (graph, choices, ..) = graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(&variant), Some(source), Some(15)).unwrap();
             for (color, walk) in walks.iter().enumerate() {
                 assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
             }

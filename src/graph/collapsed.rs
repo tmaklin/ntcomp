@@ -39,14 +39,39 @@
 //! between inner nodes do not need to store the colour sets if they are stored
 //! in the choice stream.
 //!
-//! ## Stored colex ranks
+//! ## Stored nodes
 //!
-//! The colex ranks of the junctions and the inner nodes are coded with the
-//! truncated binary code (also called minimal binary) for the bound
-//! `colex_bound` = largest stored rank + 1: with l = ⌊log2 bound⌋, the first
-//! 2^(l+1) − bound values take l bits and the others l + 1 bits, so a rank
-//! takes log2 of the bound bits on average instead of a whole number of bits.
-//! The dummy source and sink are always junctions 0 and 1 and are not stored.
+//! The nodes are coded in *node order*: the junctions in their breadth-first
+//! numbering (see "Stored targets"); for each junction its chains in order;
+//! along a chain, each inner node, then the target junction if this chain is
+//! the first to reach it. The dummy source and sink are always junctions 0
+//! and 1 and are not stored. The suffix lengths (below) are decoded in the
+//! same order, interleaved: the length of an edge before the node it leads
+//! to.
+//!
+//! A stored node is its colex rank in the truncated binary code (also called
+//! minimal binary) for the bound `colex_bound` = largest rank + 1: with
+//! l = ⌊log2 bound⌋, the first 2^(l+1) − bound values take l bits and the
+//! others l + 1 bits.
+//!
+//! When the graph is stored with the index ([WalkIndex]), most nodes are
+//! *derived* instead. The phrase of a node is its _k_-mer left-extended by
+//! the suffix length of the edge leaving it. A phrase usually ends at a
+//! _k_-mer with more than one predecessor while the contig is still in the
+//! index; then the next node's _k_-mer is _k_ left steps from the start of
+//! the phrase in the de Bruijn graph of the index, and only the predecessor
+//! taken at each step with more than one is needed. For a node X whose
+//! predecessor A on its chain is a full entry (not the source, suffix length
+//! implicit or at least _k_), an adaptive flag (by inner node or junction and
+//! by A's suffix length implicit or explicit) says whether X is derived: then
+//! each branch on the walk from A's phrase start is coded as the index of the
+//! predecessor taken in the colex interval of the predecessors (adaptive, by
+//! the in-degree and whether it is the first step); otherwise, and for the
+//! other nodes, X's rank is stored. A walk step takes one predecessor from
+//! the SBWT's inverse LF step and the others from the LCS array (they share
+//! the last _k_ − 1 bases), so decoding needs the index. The encoder derives
+//! a node when every _k_-mer of X followed by the first _k_ bases of A's
+//! phrase is in the index.
 //!
 //! ## Stored suffix lengths
 //!
@@ -113,6 +138,7 @@ use super::{
 };
 use super::bits::{BitReader, BitWriter};
 use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
+use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
 /// Smallest number of suffix lengths coded directly (not escaped): lengths
 /// up to this are coded directly even when _k_ is smaller (left extensions
@@ -175,13 +201,17 @@ pub struct StoredChains {
     /// Every stored colex rank is below this (largest rank + 1).
     pub colex_bound: u32,
 
-    /// Colex ranks of the junction nodes except the dummy source and sink,
-    /// truncated binary for `colex_bound`.
-    pub junction_weights: Vec<u8>,
+    /// Colex ranks of the stored (not derived) nodes in node order,
+    /// truncated binary for `colex_bound`, see the module docs.
+    pub node_ranks: Vec<u8>,
 
-    /// Colex ranks of the inner nodes, concatenated over all chains,
-    /// truncated binary for `colex_bound`.
-    pub inner_weights: Vec<u8>,
+    /// Whether nodes are derived by walks in the index (the graph was stored
+    /// with a [WalkIndex]); then decoding needs the index.
+    pub derived: bool,
+
+    /// Flags and branch choices of the derived nodes, arithmetic coded, see
+    /// the module docs.
+    pub node_walks: Vec<u8>,
 
 
     /// Largest LCS context of the suffix length models; 0: one context for
@@ -350,31 +380,149 @@ impl SuffixModel {
     }
 }
 
-/// Codes `ranks`, all below `bound`, with the truncated binary code.
-fn pack_colex(
-    ranks: &[u32],
-    bound: u32,
-) -> Vec<u8> {
-    let mut writer = BitWriter::new();
-    for &rank in ranks {
-        writer.write_truncated_binary(rank, bound);
-    }
-    writer.finish()
+/// The index for deriving nodes by walks, see the module docs.
+#[derive(Clone, Copy)]
+pub struct WalkIndex<'a> {
+    pub sbwt: &'a SbwtIndex<SubsetMatrix>,
+    /// The LCS array: required to store a graph (for the matching
+    /// statistics of the walks), and makes the left extensions faster when
+    /// reading one; without it the LCS values come from the [LcsLookup].
+    pub lcs: Option<&'a LcsArray>,
 }
 
-/// Reads `n` ranks coded by [pack_colex]; None unless `bytes` holds exactly
-/// that many (up to the padding of the last byte).
-fn unpack_colex(
-    bytes: &[u8],
-    n: usize,
-    bound: u32,
-) -> Option<Vec<u32>> {
-    if bound == 0 {
-        return None
+impl WalkIndex<'_> {
+    /// The first _k_ bases of the phrase of the _k_-mer at `colex` with suffix
+    /// length `len` (0: implicit); None for a short entry or a rank outside
+    /// the index.
+    fn phrase_start(
+        &self,
+        colex: u32,
+        len: u32,
+    ) -> Option<Vec<u8>> {
+        let k = self.sbwt.k();
+        if (len != 0 && (len as usize) < k) || colex as usize >= self.sbwt.n_sets() {
+            return None
+        }
+        let kmer = self.sbwt.access_kmer(colex as usize);
+        let max = if len == 0 { usize::MAX / 2 } else { len as usize - k };
+        let (phrase, _) = crate::left_extend_kmer(&kmer, None, self.sbwt, self.lcs, max);
+        Some(phrase[..k].to_vec())
     }
-    let mut reader = BitReader::new(bytes);
-    let ranks = (0..n).map(|_| reader.read_truncated_binary(bound)).collect::<Option<Vec<u32>>>()?;
-    (reader.bits_read().div_ceil(8) == bytes.len()).then_some(ranks)
+
+    /// The colex interval of the _k_-mers sharing the last _k_ − 1 bases with
+    /// the one at `rank`.
+    fn group(
+        &self,
+        lcs: LcsLookup,
+        rank: usize,
+    ) -> std::ops::Range<usize> {
+        let k = self.sbwt.k() as u32;
+        let (mut start, mut end) = (rank, rank + 1);
+        while start > 0 && lcs(start as u32) >= k - 1 {
+            start -= 1;
+        }
+        while end < self.sbwt.n_sets() && lcs(end as u32) >= k - 1 {
+            end += 1;
+        }
+        start..end
+    }
+}
+
+/// Largest number of predecessors of a _k_-mer (one per base).
+const MAX_IN_DEGREE: usize = 4;
+
+/// Adaptive models of the node walks.
+struct WalkModels {
+    /// Derived or not: inner node or junction x implicit or explicit suffix length.
+    flags: [u32; 4],
+    /// Branch choices: first step or not x in-degree 2..=4 (2-bit trees).
+    steps: [u32; 2 * MAX_IN_DEGREE * 4],
+}
+
+impl WalkModels {
+    fn new() -> Self {
+        WalkModels { flags: [C0; 4], steps: [C0; 2 * MAX_IN_DEGREE * 4] }
+    }
+}
+
+/// Codes (or decodes, `rows` None) the branches of the walk of _k_ left steps
+/// from the _k_-mer `start`; when encoding, `rows[p]` is the colex rank of
+/// the _k_-mer ending at p of the 2_k_ bases of the derived node followed by
+/// `start`. Returns the rank of the node reached, None for an invalid walk.
+fn code_walk<C: Coder>(
+    c: &mut C,
+    m: &mut WalkModels,
+    index: &WalkIndex,
+    lcs: LcsLookup,
+    start: &[u8],
+    rows: Option<&[usize]>,
+) -> Option<u32> {
+    let k = index.sbwt.k();
+    let mut cur = index.sbwt.search(start)?.start;
+    for step in 0..k {
+        let group = index.group(lcs, index.sbwt.inverse_lf_step(cur)?);
+        let in_degree = group.end - group.start;
+        if in_degree > MAX_IN_DEGREE {
+            return None
+        }
+        cur = group.start;
+        if in_degree > 1 {
+            let truth = rows.map_or(0, |rows| (rows[2 * k - 2 - step] - group.start) as u32);
+            let context = ((step > 0) as usize * MAX_IN_DEGREE + in_degree - 1) * 4;
+            let chosen = code_tree(c, &mut m.steps[context..context + 4], 2, truth) as usize;
+            if chosen >= in_degree {
+                return None
+            }
+            cur += chosen;
+        }
+    }
+    u32::try_from(cur).ok()
+}
+
+/// Encoder side of the stored nodes: the ranks, the walks and their models.
+struct NodeWriter<'a> {
+    walk: Option<(WalkIndex<'a>, LcsLookup<'a>, StreamingIndex<'a, SbwtIndex<SubsetMatrix>, LcsArray>)>,
+    ranks: BitWriter,
+    walks: Encoder,
+    models: WalkModels,
+    bound: u32,
+}
+
+impl NodeWriter<'_> {
+    /// Codes node `x` whose predecessor on its chain is `pred` (rank, suffix
+    /// length; None for the source).
+    fn node(
+        &mut self,
+        pred: Option<(u32, u32)>,
+        x: u32,
+        is_inner: bool,
+    ) {
+        let start = match (&self.walk, pred) {
+            (Some((index, _, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
+            _ => None,
+        };
+        let Some((start, len)) = start else {
+            self.ranks.write_truncated_binary(x, self.bound);
+            return
+        };
+        let (index, lcs, streaming) = self.walk.as_ref().unwrap();
+        let k = index.sbwt.k();
+        // The walk exists if every k-mer of x followed by the phrase start is in the index.
+        let mut bases = index.sbwt.access_kmer(x as usize);
+        bases.extend_from_slice(&start);
+        let ms = streaming.matching_statistics(&bases);
+        let rows: Vec<usize> = ms.iter().map(|m| m.1.start).collect();
+        let derivable = (k - 1..2 * k).all(|p| ms[p].0 == k)
+            && (k..2 * k).all(|p| { let g = index.group(lcs, rows[p - 1]); g.end - g.start <= MAX_IN_DEGREE });
+        let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
+        code_bit(&mut self.walks, flag, derivable as u32);
+        if derivable {
+            let reached = code_walk(&mut self.walks, &mut self.models, index, lcs, &start, Some(&rows));
+            assert_eq!(reached, Some(x), "node walk does not reach the node");
+        } else {
+            self.ranks.write_truncated_binary(x, self.bound);
+        }
+    }
 }
 
 impl ChainCsr {
@@ -455,34 +603,20 @@ impl ChainCsr {
     pub fn to_stored(
         &self,
     ) -> StoredChains {
-        self.to_stored_with(None, 0, None)
-    }
-
-    /// Colex rank of the source of every edge, in chain order (the junction
-    /// for the first edge of a chain, else the previous inner node).
-    fn edge_sources(
-        &self,
-    ) -> Vec<u32> {
-        let mut sources = Vec::with_capacity(self.suffix_lens.len());
-        for junction in 0..self.junction_weights.len() {
-            let (start, end) = self.row(junction);
-            for chain in start..end {
-                sources.push(self.junction_weights[junction]);
-                sources.extend_from_slice(self.inner_nodes(chain));
-            }
-        }
-        sources
+        self.to_stored_with(None, 0, None, None)
     }
 
     /// Same as [ChainCsr::to_stored], with one suffix length code per LCS
     /// value of the edge's source rank (capped at `lcs_cap`) if `lcs` gives
-    /// the LCS array value of a colex rank, and direct suffix length symbols
-    /// for _k_-mer size `k`, see the module docs.
+    /// the LCS array value of a colex rank, direct suffix length symbols for
+    /// _k_-mer size `k`, and nodes derived by walks in `walk` (which needs
+    /// `lcs` and the LCS array), see the module docs.
     pub fn to_stored_with(
         &self,
         lcs: Option<LcsLookup>,
         lcs_cap: u32,
         k: Option<u32>,
+        walk: Option<WalkIndex>,
     ) -> StoredChains {
         let lcs_cap = if lcs.is_some() { lcs_cap.max(1) } else { 0 };
         let max_direct = max_direct_suffix_len(k);
@@ -502,22 +636,6 @@ impl ChainCsr {
         let (_, next_new) = code_targets(&mut targets, self.n_chains(), Some(&self.targets)).expect("targets encode");
         assert_eq!(next_new as usize, n_junctions, "junctions are not numbered in breadth-first order");
 
-        let sources = if lcs_cap > 0 { self.edge_sources() } else { Vec::new() };
-        let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
-        let mut suffix_lens = Encoder::new();
-        let mut edge = 0;
-        for chain in 0..self.n_chains() {
-            for (i, &len) in self.chain_suffix_lens(chain).iter().enumerate() {
-                let source = if lcs_cap > 0 { sources[edge] } else { 0 };
-                edge += 1;
-                if chain < n_source_chains && i == 0 {
-                    continue;
-                }
-                let context = if lcs_cap > 0 { lcs.unwrap()(source).min(lcs_cap) as usize } else { 0 };
-                model.code(&mut suffix_lens, context, len).expect("suffix length encode");
-            }
-        }
-
         // Real colex ranks only; the dummy source and sink are junctions 0 and 1.
         assert_eq!(self.junction_weights[..2], [SOURCE_COLEX, SINK_COLEX], "junctions 0 and 1 are not the source and sink");
         let real_junctions = &self.junction_weights[2..];
@@ -525,11 +643,50 @@ impl ChainCsr {
         assert!(max_colex < SOURCE_COLEX, "colex rank collides with dummy node ranks");
         let colex_bound = max_colex + 1;
 
+        let walk = walk.map(|index| {
+            let lcs = lcs.expect("node walks need the LCS values");
+            let streaming = StreamingIndex::new(index.sbwt, index.lcs.expect("storing node walks needs the LCS array"));
+            (index, lcs, streaming)
+        });
+        let derived = walk.is_some();
+        let mut nodes = NodeWriter { walk, ranks: BitWriter::new(), walks: Encoder::new(), models: WalkModels::new(), bound: colex_bound };
+        let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
+        let mut suffix_lens = Encoder::new();
+        let mut reached = vec![false; n_junctions];
+        reached[SOURCE_NODE as usize] = true;
+        reached[SINK_NODE as usize] = true;
+        for junction in 0..n_junctions {
+            let (start, end) = self.row(junction);
+            for chain in start..end {
+                let inner = self.inner_nodes(chain);
+                let lens = self.chain_suffix_lens(chain);
+                for (i, &len) in lens.iter().enumerate() {
+                    let source = if i == 0 { self.junction_weights[junction] } else { inner[i - 1] };
+                    let from_source = junction == SOURCE_NODE as usize && i == 0;
+                    if !from_source {
+                        let context = if lcs_cap > 0 { lcs.unwrap()(source).min(lcs_cap) as usize } else { 0 };
+                        model.code(&mut suffix_lens, context, len).expect("suffix length encode");
+                    }
+                    let pred = (!from_source).then_some((source, len));
+                    if i + 1 < lens.len() {
+                        nodes.node(pred, inner[i], true);
+                    } else {
+                        let target = self.targets[chain] as usize;
+                        if !reached[target] {
+                            reached[target] = true;
+                            nodes.node(pred, self.junction_weights[target], false);
+                        }
+                    }
+                }
+            }
+        }
+
         StoredChains {
             n_junctions: n_junctions.try_into().expect("too many junctions"),
             colex_bound,
-            junction_weights: pack_colex(real_junctions, colex_bound),
-            inner_weights: pack_colex(&self.inner_weights, colex_bound),
+            node_ranks: nodes.ranks.finish(),
+            derived,
+            node_walks: if derived { nodes.walks.finish() } else { Vec::new() },
             lcs_cap: lcs_cap as u16,
             max_direct,
             suffix_lens: suffix_lens.finish(),
@@ -542,16 +699,18 @@ impl ChainCsr {
     pub fn from_stored(
         stored: StoredChains,
     ) -> Result<Self, GraphDecodeError> {
-        Self::from_stored_with(stored, None, None)
+        Self::from_stored_with(stored, None, None, None)
     }
 
     /// Same as [ChainCsr::from_stored]; `lcs` must give the LCS array value
-    /// of a colex rank if the chains were stored with LCS contexts, and `k`
-    /// must be the _k_-mer size they were stored with (None for _k_ ≤ 255).
+    /// of a colex rank if the chains were stored with LCS contexts, `k` must
+    /// be the _k_-mer size they were stored with (None for _k_ ≤ 255), and
+    /// `walk` the index if nodes were derived by walks.
     pub fn from_stored_with(
         stored: StoredChains,
         lcs: Option<LcsLookup>,
         k: Option<u32>,
+        walk: Option<WalkIndex>,
     ) -> Result<Self, GraphDecodeError> {
         let max_direct = max_direct_suffix_len(k);
         if stored.max_direct != max_direct {
@@ -566,8 +725,6 @@ impl ChainCsr {
         if colex_bound == 0 || colex_bound > SOURCE_COLEX {
             return Err(truncated("colex rank bound"))
         }
-        let mut junction_weights = vec![SOURCE_COLEX, SINK_COLEX];
-        junction_weights.extend(unpack_colex(&stored.junction_weights, n_junctions - 2, colex_bound).ok_or_else(|| truncated("junction colex ranks"))?);
 
         let mut coded = Decoder::new(&stored.topology);
         let (degrees, inner, contig_lens) = code_topology(&mut coded, n_junctions, None).ok_or_else(|| truncated("out-degrees, chain lengths and contig lengths"))?;
@@ -589,48 +746,92 @@ impl ChainCsr {
             chain_ptrs.push(ptr);
         }
         let n_inner = *chain_ptrs.last().unwrap() as usize;
-        let inner_weights = unpack_colex(&stored.inner_weights, n_inner, colex_bound).ok_or_else(|| truncated("inner colex ranks"))?;
 
-        let n_source_chains = row_ptrs[1] as usize;
         let lcs_cap = stored.lcs_cap as u32;
         let lcs = match (lcs_cap, lcs) {
             (0, _) => None,
             (_, Some(lcs)) => Some(lcs),
             (_, None) => return Err(GraphDecodeError("stored chains: the suffix lengths need the LCS array".to_string())),
         };
-        let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
-        let mut coded = Decoder::new(&stored.suffix_lens);
-        let mut suffix_lens = Vec::with_capacity(n_inner + n_chains);
-        let mut junction = 0;
-        for chain in 0..n_chains {
-            while row_ptrs[junction + 1] as usize <= chain {
-                junction += 1;
-            }
-            let n_edges = (chain_ptrs[chain + 1] - chain_ptrs[chain]) as usize + 1;
-            for i in 0..n_edges {
-                if chain < n_source_chains && i == 0 {
-                    suffix_lens.push(contig_lens[chain] as u32);
-                    continue;
-                }
-                let context = match lcs {
-                    None => 0,
-                    Some(lcs) => {
-                        let source = if i == 0 { junction_weights[junction] } else { inner_weights[chain_ptrs[chain] as usize + i - 1] };
-                        lcs(source).min(lcs_cap) as usize
-                    },
-                };
-                suffix_lens.push(model.code(&mut coded, context, 0).ok_or_else(|| truncated("suffix lengths"))?);
-            }
-        }
+        let walk = match (stored.derived, walk, lcs) {
+            (false, _, _) => None,
+            (true, Some(walk), Some(lcs)) => Some((walk, lcs)),
+            _ => return Err(GraphDecodeError("stored chains: the derived nodes need the index".to_string())),
+        };
 
-        if coded.overrun() {
-            return Err(truncated("suffix lengths"))
-        }
-
+        // The targets set the node order.
         let mut coded = Decoder::new(&stored.targets);
         let (targets, next_new) = code_targets(&mut coded, n_chains, None)?;
         if next_new as usize != n_junctions || coded.overrun() {
             return Err(truncated("targets"))
+        }
+
+        // Nodes and suffix lengths in node order, see the module docs.
+        let mut ranks = BitReader::new(&stored.node_ranks);
+        let mut walks = Decoder::new(&stored.node_walks);
+        let mut models = WalkModels::new();
+        let mut node = |pred: Option<(u32, u32)>, is_inner: bool| -> Result<u32, GraphDecodeError> {
+            let start = match (&walk, pred) {
+                (Some((index, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
+                _ => None,
+            };
+            if let Some((start, len)) = start {
+                let (index, lcs) = walk.as_ref().unwrap();
+                let flag = &mut models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
+                if code_bit(&mut walks, flag, 0) == 1 {
+                    return code_walk(&mut walks, &mut models, index, *lcs, &start, None).ok_or_else(|| truncated("node walks"))
+                }
+            }
+            ranks.read_truncated_binary(colex_bound).ok_or_else(|| truncated("node colex ranks"))
+        };
+        let mut junction_weights = vec![0_u32; n_junctions];
+        junction_weights[SOURCE_NODE as usize] = SOURCE_COLEX;
+        junction_weights[SINK_NODE as usize] = SINK_COLEX;
+        let mut reached = vec![false; n_junctions];
+        reached[SOURCE_NODE as usize] = true;
+        reached[SINK_NODE as usize] = true;
+        let mut inner_weights = vec![0_u32; n_inner];
+        let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
+        let mut coded = Decoder::new(&stored.suffix_lens);
+        let mut suffix_lens = Vec::with_capacity(n_inner + n_chains);
+        for junction in 0..n_junctions {
+            if !reached[junction] {
+                return Err(truncated("targets"))
+            }
+            for chain in row_ptrs[junction] as usize..row_ptrs[junction + 1] as usize {
+                let start = chain_ptrs[chain] as usize;
+                let n_edges = chain_ptrs[chain + 1] as usize - start + 1;
+                for i in 0..n_edges {
+                    let source = if i == 0 { junction_weights[junction] } else { inner_weights[start + i - 1] };
+                    let from_source = junction == SOURCE_NODE as usize && i == 0;
+                    let len = if from_source {
+                        contig_lens[chain] as u32
+                    } else {
+                        let context = match lcs {
+                            None => 0,
+                            Some(lcs) => lcs(source).min(lcs_cap) as usize,
+                        };
+                        model.code(&mut coded, context, 0).ok_or_else(|| truncated("suffix lengths"))?
+                    };
+                    suffix_lens.push(len);
+                    let pred = (!from_source).then_some((source, len));
+                    if i + 1 < n_edges {
+                        inner_weights[start + i] = node(pred, true)?;
+                    } else {
+                        let target = targets[chain] as usize;
+                        if !reached[target] {
+                            reached[target] = true;
+                            junction_weights[target] = node(pred, false)?;
+                        }
+                    }
+                }
+            }
+        }
+        if coded.overrun() {
+            return Err(truncated("suffix lengths"))
+        }
+        if (stored.derived && walks.overrun()) || ranks.bits_read().div_ceil(8) != stored.node_ranks.len() {
+            return Err(truncated("nodes"))
         }
 
         Ok(ChainCsr {
@@ -901,8 +1102,8 @@ mod tests {
                 1 => { stored.topology.pop(); },
                 2 => stored.suffix_lens.clear(),
                 3 => { stored.topology.truncate(stored.topology.len() / 2); },
-                4 => { stored.junction_weights.pop(); },
-                5 => { stored.inner_weights.pop(); },
+                4 => { stored.node_ranks.pop(); },
+                5 => { stored.node_ranks.push(0); },
                 6 => stored.colex_bound = 0,
                 7 => stored.colex_bound = 1,
                 _ => stored.targets.clear(),
@@ -919,8 +1120,10 @@ mod tests {
         assert_eq!(stored.colex_bound, 96);
         assert_eq!(stored.n_junctions as usize, chains.junction_weights.len());
         let bits = |ranks: &[u32]| ranks.iter().map(|&r| if r < 32 { 6 } else { 7 }).sum::<usize>().div_ceil(8);
-        assert_eq!(stored.junction_weights.len(), bits(&chains.junction_weights[2..]));
-        assert_eq!(stored.inner_weights.len(), bits(&chains.inner_weights));
+        // Without the index every node is stored.
+        let all: Vec<u32> = chains.junction_weights[2..].iter().chain(&chains.inner_weights).copied().collect();
+        assert_eq!(stored.node_ranks.len(), bits(&all));
+        assert!(!stored.derived && stored.node_walks.is_empty());
 
         // Ranks of 0 only (no bits), a power-of-two bound, and ranks just below the dummy ranks.
         for (ranks, bound) in [(vec![0, 0], 1), (vec![5, 63, 0], 64), (vec![1, SOURCE_COLEX - 1, 7], SOURCE_COLEX)] {
@@ -929,7 +1132,7 @@ mod tests {
             let stored = chains.to_stored();
             assert_eq!(stored.colex_bound, bound);
             if bound == 1 {
-                assert!(stored.junction_weights.is_empty() && stored.inner_weights.is_empty());
+                assert!(stored.node_ranks.is_empty());
             }
             let decoded = ChainCsr::from_stored(stored).unwrap();
             assert_eq!(decoded, chains);
@@ -990,26 +1193,26 @@ mod tests {
 
         // For k <= 255 the coding is the same as without k.
         for k in [Some(31), Some(255)] {
-            assert_eq!(postcard::to_allocvec(&chains.to_stored_with(None, 0, k)).unwrap(), postcard::to_allocvec(&chains.to_stored()).unwrap());
+            assert_eq!(postcard::to_allocvec(&chains.to_stored_with(None, 0, k, None)).unwrap(), postcard::to_allocvec(&chains.to_stored()).unwrap());
         }
         assert_eq!(max_direct_suffix_len(Some(63)), MIN_DIRECT_SUFFIX_LEN);
         assert_eq!(max_direct_suffix_len(Some(300)), 300);
 
         // With k = 300 every length up to 300 is coded directly, and the chains
         // only decode with the same k.
-        let stored = chains.to_stored_with(None, 0, Some(300));
+        let stored = chains.to_stored_with(None, 0, Some(300), None);
         assert_eq!(stored.max_direct, 300);
         assert_eq!(chains.to_stored().max_direct, MIN_DIRECT_SUFFIX_LEN);
-        assert_eq!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300)), None, Some(300)).unwrap(), chains);
-        assert!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300)), None, None).is_err());
-        assert!(ChainCsr::from_stored_with(chains.to_stored(), None, Some(300)).is_err());
+        assert_eq!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300), None), None, Some(300), None).unwrap(), chains);
+        assert!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300), None), None, None, None).is_err());
+        assert!(ChainCsr::from_stored_with(chains.to_stored(), None, Some(300), None).is_err());
 
         // The same with LCS contexts.
         let lcs = |rank: u32| rank % 7;
-        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300));
-        assert_eq!(ChainCsr::from_stored_with(stored, Some(&lcs), Some(300)).unwrap(), chains);
-        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300));
-        assert!(ChainCsr::from_stored_with(stored, Some(&lcs), None).is_err());
+        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300), None);
+        assert_eq!(ChainCsr::from_stored_with(stored, Some(&lcs), Some(300), None).unwrap(), chains);
+        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300), None);
+        assert!(ChainCsr::from_stored_with(stored, Some(&lcs), None, None).is_err());
     }
 
     #[test]

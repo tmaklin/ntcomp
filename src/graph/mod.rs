@@ -747,13 +747,15 @@ pub enum StoredGraph {
 
 impl StoredGraph {
     /// Serializes the graph. With `lcs`, the suffix lengths of collapsed
-    /// chains are coded per LCS context, see [collapsed]; reading them back
-    /// then needs an [LcsSource]. `k` is the _k_-mer size of the index (None
-    /// if unknown), which sets the direct suffix length symbols, see
-    /// [collapsed::max_direct_suffix_len].
+    /// chains are coded per LCS context, and with `sbwt` too their nodes are
+    /// derived by walks in the index where possible, see [collapsed]; reading
+    /// them back then needs an [LcsSource] (and the SBWT). `k` is the _k_-mer
+    /// size of the index (None if unknown), which sets the direct suffix
+    /// length symbols, see [collapsed::max_direct_suffix_len].
     pub fn to_bytes(
         &self,
         lcs: Option<&LcsArray>,
+        sbwt: Option<&SbwtIndexVariant>,
         k: Option<u32>,
     ) -> Result<Vec<u8>, postcard::Error> {
         let repr = match self {
@@ -761,20 +763,23 @@ impl StoredGraph {
             StoredGraph::Chains(chains) => match lcs {
                 Some(lcs) => {
                     let lookup = |rank: u32| lcs.access(rank as usize) as u32;
-                    StoredGraphRef::Chains(chains.to_stored_with(Some(&lookup), collapsed::max_direct_suffix_len(k), k))
+                    let walk = sbwt.map(|SbwtIndexVariant::SubsetMatrix(sbwt)| collapsed::WalkIndex { sbwt, lcs: Some(lcs) });
+                    StoredGraphRef::Chains(chains.to_stored_with(Some(&lookup), collapsed::max_direct_suffix_len(k), k, walk))
                 },
-                None => StoredGraphRef::Chains(chains.to_stored_with(None, 0, k)),
+                None => StoredGraphRef::Chains(chains.to_stored_with(None, 0, k, None)),
             },
         };
         postcard::to_allocvec(&repr)
     }
 
     /// Reads a graph written by [StoredGraph::to_bytes]; `lcs` is needed if
-    /// it was written with the LCS array, and `k` must be the _k_-mer size it
-    /// was written with (None works for _k_ ≤ 255).
+    /// it was written with the LCS array, `sbwt` if it was written with the
+    /// SBWT too, and `k` must be the _k_-mer size it was written with (None
+    /// works for _k_ ≤ 255).
     pub fn from_bytes(
         bytes: &[u8],
         lcs: Option<LcsSource>,
+        sbwt: Option<&SbwtIndexVariant>,
         k: Option<u32>,
     ) -> Result<Self, E> {
         Ok(match postcard::from_bytes(bytes)? {
@@ -782,7 +787,9 @@ impl StoredGraph {
             StoredGraphOwned::Chains(stored) => {
                 let lookup = lcs.map(|source| move |rank: u32| source.lcs(rank));
                 let lookup: Option<collapsed::LcsLookup> = lookup.as_ref().map(|f| f as collapsed::LcsLookup);
-                StoredGraph::Chains(ChainCsr::from_stored_with(stored, lookup, k)?)
+                let array = match lcs { Some(LcsSource::Array(array)) => Some(array), _ => None };
+                let walk = sbwt.map(|SbwtIndexVariant::SubsetMatrix(sbwt)| collapsed::WalkIndex { sbwt, lcs: array });
+                StoredGraph::Chains(ChainCsr::from_stored_with(stored, lookup, k, walk)?)
             },
         })
     }

@@ -164,7 +164,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     pub fn decode_from_read(
         self,
     ) -> Result<DecodedSections, E> {
-        self.decode_from_read_with(None, None)
+        self.decode_from_read_with(None, None, None)
     }
 
     /// Same as [GraphDecoder::decode_from_read] for an archive written with
@@ -181,14 +181,17 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
             Some(lcs) => LcsSource::Array(lcs),
             None => LcsSource::Sbwt(sbwt),
         };
-        self.decode_from_read_with(Some(source), Some(index.k().try_into()?))
+        self.decode_from_read_with(Some(sbwt), Some(source), Some(index.k().try_into()?))
     }
 
-    /// Same as [GraphDecoder::decode_from_read]; `lcs` gives the LCS array
-    /// values needed if the archive was written with the LCS array, and `k`
-    /// the _k_-mer size it was written with (None works for _k_ ≤ 255).
+    /// Same as [GraphDecoder::decode_from_read]; `sbwt` is the index needed
+    /// if the archive was written with it (graph nodes derived by walks),
+    /// `lcs` gives the LCS array values needed if the archive was written with
+    /// the LCS array, and `k` the _k_-mer size it was written with (None works
+    /// for _k_ ≤ 255).
     pub fn decode_from_read_with(
         self,
+        sbwt: Option<&SbwtIndexVariant>,
         lcs: Option<LcsSource>,
         k: Option<u32>,
     ) -> Result<DecodedSections, E> {
@@ -203,7 +206,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
-        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs, k)?;
+        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs, sbwt, k)?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;
