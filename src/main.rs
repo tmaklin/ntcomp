@@ -525,7 +525,7 @@ fn main() {
                     .reorient_contigs(*reorient)
                     .reorient_sampling(*reorient_sampling)
                     .edit_snps(*edit_snps)
-                    .edit_snps_max_shared(*edit_snps_max_shared as usize);
+                    .edit_snps_max_shared(edit_snps_max_shared.map_or(ntcomp::graph::snps::DEFAULT_MAX_SHARED, |max| max as usize));
 
                 // First pass for SNP editing: choose the strands and call the SNPs of every
                 // contig, `batch_size` input files at a time.

@@ -172,8 +172,8 @@ pub enum Commands {
         #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs against the index before encoding (reads the input twice).")]
         edit_snps: bool,
 
-        #[arg(long = "edit-snps-max-shared", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..), help = "Edit only SNPs that at most this many contigs have.")]
-        edit_snps_max_shared: u64,
+        #[arg(long = "edit-snps-max-shared", value_parser = clap::value_parser!(u64).range(1..), help = "Edit only SNPs that at most this many contigs have [default: edit all SNPs].")]
+        edit_snps_max_shared: Option<u64>,
 
         // Resources
         // // Threads

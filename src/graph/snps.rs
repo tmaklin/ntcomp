@@ -68,8 +68,8 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 
 /// Default for the largest number of contigs that may share a SNP for it to
-/// be edited.
-pub const DEFAULT_MAX_SHARED: usize = 5;
+/// be edited: no limit, every SNP is edited.
+pub const DEFAULT_MAX_SHARED: usize = usize::MAX;
 
 /// Bases on both sides of a SNP that identify it across contigs.
 pub const FLANK: usize = 32;
