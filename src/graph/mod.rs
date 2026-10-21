@@ -165,9 +165,9 @@ pub struct ColexGraphEdge {
 /// the k-mer as far as the encoder could have extended it at that position and
 /// explicit and plain by taking the suffix length stored inside [SuffixLen].
 ///
-/// If `lcs` is given, the k-mers are extended with right extensions of their
-/// reverse complements, which is faster and gives the same sequence if the
-/// SBWT contains both strands, see [crate::left_extend_kmer].
+/// If `lcs` is given, the k-mers are extended by walking the de Bruijn graph
+/// of the SBWT, see [crate::left_extend_row], which is faster and gives the
+/// same sequence.
 ///
 /// Fails if the dictionary does not cover exactly `sequence_length` bases.
 pub fn decode_path(
@@ -181,22 +181,27 @@ pub fn decode_path(
     match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
             let k = sbwt.k();
+            // Left extension of the k-mer at `colex_rank`, by walking the SBWT
+            // with `lcs` and from the k-mer's characters without.
+            let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| match lcs {
+                Some(lcs) => crate::left_extend_row(sbwt, lcs, colex_rank as usize, max_extension_len, implicit).0,
+                None => crate::left_extend_kmer(&sbwt.access_kmer(colex_rank as usize), None, sbwt, None, max_extension_len).0,
+            };
             for (colex_rank, suffix_len) in path {
-                let kmer = sbwt.access_kmer(colex_rank as usize);
                 let (kmer, len) = match suffix_len {
                     SuffixLen::Implicit => {
                         // The encoder extends at most end - k - 1 characters.
-                        let (new_kmer, _) = crate::left_extend_kmer(&kmer, None, sbwt, lcs, end.saturating_sub(k + 1));
+                        let new_kmer = extend(colex_rank, end.saturating_sub(k + 1), true);
                         let len = new_kmer.len();
                         (new_kmer, len)
                     },
                     SuffixLen::Explicit { suffix_len: len } => {
-                        let (new_kmer, _) = crate::left_extend_kmer(&kmer, None, sbwt, lcs, (len - k as u32) as usize);
+                        let new_kmer = extend(colex_rank, (len - k as u32) as usize, false);
                         assert_eq!(new_kmer.len(), len as usize);
                         (new_kmer, len as usize)
                     },
                     SuffixLen::Plain { suffix_len: len } => {
-                        (kmer, len as usize)
+                        (sbwt.access_kmer(colex_rank as usize), len as usize)
                     },
                 };
                 if len > end {

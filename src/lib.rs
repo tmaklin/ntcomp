@@ -196,6 +196,94 @@ pub fn left_extend_kmer(
     (kmer, stopped_in_sbwt)
 }
 
+/// Left extension of the _k_-mer at colex rank `row` by walking the de Bruijn
+/// graph of the SBWT: the labels read along inverse LF steps from `row` are
+/// the _k_-mer's bases from right to left, followed by the first bases of the
+/// predecessors taken, so a phrase of length _k_ + L takes _k_ + L steps and
+/// no searches. Requires the select support of the SBWT.
+///
+/// With `check`, extends while the _k_-mer has exactly one predecessor, at
+/// most `max_extension_len` characters, and returns whether the extension
+/// stopped there: the same as [left_extend_kmer] without `ref_nts` on the
+/// _k_-mer at `row`. Without `check`, takes `max_extension_len` steps without
+/// looking at the in-degrees, for a length known to be an extension (each
+/// _k_-mer on the way has one predecessor); the returned flag is then false.
+///
+/// Panics without `check` if the walk reaches a dummy _k_-mer.
+pub fn left_extend_row(
+    sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
+    lcs: &LcsArray,
+    row: usize,
+    max_extension_len: usize,
+    check: bool,
+) -> (Vec<u8>, bool) {
+    let k = sbwt.k();
+    // labels[t] is the label of the row t steps from `row`: the base t from the
+    // right of the phrase. The row taken at extension step j has its first base
+    // at labels[j + k - 1].
+    let mut labels: Vec<Option<u8>> = Vec::with_capacity(k + 64);
+    labels.push(sbwt.inlabel(row));
+    let mut cur = Some(row);
+    let mut extension_len = 0;
+    let mut stopped_in_sbwt = false;
+    while extension_len < max_extension_len {
+        let Some(predecessor) = cur.and_then(|r| sbwt.inverse_lf_step(r)) else {
+            stopped_in_sbwt = true;
+            break
+        };
+        if check && !only_in_group(sbwt, lcs, predecessor) {
+            stopped_in_sbwt = true;
+            break
+        }
+        labels.push(sbwt.inlabel(predecessor));
+        cur = Some(predecessor);
+        extension_len += 1;
+    }
+    while labels.len() < k + extension_len {
+        cur = cur.and_then(|r| sbwt.inverse_lf_step(r));
+        labels.push(cur.and_then(|r| sbwt.inlabel(r)));
+    }
+    // A dummy predecessor (the k-mer has none in the index) has a $ as its
+    // first base: the walk reaches the source row within k - 1 steps after it.
+    if let Some(dollar) = labels[..(k + extension_len)].iter().position(|label| label.is_none()) {
+        assert!(check && dollar >= k, "the walk from colex rank {} reached a dummy k-mer", row);
+        extension_len = dollar - k;
+        stopped_in_sbwt = true;
+    }
+    let phrase = labels[..(k + extension_len)].iter().rev().map(|label| label.unwrap()).collect();
+    (phrase, stopped_in_sbwt)
+}
+
+/// Whether the _k_-mer at colex rank `row`, the first of its group (as from
+/// [inverse_lf_step](sbwt::SbwtIndex::inverse_lf_step)), is the only one
+/// with its last _k_ - 1 characters: the only predecessor of the _k_-mers it
+/// precedes.
+fn only_in_group(
+    sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
+    lcs: &LcsArray,
+    row: usize,
+) -> bool {
+    let k = sbwt.k();
+    (row == 0 || lcs.access(row) < k - 1) && (row + 1 >= sbwt.n_sets() || lcs.access(row + 1) < k - 1)
+}
+
+/// Whether the _k_-mer at colex rank `row` is a real _k_-mer, not a dummy
+/// one padded with $: the _k_ - 1 inverse LF steps from it do not reach the
+/// source row.
+fn is_real_kmer(
+    sbwt: &sbwt::SbwtIndex<sbwt::SubsetMatrix>,
+    row: usize,
+) -> bool {
+    let mut cur = row;
+    for _ in 0..sbwt.k() {
+        match sbwt.inlabel(cur).and_then(|_| sbwt.inverse_lf_step(cur)) {
+            Some(predecessor) => cur = predecessor,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// LCS array value of `colex_rank` computed from the SBWT: the length of the
 /// longest common suffix of the _k_-mers at `colex_rank` - 1 and
 /// `colex_rank` (0 for rank 0). Takes one step per common character.
@@ -309,17 +397,41 @@ pub fn encode_sequence(
             let mut kept: Vec<usize> = Vec::new();
             while i > 0 {
                 if res[i - 1].0 == k && i > k + 1 {
-                    let seq = nucleotides[(i - k)..i].to_vec();
-
-                    let ref_nts = &nucleotides[0..i];
-                    let (new_kmer, stopped_in_sbwt) = left_extend_kmer(&seq, Some(ref_nts), sbwt, Some(lcs), i - k - 1);
-                    assert_eq!(new_kmer.as_slice(), &nucleotides[(i - new_kmer.len())..i]);
+                    // Left extend as [left_extend_kmer] with the sequence as the
+                    // reference, through the rows of the matching statistics: the
+                    // k-mer ending one base to the left is the predecessor the
+                    // sequence takes, and its group holds all the predecessors.
+                    let max_extension_len = i - k - 1;
+                    let mut row = res[i - 1].1.start;
+                    let mut extension_len = 0;
+                    let mut stopped_in_sbwt = false;
+                    while extension_len < max_extension_len {
+                        let left = i - 2 - extension_len;
+                        if res[left].0 == k {
+                            let predecessor = res[left].1.start;
+                            if !only_in_group(sbwt, lcs, predecessor) {
+                                stopped_in_sbwt = true;
+                                break
+                            }
+                            row = predecessor;
+                            extension_len += 1;
+                        } else {
+                            // The sequence's predecessor is not in the index: the
+                            // extension stops in the SBWT unless the k-mer has exactly
+                            // one (real) predecessor, a different one.
+                            stopped_in_sbwt = !sbwt.inverse_lf_step(row).is_some_and(|predecessor| {
+                                only_in_group(sbwt, lcs, predecessor) && is_real_kmer(sbwt, predecessor)
+                            });
+                            break
+                        }
+                    }
+                    let phrase_len = k + extension_len;
 
                     // Store the whole left extension; the next entry ends where it starts.
-                    res[i - 1].0 = new_kmer.len();
+                    res[i - 1].0 = phrase_len;
                     kept.push(i - 1);
                     implicit.push(stopped_in_sbwt);
-                    i -= new_kmer.len() - 1;
+                    i -= phrase_len - 1;
                 } else {
                     kept.push(i - 1);
                     implicit.push(false);
@@ -609,11 +721,26 @@ mod tests {
                     let ref_nts = &seq[..end];
                     assert_eq!(left_extend_kmer(kmer, Some(ref_nts), sbwt, Some(&lcs), max), left_extend_kmer(kmer, Some(ref_nts), sbwt, None, max));
                 }
+                // Walking the SBWT from the k-mer's row: checked, and by a known length.
+                let row = sbwt.search(kmer).unwrap().start;
+                assert_eq!(left_extend_row(sbwt, &lcs, row, max, true), left_extend_kmer(kmer, None, sbwt, None, max));
+                assert_eq!(left_extend_row(sbwt, &lcs, row, plain.len() - k, false).0, plain);
                 n_extended += (plain.len() > k) as usize;
             }
 
-            // Both decoders recover the sequence from its encoding.
+            // The encoder's extensions from the matching statistics are those of
+            // left_extend_kmer with the sequence as the reference.
             let (dictionary, implicit) = encode_sequence(seq, &variant, &lcs).unwrap();
+            let mut end = seq.len();
+            for ((len, _), &imp) in dictionary.iter().zip(&implicit) {
+                if *len >= k && end > k + 1 {
+                    let extended = left_extend_kmer(&seq[end - k..end], Some(&seq[..end]), sbwt, None, end - k - 1);
+                    assert_eq!(extended, (seq[end - len..end].to_vec(), imp));
+                }
+                end -= len;
+            }
+
+            // Both decoders recover the sequence from its encoding.
             let path = |_| dictionary.iter().zip(&implicit).map(|((len, colex), &imp)| {
                 let len = *len as u32;
                 let suffix_len = if imp {

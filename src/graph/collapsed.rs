@@ -403,9 +403,11 @@ impl WalkIndex<'_> {
         if (len != 0 && (len as usize) < k) || colex as usize >= self.sbwt.n_sets() {
             return None
         }
-        let kmer = self.sbwt.access_kmer(colex as usize);
         let max = if len == 0 { usize::MAX / 2 } else { len as usize - k };
-        let (phrase, _) = crate::left_extend_kmer(&kmer, None, self.sbwt, self.lcs, max);
+        let (phrase, _) = match self.lcs {
+            Some(lcs) => crate::left_extend_row(self.sbwt, lcs, colex as usize, max, len == 0),
+            None => crate::left_extend_kmer(&self.sbwt.access_kmer(colex as usize), None, self.sbwt, None, max),
+        };
         Some(phrase[..k].to_vec())
     }
 
