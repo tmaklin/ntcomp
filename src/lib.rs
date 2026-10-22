@@ -835,6 +835,20 @@ mod tests {
         assert!(stored.derived && !plain.derived);
         // Some nodes are derived: fewer ranks are stored.
         assert!(stored.node_ranks.len() < plain.node_ranks.len(), "{} vs {}", stored.node_ranks.len(), plain.node_ranks.len());
+        // With walks the targets are coded where each chain ends, some of
+        // them junctions reached before.
+        assert!(stored.targets.is_empty() && !plain.targets.is_empty());
+        let mut reached = vec![false; chains.junction_weights.len()];
+        let mut reached_before = 0;
+        for junction in 0..chains.junction_weights.len() {
+            let (start, end) = chains.row(junction);
+            for chain in start..end {
+                let target = chains.targets[chain] as usize;
+                reached_before += reached[target] as usize;
+                reached[target] = true;
+            }
+        }
+        assert!(reached_before > 0, "no chain ends at a junction reached before");
         let bytes = postcard::to_allocvec(&stored).unwrap();
         // Decoded with the LCS array, and with LCS values computed from the SBWT (no array).
         let decoded = graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(&from_array), Some(15), Some(walk)).unwrap();

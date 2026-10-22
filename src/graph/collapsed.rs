@@ -43,9 +43,10 @@
 //!
 //! The nodes are coded in *node order*: the junctions in their breadth-first
 //! numbering (see "Stored targets"); for each junction its chains in order;
-//! along a chain, each inner node, then the target junction if this chain is
-//! the first to reach it. The dummy source and sink are always junctions 0
-//! and 1 and are not stored. The suffix lengths (below) are decoded in the
+//! along a chain, each inner node, then the chain's target (with the index,
+//! see below) or, without it, the target junction if this chain is the first
+//! to reach it. The dummy source and sink are always junctions 0 and 1 and
+//! are not stored. The suffix lengths (below) are decoded in the
 //! same order, interleaved: the length of an edge before the node it leads
 //! to.
 //!
@@ -66,12 +67,23 @@
 //! by A's suffix length implicit or explicit) says whether X is derived: then
 //! each branch on the walk from A's phrase start is coded as the index of the
 //! predecessor taken in the colex interval of the predecessors (adaptive, by
-//! the in-degree and whether it is the first step); otherwise, and for the
-//! other nodes, X's rank is stored. A walk step takes one predecessor from
-//! the SBWT's inverse LF step and the others from the LCS array (they share
-//! the last _k_ − 1 bases), so decoding needs the index. The encoder derives
-//! a node when every _k_-mer of X followed by the first _k_ bases of A's
-//! phrase is in the index.
+//! the in-degree, whether it is the first step and the choice taken the last
+//! time a walk passed the same branch, if any); otherwise, and for the other
+//! nodes, X's rank is stored. A walk step takes one predecessor from the
+//! SBWT's inverse LF step and the others from the LCS array (they share the
+//! last _k_ − 1 bases), so decoding needs the index. The encoder derives a
+//! node when every _k_-mer of X followed by the first _k_ bases of A's
+//! phrase is in the index and no step has more than four predecessors.
+//!
+//! With the index, the target of every chain is coded in node order where
+//! the chain ends, instead of in the targets stream. If the chain's last node
+//! A is a full entry, an adaptive flag (by A's suffix length implicit or
+//! explicit) says whether the target is derived: its _k_-mer is the end of
+//! the walk from A's phrase start, coded as above. A derived rank that
+//! belongs to a junction reached before is that junction; any other is the
+//! next new junction. Otherwise the target is coded as in "Stored targets",
+//! in the node stream, and a new target's rank is stored. The sink is never
+//! derived.
 //!
 //! ## Stored suffix lengths
 //!
@@ -118,8 +130,10 @@
 //! ## Stored targets
 //!
 //! Junctions are numbered in breadth-first order, so the target of a chain is
-//! either the next junction not reached yet or one reached before. Each target
-//! is coded with the binary arithmetic coder of [crate::coder::arith]: an adaptive
+//! either the next junction not reached yet or one reached before. Without
+//! the index the targets are coded first, in chain order, in their own
+//! stream; with it, in the node stream (see "Stored nodes"). Each target is
+//! coded with the binary arithmetic coder of [crate::coder::arith]: an adaptive
 //! flag "the next new junction"; otherwise the distance d from the newest
 //! junction reached so far, as the bit length of d + 1 (a 6-bit adaptive tree)
 //! and the bits below its top one, the first [TARGET_MODELLED_BITS] of them
@@ -229,12 +243,62 @@ pub struct StoredChains {
     /// edges out of the dummy source), arithmetic coded, see the module docs.
     pub topology: Vec<u8>,
 
-    /// Target of every chain, arithmetic coded, see the module docs.
+    /// Target of every chain, arithmetic coded, see the module docs; empty
+    /// when the nodes are derived (the targets are in `node_walks`).
     pub targets: Vec<u8>,
 }
 
 /// Low bits of a target distance coded with adaptive models (the others raw).
 pub const TARGET_MODELLED_BITS: u32 = 8;
+
+/// Adaptive models of the chain targets coded as in "Stored targets", and
+/// the next new junction.
+struct TargetModels {
+    is_new: u32,
+    length_tree: Vec<u32>,
+    low: Vec<u32>,
+    next_new: u32,
+}
+
+impl TargetModels {
+    fn new() -> Self {
+        TargetModels { is_new: C0, length_tree: vec![C0; 64], low: vec![C0; 34 << TARGET_MODELLED_BITS], next_new: 2 }
+    }
+
+    /// Codes `target` (or decodes one, None); returns it and whether it is
+    /// the next new junction. None for an invalid target.
+    fn code<C: Coder>(
+        &mut self,
+        c: &mut C,
+        target: Option<u32>,
+    ) -> Option<(u32, bool)> {
+        let next_new = self.next_new;
+        if let Some(target) = target {
+            assert!(target <= next_new, "junctions are not numbered in breadth-first order");
+        }
+        if code_bit(c, &mut self.is_new, target.is_some_and(|t| t == next_new) as u32) == 1 {
+            self.next_new += 1;
+            return Some((next_new, true))
+        }
+        // d + 1 (d = distance from the newest junction) has `bits` bits.
+        let d = next_new.wrapping_sub(1).wrapping_sub(target.unwrap_or(0)) as u64;
+        let bits = code_tree(c, &mut self.length_tree, 6, 63 - (d + 1).leading_zeros()) + 1;
+        if bits > 33 { return None }
+        let mut x = 1_u64;
+        for (j, b) in (0..bits - 1).rev().enumerate() {
+            let truth = (((d + 1) >> b) & 1) as u32;
+            let bit = if (j as u32) < TARGET_MODELLED_BITS {
+                code_bit(c, &mut self.low[((bits as usize) << TARGET_MODELLED_BITS) + x as usize], truth)
+            } else {
+                c.code(truth, 32768)
+            };
+            x = (x << 1) | bit as u64;
+        }
+        let d = x - 1;
+        if d >= next_new as u64 - 1 { return None }
+        Some((next_new - 1 - d as u32, false))
+    }
+}
 
 /// Codes the `targets` of chains with the arithmetic coder, or decodes `n`
 /// of them (`targets` None), see the module docs. Returns the targets and the
@@ -245,41 +309,13 @@ fn code_targets<C: Coder>(
     n: usize,
     targets: Option<&[u32]>,
 ) -> Result<(Vec<u32>, u32), GraphDecodeError> {
-    let invalid = || GraphDecodeError("stored chains: targets truncated or invalid".to_string());
-    let mut is_new = C0;
-    let mut length_tree = vec![C0; 64];
-    let mut low = vec![C0; 34 << TARGET_MODELLED_BITS];
+    let mut models = TargetModels::new();
     let mut out = Vec::with_capacity(n);
-    let mut next_new = 2_u32;
     for i in 0..n {
-        let target = targets.map_or(0, |t| t[i]);
-        if targets.is_some() {
-            assert!(target <= next_new, "junctions are not numbered in breadth-first order");
-        }
-        if code_bit(c, &mut is_new, (target == next_new) as u32) == 1 {
-            out.push(next_new);
-            next_new += 1;
-            continue
-        }
-        // d + 1 (d = distance from the newest junction) has `bits` bits.
-        let d = next_new.wrapping_sub(1).wrapping_sub(target) as u64;
-        let bits = code_tree(c, &mut length_tree, 6, 63 - (d + 1).leading_zeros()) + 1;
-        if bits > 33 { return Err(invalid()) }
-        let mut x = 1_u64;
-        for (j, b) in (0..bits - 1).rev().enumerate() {
-            let truth = (((d + 1) >> b) & 1) as u32;
-            let bit = if (j as u32) < TARGET_MODELLED_BITS {
-                code_bit(c, &mut low[((bits as usize) << TARGET_MODELLED_BITS) + x as usize], truth)
-            } else {
-                c.code(truth, 32768)
-            };
-            x = (x << 1) | bit as u64;
-        }
-        let d = x - 1;
-        if d >= next_new as u64 - 1 { return Err(invalid()) }
-        out.push(next_new - 1 - d as u32);
+        let (target, _) = models.code(c, targets.map(|t| t[i])).ok_or_else(|| GraphDecodeError("stored chains: targets truncated or invalid".to_string()))?;
+        out.push(target);
     }
-    Ok((out, next_new))
+    Ok((out, models.next_new))
 }
 
 /// Context of a chain length: the source junction's out-degree (capped at 8)
@@ -437,13 +473,18 @@ const MAX_IN_DEGREE: usize = 4;
 struct WalkModels {
     /// Derived or not: inner node or junction x implicit or explicit suffix length.
     flags: [u32; 4],
-    /// Branch choices: first step or not x in-degree 2..=4 (2-bit trees).
-    steps: [u32; 2 * MAX_IN_DEGREE * 4],
+    /// Chain target derived or not: implicit or explicit suffix length.
+    ends: [u32; 2],
+    /// Branch choices: the choice at the same in-branch last time (none,
+    /// 0..=3) x first step or not x in-degree 2..=4 (2-bit trees).
+    steps: Vec<u32>,
+    /// The last choice at each in-branch, by its group's first row.
+    last_at: std::collections::HashMap<u32, u8>,
 }
 
 impl WalkModels {
     fn new() -> Self {
-        WalkModels { flags: [C0; 4], steps: [C0; 2 * MAX_IN_DEGREE * 4] }
+        WalkModels { flags: [C0; 4], ends: [C0; 2], steps: vec![C0; 5 * 2 * MAX_IN_DEGREE * 4], last_at: std::collections::HashMap::new() }
     }
 }
 
@@ -470,11 +511,13 @@ fn code_walk<C: Coder>(
         cur = group.start;
         if in_degree > 1 {
             let truth = rows.map_or(0, |rows| (rows[2 * k - 2 - step] - group.start) as u32);
-            let context = ((step > 0) as usize * MAX_IN_DEGREE + in_degree - 1) * 4;
+            let last = m.last_at.get(&(group.start as u32)).map_or(4, |&x| x as usize);
+            let context = ((last * 2 + (step > 0) as usize) * MAX_IN_DEGREE + in_degree - 1) * 4;
             let chosen = code_tree(c, &mut m.steps[context..context + 4], 2, truth) as usize;
             if chosen >= in_degree {
                 return None
             }
+            m.last_at.insert(group.start as u32, chosen as u8);
             cur += chosen;
         }
     }
@@ -493,37 +536,163 @@ struct NodeWriter<'a> {
 impl NodeWriter<'_> {
     /// Codes node `x` whose predecessor on its chain is `pred` (rank, suffix
     /// length; None for the source).
+    /// The phrase start of the predecessor and its suffix length, if a walk
+    /// can start there.
+    fn start(
+        &self,
+        pred: Option<(u32, u32)>,
+    ) -> Option<(Vec<u8>, u32)> {
+        match (&self.walk, pred) {
+            (Some((index, _, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
+            _ => None,
+        }
+    }
+
+    /// The rows of the k-mers of `x` followed by `start` if the walk from
+    /// `start` to `x` exists: every k-mer in the index, in-degrees at most
+    /// [MAX_IN_DEGREE].
+    fn walk_rows(
+        &self,
+        start: &[u8],
+        x: u32,
+    ) -> Option<Vec<usize>> {
+        let (index, lcs, streaming) = self.walk.as_ref().unwrap();
+        let k = index.sbwt.k();
+        let mut bases = index.sbwt.access_kmer(x as usize);
+        bases.extend_from_slice(start);
+        let ms = streaming.matching_statistics(&bases);
+        let rows: Vec<usize> = ms.iter().map(|m| m.1.start).collect();
+        let derivable = (k - 1..2 * k).all(|p| ms[p].0 == k)
+            && (k..2 * k).all(|p| { let g = index.group(lcs, rows[p - 1]); g.end - g.start <= MAX_IN_DEGREE });
+        derivable.then_some(rows)
+    }
+
+    fn code_walk_to(
+        &mut self,
+        start: &[u8],
+        rows: &[usize],
+        x: u32,
+    ) {
+        let (index, lcs, _) = self.walk.as_ref().unwrap();
+        let reached = code_walk(&mut self.walks, &mut self.models, index, lcs, start, Some(rows));
+        assert_eq!(reached, Some(x), "node walk does not reach the node");
+    }
+
     fn node(
         &mut self,
         pred: Option<(u32, u32)>,
         x: u32,
         is_inner: bool,
     ) {
-        let start = match (&self.walk, pred) {
-            (Some((index, _, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
-            _ => None,
-        };
-        let Some((start, len)) = start else {
+        let Some((start, len)) = self.start(pred) else {
             self.ranks.write_truncated_binary(x, self.bound);
             return
         };
-        let (index, lcs, streaming) = self.walk.as_ref().unwrap();
-        let k = index.sbwt.k();
-        // The walk exists if every k-mer of x followed by the phrase start is in the index.
-        let mut bases = index.sbwt.access_kmer(x as usize);
-        bases.extend_from_slice(&start);
-        let ms = streaming.matching_statistics(&bases);
-        let rows: Vec<usize> = ms.iter().map(|m| m.1.start).collect();
-        let derivable = (k - 1..2 * k).all(|p| ms[p].0 == k)
-            && (k..2 * k).all(|p| { let g = index.group(lcs, rows[p - 1]); g.end - g.start <= MAX_IN_DEGREE });
+        let rows = self.walk_rows(&start, x);
         let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
-        code_bit(&mut self.walks, flag, derivable as u32);
-        if derivable {
-            let reached = code_walk(&mut self.walks, &mut self.models, index, lcs, &start, Some(&rows));
-            assert_eq!(reached, Some(x), "node walk does not reach the node");
-        } else {
-            self.ranks.write_truncated_binary(x, self.bound);
+        code_bit(&mut self.walks, flag, rows.is_some() as u32);
+        match rows {
+            Some(rows) => self.code_walk_to(&start, &rows, x),
+            None => self.ranks.write_truncated_binary(x, self.bound),
         }
+    }
+
+    /// Codes the target junction `target` (colex rank `rank`, `is_new` if
+    /// this chain reaches it first) of a chain whose last node is `pred`:
+    /// by a walk if one exists, else by `targets` and a new target's rank.
+    fn end(
+        &mut self,
+        pred: Option<(u32, u32)>,
+        target: u32,
+        rank: u32,
+        is_new: bool,
+        targets: &mut TargetModels,
+    ) {
+        if let Some((start, len)) = self.start(pred) {
+            let rows = if target == SINK_NODE { None } else { self.walk_rows(&start, rank) };
+            code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], rows.is_some() as u32);
+            if let Some(rows) = rows {
+                self.code_walk_to(&start, &rows, rank);
+                if is_new {
+                    targets.next_new += 1;
+                }
+                return
+            }
+        }
+        targets.code(&mut self.walks, Some(target)).expect("target encode");
+        if is_new {
+            self.ranks.write_truncated_binary(rank, self.bound);
+        }
+    }
+}
+
+/// Decoder side of the stored nodes, see [NodeWriter].
+struct NodeReader<'a, 'b> {
+    walk: Option<(WalkIndex<'a>, LcsLookup<'a>)>,
+    ranks: BitReader<'b>,
+    walks: Decoder<'b>,
+    models: WalkModels,
+    bound: u32,
+}
+
+impl NodeReader<'_, '_> {
+    fn start(
+        &self,
+        pred: Option<(u32, u32)>,
+    ) -> Option<(Vec<u8>, u32)> {
+        match (&self.walk, pred) {
+            (Some((index, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
+            _ => None,
+        }
+    }
+
+    fn walk_from(
+        &mut self,
+        start: &[u8],
+    ) -> Option<u32> {
+        let (index, lcs) = self.walk.as_ref().unwrap();
+        code_walk(&mut self.walks, &mut self.models, index, *lcs, start, None)
+    }
+
+    /// Decodes a node whose predecessor is `pred`.
+    fn node(
+        &mut self,
+        pred: Option<(u32, u32)>,
+        is_inner: bool,
+    ) -> Option<u32> {
+        if let Some((start, len)) = self.start(pred) {
+            let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
+            if code_bit(&mut self.walks, flag, 0) == 1 {
+                return self.walk_from(&start)
+            }
+        }
+        self.ranks.read_truncated_binary(self.bound)
+    }
+
+    /// Decodes the target of a chain whose last node is `pred`: the
+    /// junction and, if this chain reaches it first, its colex rank.
+    fn end(
+        &mut self,
+        pred: Option<(u32, u32)>,
+        targets: &mut TargetModels,
+        junction_of: &std::collections::HashMap<u32, u32>,
+    ) -> Option<(u32, Option<u32>)> {
+        if let Some((start, len)) = self.start(pred) {
+            if code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], 0) == 1 {
+                let rank = self.walk_from(&start)?;
+                if let Some(&junction) = junction_of.get(&rank) {
+                    return Some((junction, None))
+                }
+                let junction = targets.next_new;
+                targets.next_new += 1;
+                return Some((junction, Some(rank)))
+            }
+        }
+        let (target, is_new) = targets.code(&mut self.walks, None)?;
+        if is_new {
+            return Some((target, Some(self.ranks.read_truncated_binary(self.bound)?)))
+        }
+        Some((target, None))
     }
 }
 
@@ -652,6 +821,8 @@ impl ChainCsr {
         });
         let derived = walk.is_some();
         let mut nodes = NodeWriter { walk, ranks: BitWriter::new(), walks: Encoder::new(), models: WalkModels::new(), bound: colex_bound };
+        // With walks, the targets are coded where each chain ends.
+        let mut end_targets = TargetModels::new();
         let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
         let mut suffix_lens = Encoder::new();
         let mut reached = vec![false; n_junctions];
@@ -674,8 +845,11 @@ impl ChainCsr {
                         nodes.node(pred, inner[i], true);
                     } else {
                         let target = self.targets[chain] as usize;
-                        if !reached[target] {
-                            reached[target] = true;
+                        let is_new = !reached[target];
+                        reached[target] = true;
+                        if derived {
+                            nodes.end(pred, target as u32, self.junction_weights[target], is_new, &mut end_targets);
+                        } else if is_new {
                             nodes.node(pred, self.junction_weights[target], false);
                         }
                     }
@@ -693,7 +867,7 @@ impl ChainCsr {
             max_direct,
             suffix_lens: suffix_lens.finish(),
             topology: topology.finish(),
-            targets: targets.finish(),
+            targets: if derived { Vec::new() } else { targets.finish() },
         }
     }
 
@@ -761,31 +935,30 @@ impl ChainCsr {
             _ => return Err(GraphDecodeError("stored chains: the derived nodes need the index".to_string())),
         };
 
-        // The targets set the node order.
-        let mut coded = Decoder::new(&stored.targets);
-        let (targets, next_new) = code_targets(&mut coded, n_chains, None)?;
-        if next_new as usize != n_junctions || coded.overrun() {
-            return Err(truncated("targets"))
-        }
+        // The targets set the node order: stored first, or with walks coded
+        // where each chain ends.
+        let mut targets = if stored.derived {
+            vec![0_u32; n_chains]
+        } else {
+            let mut coded = Decoder::new(&stored.targets);
+            let (targets, next_new) = code_targets(&mut coded, n_chains, None)?;
+            if next_new as usize != n_junctions || coded.overrun() {
+                return Err(truncated("targets"))
+            }
+            targets
+        };
 
         // Nodes and suffix lengths in node order, see the module docs.
-        let mut ranks = BitReader::new(&stored.node_ranks);
-        let mut walks = Decoder::new(&stored.node_walks);
-        let mut models = WalkModels::new();
-        let mut node = |pred: Option<(u32, u32)>, is_inner: bool| -> Result<u32, GraphDecodeError> {
-            let start = match (&walk, pred) {
-                (Some((index, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
-                _ => None,
-            };
-            if let Some((start, len)) = start {
-                let (index, lcs) = walk.as_ref().unwrap();
-                let flag = &mut models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
-                if code_bit(&mut walks, flag, 0) == 1 {
-                    return code_walk(&mut walks, &mut models, index, *lcs, &start, None).ok_or_else(|| truncated("node walks"))
-                }
-            }
-            ranks.read_truncated_binary(colex_bound).ok_or_else(|| truncated("node colex ranks"))
+        let mut nodes = NodeReader {
+            walk,
+            ranks: BitReader::new(&stored.node_ranks),
+            walks: Decoder::new(&stored.node_walks),
+            models: WalkModels::new(),
+            bound: colex_bound,
         };
+        let mut end_targets = TargetModels::new();
+        // Colex rank -> junction, for the junctions reached so far.
+        let mut junction_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut junction_weights = vec![0_u32; n_junctions];
         junction_weights[SOURCE_NODE as usize] = SOURCE_COLEX;
         junction_weights[SINK_NODE as usize] = SINK_COLEX;
@@ -818,12 +991,23 @@ impl ChainCsr {
                     suffix_lens.push(len);
                     let pred = (!from_source).then_some((source, len));
                     if i + 1 < n_edges {
-                        inner_weights[start + i] = node(pred, true)?;
+                        inner_weights[start + i] = nodes.node(pred, true).ok_or_else(|| truncated("nodes"))?;
+                    } else if stored.derived {
+                        let (target, rank) = nodes.end(pred, &mut end_targets, &junction_of).ok_or_else(|| truncated("targets"))?;
+                        if target as usize >= n_junctions {
+                            return Err(truncated("targets"))
+                        }
+                        targets[chain] = target;
+                        if let Some(rank) = rank {
+                            reached[target as usize] = true;
+                            junction_weights[target as usize] = rank;
+                            junction_of.insert(rank, target);
+                        }
                     } else {
                         let target = targets[chain] as usize;
                         if !reached[target] {
                             reached[target] = true;
-                            junction_weights[target] = node(pred, false)?;
+                            junction_weights[target] = nodes.node(pred, false).ok_or_else(|| truncated("nodes"))?;
                         }
                     }
                 }
@@ -832,7 +1016,8 @@ impl ChainCsr {
         if coded.overrun() {
             return Err(truncated("suffix lengths"))
         }
-        if (stored.derived && walks.overrun()) || ranks.bits_read().div_ceil(8) != stored.node_ranks.len() {
+        if (stored.derived && (nodes.walks.overrun() || end_targets.next_new as usize != n_junctions))
+            || nodes.ranks.bits_read().div_ceil(8) != stored.node_ranks.len() {
             return Err(truncated("nodes"))
         }
 
