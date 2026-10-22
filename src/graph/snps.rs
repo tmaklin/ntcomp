@@ -11,25 +11,27 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
-//! Editing SNPs towards the index before encoding.
+//! Editing SNPs and small indels towards the index before encoding.
 //!
 //! A contig that differs from the index by a SNP is encoded as several short
 //! dictionary entries around the SNP. Replacing the contig's base with the
 //! index's base before encoding gives fewer, longer entries; the original base
-//! is stored separately and put back after decoding.
+//! is stored separately and put back after decoding. Small indels are edited
+//! the same way: contig bases the index does not have are removed (a
+//! deletion, [Change::Del]) and index bases the contig does not have are
+//! added (an insertion, [Change::Ins]). Below, "SNP" means any of these edits.
 //!
-//! The SNPs are called by walking the index, see [call_snps]. SNPs are
-//! identified across contigs by the change and [FLANK] bases on both sides.
+//! The edits are called by walking the index, see [call_snps].
 //!
 //! ## Stored SNPs
 //!
 //! A SNP that several contigs share is stored in full once. Each SNP gets an
 //! id when it is stored in full ("new"), in colour order. A later contig with
-//! the same SNP (same change and [FLANK] bases on both sides) stores it as a
-//! *repeat*: its position is not stored, the decoder finds it by searching
-//! the contig's edited sequence for the SNP's [CONTEXT]-base context taken
-//! from the contig that has it as new. A SNP is only a repeat if its context
-//! is the same as there and occurs once in the contig.
+//! the same SNP (the same change and [CONTEXT]-base context in the edited
+//! contig, centred on the SNP's position there) stores it as a *repeat*: its
+//! position is not stored, the decoder finds it by searching the contig's
+//! edited sequence for the context taken from the contig that has it as new.
+//! A SNP is only a repeat if its context occurs once in the contig.
 //!
 //! Every colour has an id list: its new SNPs in position order, then its
 //! repeats. A colour with repeats may name a *reference*, the earlier colour
@@ -43,10 +45,14 @@
 //!   colour had none);
 //! - its new SNPs: the gap from the base after the previous new SNP (from the
 //!   start of the contig for the first one), adaptive Elias gamma by the
-//!   bit length of the previous gap, and the original base as its distance
-//!   from the index's base (1, 2 or 3 in A, C, G, T order; 2 is a
-//!   transition), adaptive. The index's base is read from the decoded
-//!   (edited) contig;
+//!   bit length of the previous gap, and its change as a symbol of an
+//!   adaptive 2-bit tree: 0–2 a substitution, the original base's distance
+//!   from the index's base minus one (1, 2 or 3 in A, C, G, T order; 2 is a
+//!   transition; the index's base is read from the decoded, edited, contig),
+//!   3 an indel: an adaptive flag (deletion or insertion), the length minus
+//!   one (an adaptive 2-bit tree per kind) and for a deletion its bases (an
+//!   adaptive 2-bit tree). The position is in the edited contig: where a
+//!   deletion's bases are put back, the first of an insertion's bases;
 //! - whether it has a reference; if so the distance back to it and a flag per
 //!   entry of the reference's id list (adaptive, by the previous two flags,
 //!   whether the entry is one of the reference's new SNPs and whether it is
@@ -89,10 +95,36 @@ pub struct Snp {
     pub index_base: u8,
 }
 
-/// A SNP and the hash that identifies it across contigs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A change of a contig against the index.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Change {
+    /// A SNP: the contig's base `base` where the index has `index_base`.
+    Sub { base: u8, index_base: u8 },
+    /// Contig bases the index does not have, removed when editing.
+    Del { bases: Vec<u8> },
+    /// Index bases the contig does not have, added when editing.
+    Ins { bases: Vec<u8> },
+}
+
+/// A change at a position of a contig: the first base it changes or removes,
+/// or the base an insertion goes before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edit {
+    pub pos: u32,
+    pub change: Change,
+}
+
+impl From<Snp> for Edit {
+    fn from(snp: Snp) -> Self {
+        Edit { pos: snp.pos, change: Change::Sub { base: snp.base, index_base: snp.index_base } }
+    }
+}
+
+/// A called edit (in the contig's coordinates) and the hash that identifies
+/// it across contigs ([FLANK] contig bases on both sides and the change).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalledSnp {
-    pub snp: Snp,
+    pub edit: Edit,
     pub key: u64,
 }
 
@@ -108,25 +140,34 @@ fn base_code(
     }
 }
 
-/// Hash of the SNP with [FLANK] bases on both sides.
+/// Hash of the edit with [FLANK] bases of `sequence` on both sides (before
+/// its position and after the bases it changes or removes).
 fn key(
     sequence: &[u8],
-    snp: &Snp,
+    edit: &Edit,
 ) -> u64 {
-    let pos = snp.pos as usize;
-    let start = pos.saturating_sub(FLANK);
-    let end = (pos + 1 + FLANK).min(sequence.len());
+    let pos = edit.pos as usize;
+    let after = match &edit.change {
+        Change::Sub { .. } => pos + 1,
+        Change::Del { bases } => pos + bases.len(),
+        Change::Ins { .. } => pos,
+    };
     let mut hasher = DefaultHasher::new();
-    sequence[start..pos].hash(&mut hasher);
-    snp.base.hash(&mut hasher);
-    snp.index_base.hash(&mut hasher);
-    sequence[(pos + 1)..end].hash(&mut hasher);
+    sequence[pos.saturating_sub(FLANK)..pos].hash(&mut hasher);
+    edit.change.hash(&mut hasher);
+    sequence[after..(after + FLANK).min(sequence.len())].hash(&mut hasher);
     hasher.finish()
 }
 
-/// Most substitutions in one stretch of the contig not in the index, see
+/// Most edits in one stretch of the contig not in the index, see
 /// [call_snps].
-const MAX_SUBSTITUTIONS: usize = 3;
+const MAX_EDITS: usize = 5;
+
+/// Most contig bases one deletion removes, see [call_snps].
+const MAX_DELETED: usize = 3;
+
+/// Most index bases one insertion adds, see [call_snps].
+const MAX_INSERTED: usize = 2;
 
 /// A pattern in the index: its colex interval and length (at most _k_).
 type Pattern = (std::ops::Range<usize>, usize);
@@ -180,18 +221,107 @@ fn walk_right(
     (pattern, pos)
 }
 
-/// Calls the SNPs of `sequence` against the index by walking its de Bruijn
-/// graph; sorted by position.
+/// An edit tried in a stretch the contig cannot extend: its change (as
+/// the base, the number of contig bases removed, or the bases added), the
+/// pattern after the walk following it, the contig position the walk
+/// reached and whether that completes the stretch.
+type Tried = (TriedChange, Pattern, usize, bool);
+
+#[derive(Clone)]
+enum TriedChange {
+    Sub(u8),
+    Del(usize),
+    Ins(Vec<u8>),
+}
+
+/// Edits from `pos` until a walk takes _k_ contig bases from the last one,
+/// starting from the match `pattern`: at most [MAX_EDITS], substitutions only
+/// or also indels. None if the walk does not get through.
+fn repair(
+    sbwt: &SbwtIndex<SubsetMatrix>,
+    lcs: &LcsArray,
+    sequence: &[u8],
+    mut pattern: Pattern,
+    mut pos: usize,
+    with_indels: bool,
+) -> Option<(Vec<(usize, TriedChange)>, Pattern, usize)> {
+    let (k, n) = (sbwt.k(), sequence.len());
+    let mut found: Vec<(usize, TriedChange)> = Vec::new();
+    loop {
+        if found.len() == MAX_EDITS || pos + k > n || base_code(sequence[pos]).is_none() {
+            return None
+        }
+        let mut tried: Vec<Tried> = Vec::new();
+        for &b in b"ACGT" {
+            if b == sequence[pos] {
+                continue
+            }
+            let Some(after) = step_right(sbwt, lcs, &pattern, b) else { continue };
+            let (walked, reached) = walk_right(sbwt, lcs, sequence, after, pos + 1, pos + k);
+            tried.push((TriedChange::Sub(b), walked, reached, reached == pos + k));
+        }
+        if with_indels && !tried.iter().any(|t| t.3) {
+            // Contig bases removed: the walk goes on after them.
+            for d in 1..=MAX_DELETED {
+                if pos + d + k > n || !sequence[pos..pos + d].iter().all(|&c| base_code(c).is_some()) {
+                    break
+                }
+                let (walked, reached) = walk_right(sbwt, lcs, sequence, pattern.clone(), pos + d, pos + d + k);
+                if reached > pos + d {
+                    tried.push((TriedChange::Del(d), walked, reached, reached == pos + d + k));
+                }
+            }
+            // Index bases added: every path of up to MAX_INSERTED steps.
+            let mut paths: Vec<(Vec<u8>, Pattern)> = vec![(Vec::new(), pattern.clone())];
+            for _ in 0..MAX_INSERTED {
+                let mut longer = Vec::new();
+                for (bases, path) in &paths {
+                    for &b in b"ACGT" {
+                        let Some(after) = step_right(sbwt, lcs, path, b) else { continue };
+                        let mut bases = bases.clone();
+                        bases.push(b);
+                        let (walked, reached) = walk_right(sbwt, lcs, sequence, after.clone(), pos, pos + k);
+                        if reached > pos {
+                            tried.push((TriedChange::Ins(bases.clone()), walked, reached, reached == pos + k));
+                        }
+                        longer.push((bases, after));
+                    }
+                }
+                paths = longer;
+            }
+        }
+        // The first edit that completes the stretch (substitutions first,
+        // then deletions and insertions by length), else the one that walks
+        // furthest.
+        let best = tried.iter().position(|t| t.3).or_else(|| {
+            let furthest = tried.iter().map(|t| t.2).max()?;
+            tried.iter().position(|t| t.2 == furthest)
+        })?;
+        let (change, walked, reached, complete) = tried.swap_remove(best);
+        found.push((pos, change));
+        if complete {
+            return Some((found, walked, reached))
+        }
+        pattern = walked;
+        pos = reached;
+    }
+}
+
+/// Calls the edits (SNPs and small indels) of `sequence` against the index
+/// by walking its de Bruijn graph; sorted by position.
 ///
 /// Where the contig's match in the index (its matching statistics), at least
 /// as long as a random match is unlikely to be ([random_match_threshold](kbo::derandomize::random_match_threshold)),
 /// cannot be extended by the next base at p, every other base b is tried:
 /// the match followed by b and then by the contig's bases, one step right in
-/// the index at a time. If that walk takes the next _k_ - 1 bases, every
+/// the index at a time. If that walk takes the next _k_ − 1 bases, every
 /// _k_-mer through p is in the index once p is b: a SNP. If no b gets that
 /// far, the one that walks furthest is taken and the base where its walk
-/// stops is substituted the same way, at most [MAX_SUBSTITUTIONS] times; a
-/// stretch whose walk does not get through has no SNPs. After a SNP the
+/// stops is substituted the same way, at most [MAX_EDITS] times. If
+/// substitutions do not get the walk through, the same search is tried with
+/// indels too: removing up to [MAX_DELETED] contig bases or adding up to
+/// [MAX_INSERTED] index bases (every path of the index after the match);
+/// a stretch whose walk does not get through has no edits. After an edit the
 /// edited contig is walked on until its matching statistics are full _k_-mers
 /// again, and a base not in the index there is repaired from that walk.
 pub fn call_snps(
@@ -208,13 +338,13 @@ pub fn call_snps(
     let min_match = kbo::derandomize::random_match_threshold(k, sbwt.n_kmers(), 4, kbo::CallOpts::default().max_error_prob);
     let ms = StreamingIndex::new(sbwt, lcs).matching_statistics(sequence);
 
-    let mut snps: Vec<Snp> = Vec::new();
-    // The edited contig's match ending at i - 1, if a walk after a SNP
+    let mut edits: Vec<Edit> = Vec::new();
+    // The edited contig's match ending at i - 1, if a walk after an edit
     // stopped at i.
     let mut carried: Option<Pattern> = None;
     let mut i = 1;
     while i < n {
-        let mut pattern = match carried.take() {
+        let pattern = match carried.take() {
             Some(pattern) => pattern,
             None => {
                 let (prev_len, len) = (ms[i - 1].0, ms[i].0);
@@ -226,37 +356,19 @@ pub fn call_snps(
             },
         };
 
-        // Substitute until a walk takes k bases from the last substitution.
-        let mut pos = i;
-        let mut found: Vec<Snp> = Vec::new();
-        let repaired = loop {
-            if found.len() == MAX_SUBSTITUTIONS || pos + k > n || base_code(sequence[pos]).is_none() {
-                break None
-            }
-            let mut best: Option<(u8, Pattern, usize)> = None;
-            for &b in b"ACGT" {
-                if b == sequence[pos] {
-                    continue
-                }
-                let Some(after) = step_right(sbwt, lcs, &pattern, b) else { continue };
-                let (walked, reached) = walk_right(sbwt, lcs, sequence, after, pos + 1, pos + k);
-                if best.as_ref().is_none_or(|(_, _, furthest)| reached > *furthest) {
-                    best = Some((b, walked, reached));
-                }
-            }
-            let Some((b, walked, reached)) = best else { break None };
-            found.push(Snp { pos: pos.try_into().expect("contig position does not fit in u32"), base: sequence[pos], index_base: b });
-            if reached == pos + k {
-                break Some((walked, reached))
-            }
-            pattern = walked;
-            pos = reached;
-        };
-
+        let repaired = repair(sbwt, lcs, sequence, pattern.clone(), i, false)
+            .or_else(|| repair(sbwt, lcs, sequence, pattern, i, true));
         match repaired {
-            Some((mut pattern, mut pos)) => {
-                snps.extend(found);
-                // The original matching statistics still contain the SNPs here.
+            Some((found, mut pattern, mut pos)) => {
+                for (at, change) in found {
+                    let pos = at.try_into().expect("contig position does not fit in u32");
+                    edits.push(match change {
+                        TriedChange::Sub(b) => Edit { pos, change: Change::Sub { base: sequence[at], index_base: b } },
+                        TriedChange::Del(d) => Edit { pos, change: Change::Del { bases: sequence[at..at + d].to_vec() } },
+                        TriedChange::Ins(bases) => Edit { pos, change: Change::Ins { bases } },
+                    });
+                }
+                // The original matching statistics still contain the edits here.
                 while pos < n && ms[pos].0 < k {
                     match step_right(sbwt, lcs, &pattern, sequence[pos]) {
                         Some(next) => {
@@ -274,7 +386,49 @@ pub fn call_snps(
             None => i += 1,
         }
     }
-    snps.into_iter().map(|snp| CalledSnp { snp, key: key(sequence, &snp) }).collect()
+    edits.into_iter().map(|edit| CalledSnp { key: key(sequence, &edit), edit }).collect()
+}
+
+/// `sequence` with `edits` (in its coordinates, increasing and not
+/// overlapping) applied, and the edits at their positions in the result.
+/// None if an edit does not match the sequence.
+pub fn apply_edits(
+    sequence: &[u8],
+    edits: Vec<Edit>,
+) -> Option<(Vec<u8>, Vec<Edit>)> {
+    let mut out: Vec<u8> = Vec::with_capacity(sequence.len() + 16);
+    let mut moved: Vec<Edit> = Vec::with_capacity(edits.len());
+    let mut from = 0;
+    for edit in edits {
+        let pos = edit.pos as usize;
+        if pos < from || pos > sequence.len() {
+            return None
+        }
+        out.extend_from_slice(&sequence[from..pos]);
+        let at = out.len() as u32;
+        match &edit.change {
+            Change::Sub { base, index_base } => {
+                if sequence.get(pos) != Some(base) {
+                    return None
+                }
+                out.push(*index_base);
+                from = pos + 1;
+            },
+            Change::Del { bases } => {
+                if sequence.get(pos..pos + bases.len()) != Some(bases.as_slice()) {
+                    return None
+                }
+                from = pos + bases.len();
+            },
+            Change::Ins { bases } => {
+                out.extend_from_slice(bases);
+                from = pos;
+            },
+        }
+        moved.push(Edit { pos: at, change: edit.change });
+    }
+    out.extend_from_slice(&sequence[from..]);
+    Some((out, moved))
 }
 
 /// Error from reading the stored SNPs.
@@ -289,11 +443,13 @@ impl std::fmt::Display for SnpDecodeError {
 
 impl std::error::Error for SnpDecodeError {}
 
-/// An edited SNP with what is needed to store it as a repeat.
+/// An edit at its position in the edited contig, with what is needed to store
+/// it as a repeat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditedSnp {
-    pub snp: Snp,
-    /// Identifies the SNP across contigs, see [FLANK].
+    pub edit: Edit,
+    /// Identifies the edit across contigs: its context and change (0 without
+    /// a context).
     pub key: u64,
     /// The [CONTEXT] bases around the SNP in the edited contig (None at the
     /// contig ends).
@@ -357,27 +513,54 @@ fn find_contexts(
     found
 }
 
-/// The SNPs of one contig with their contexts in `edited`, the contig with
-/// the index's base at every SNP.
+/// The edits of one contig (at their positions in `edited`, the edited
+/// contig, see [apply_edits]) with their contexts there.
 pub fn with_contexts(
     edited: &[u8],
-    snps: Vec<CalledSnp>,
+    edits: Vec<Edit>,
 ) -> Vec<EditedSnp> {
-    let contexts: Vec<Option<[u8; CONTEXT]>> = snps.iter().map(|s| context_at(edited, s.snp.pos as usize)).collect();
+    let contexts: Vec<Option<[u8; CONTEXT]>> = edits.iter().map(|e| context_at(edited, e.pos as usize)).collect();
     let present: Vec<[u8; CONTEXT]> = contexts.iter().flatten().copied().collect();
     let found = find_contexts(edited, &present);
     let mut counts = found.iter().map(|f| f.len());
-    snps.into_iter().zip(contexts).map(|(s, context)| {
+    edits.into_iter().zip(contexts).map(|(edit, context)| {
         let unique = context.is_some() && counts.next() == Some(1);
-        EditedSnp { snp: s.snp, key: s.key, context, unique }
+        let key = context.map_or(0, |context| {
+            let mut hasher = DefaultHasher::new();
+            context.hash(&mut hasher);
+            edit.change.hash(&mut hasher);
+            hasher.finish()
+        });
+        EditedSnp { edit, key, context, unique }
     }).collect()
+}
+
+/// A new SNP's change as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stored {
+    /// The original base's distance from the index's base, 1..=3.
+    Distance(u8),
+    /// A deletion's bases, put back at the position.
+    Deleted(Vec<u8>),
+    /// An insertion's length, removed from the position on.
+    Inserted(u8),
+}
+
+impl Stored {
+    fn of(change: &Change) -> Self {
+        match change {
+            Change::Sub { base, index_base } => Stored::Distance(base_symbol(*base, *index_base)),
+            Change::Del { bases } => Stored::Deleted(bases.clone()),
+            Change::Ins { bases } => Stored::Inserted(bases.len() as u8),
+        }
+    }
 }
 
 /// SNPs of one colour.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ColourSnps {
-    /// New SNPs: position and the base's distance from the index's base.
-    new: Vec<(u32, u8)>,
+    /// New SNPs: position and the change.
+    new: Vec<(u32, Stored)>,
     /// Colours back to the reference (0: none).
     reference: u32,
     /// Indices of the shared entries in the reference's id list, increasing.
@@ -420,6 +603,9 @@ struct Models {
     flags: [u32; 16],
     gaps: Vec<GammaModel>,
     bases: [u32; 4],
+    is_deletion: u32,
+    indel_lengths: [[u32; 4]; 2],
+    deleted: [u32; 4],
     n_direct: [GammaModel; 2],
     ids: Vec<GammaModel>,
 }
@@ -437,6 +623,9 @@ impl Models {
             flags: [C0; 16],
             gaps: (0..N_LENGTH_CONTEXTS).map(|_| GammaModel::new()).collect(),
             bases: [C0; 4],
+            is_deletion: C0,
+            indel_lengths: [[C0; 4]; 2],
+            deleted: [C0; 4],
             n_direct: [GammaModel::new(), GammaModel::new()],
             ids: (0..N_LENGTH_CONTEXTS).map(|_| GammaModel::new()).collect(),
         }
@@ -470,19 +659,33 @@ fn code_all<C: Coder>(
         previous_empty = empty;
 
         // New SNPs: the gap from the base after the previous one, and the base.
-        let mut new: Vec<(u32, u8)> = Vec::with_capacity((n_new as usize).min(1 << 20));
+        let mut new: Vec<(u32, Stored)> = Vec::with_capacity((n_new as usize).min(1 << 20));
         let mut list: Vec<u32> = Vec::with_capacity((n_new as usize).min(1 << 20));
         let (mut next, mut previous_length) = (0_u64, 0_usize);
         for i in 0..n_new {
-            let (pos, distance) = truth.map_or((0, 1), |t| t.new[i as usize]);
+            let (pos, stored) = truth.map_or((0, &Stored::Distance(1)), |t| (t.new[i as usize].0, &t.new[i as usize].1));
             let gap = m.gaps[previous_length.min(N_LENGTH_CONTEXTS - 1)].code(c, pos as u64 - next + 1) - 1;
             previous_length = bit_length(gap + 1);
             let pos: u32 = (next + gap).try_into().map_err(|_| error("position beyond 32 bits"))?;
-            let distance = code_tree(c, &mut m.bases, 2, distance as u32 - 1) + 1;
-            if distance > 3 {
-                return Err(error("a SNP does not change the base"))
-            }
-            new.push((pos, distance as u8));
+            let symbol = match stored { Stored::Distance(d) => *d as u32 - 1, _ => 3 };
+            let symbol = code_tree(c, &mut m.bases, 2, symbol);
+            let stored = if symbol < 3 {
+                Stored::Distance(symbol as u8 + 1)
+            } else {
+                let is_deletion = code_bit(c, &mut m.is_deletion, matches!(stored, Stored::Deleted(_)) as u32);
+                let len = match stored { Stored::Deleted(bases) => bases.len() as u32, Stored::Inserted(len) => *len as u32, _ => 1 };
+                let len = code_tree(c, &mut m.indel_lengths[is_deletion as usize], 2, len - 1) + 1;
+                if is_deletion == 1 {
+                    let bases = (0..len as usize).map(|j| {
+                        let truth = match stored { Stored::Deleted(bases) => base_code(bases[j]).unwrap() as u32, _ => 0 };
+                        b"ACGT"[code_tree(c, &mut m.deleted, 2, truth) as usize]
+                    }).collect();
+                    Stored::Deleted(bases)
+                } else {
+                    Stored::Inserted(len as u8)
+                }
+            };
+            new.push((pos, stored));
             list.push(ids.len() as u32);
             ids.push((col as u32, i));
             next = pos as u64 + 1;
@@ -556,7 +759,7 @@ impl SnpEdits {
     pub fn new(
         snps: &[Vec<Snp>],
     ) -> Self {
-        let edited: Vec<Vec<EditedSnp>> = snps.iter().map(|colour| colour.iter().map(|&snp| EditedSnp { snp, key: 0, context: None, unique: false }).collect()).collect();
+        let edited: Vec<Vec<EditedSnp>> = snps.iter().map(|colour| colour.iter().map(|&snp| EditedSnp { edit: snp.into(), key: 0, context: None, unique: false }).collect()).collect();
         SnpEdits::with_repeats(&edited)
     }
 
@@ -599,7 +802,7 @@ impl SnpEdits {
             repeats.extend_from_slice(&direct);
             let repeated: HashSet<u32> = repeats.iter().copied().collect();
             let mut list: Vec<u32> = Vec::new();
-            let mut new: Vec<(u32, u8)> = Vec::new();
+            let mut new: Vec<(u32, Stored)> = Vec::new();
             for (s, cand) in colour.iter().zip(&candidate) {
                 if cand.is_some_and(|id| repeated.contains(&id)) { continue }
                 let id = ids.len() as u32;
@@ -608,7 +811,7 @@ impl SnpEdits {
                 }
                 list.push(id);
                 ids.push((c, new.len() as u32));
-                new.push((s.snp.pos, base_symbol(s.snp.base, s.snp.index_base)));
+                new.push((s.edit.pos, Stored::of(&s.edit.change)));
             }
             list.extend_from_slice(&repeats);
             for &id in &list { holders.entry(id).or_default().push(c); }
@@ -667,38 +870,59 @@ impl SnpEdits {
         }).collect())
     }
 
-    /// Puts the original bases of `color` back into its decoded contig.
-    /// `context` gives the context at a position of an earlier colour's edited
-    /// contig (for the pairs in [SnpEdits::context_sources]).
+    /// Puts the original contig of `color` back from its decoded (edited)
+    /// one. `context` gives the context at a position of an earlier colour's
+    /// edited contig (for the pairs in [SnpEdits::context_sources]).
     pub fn revert(
         &self,
         color: u32,
-        sequence: &mut [u8],
+        sequence: &mut Vec<u8>,
         context: &dyn Fn(u32, u32) -> Option<[u8; CONTEXT]>,
     ) -> Result<(), SnpDecodeError> {
         let snps = self.colours.get(color as usize).ok_or_else(|| SnpDecodeError(format!("no SNP stream for colour {}", color)))?;
-        // Repeats are located in the edited sequence before any base changes.
+        // Repeats are located in the edited sequence before anything changes.
         let mut targets: Vec<[u8; CONTEXT]> = Vec::with_capacity(snps.repeats.len());
-        let mut distances: Vec<u8> = Vec::with_capacity(snps.repeats.len());
+        let mut stored: Vec<&Stored> = Vec::with_capacity(snps.repeats.len());
         for &id in &snps.repeats {
             let (f, i) = self.ids[id as usize];
-            let (pos, distance) = self.colours[f as usize].new[i as usize];
-            targets.push(context(f, pos).ok_or_else(|| SnpDecodeError(format!("no context at {} of colour {} for colour {}", pos, f, color)))?);
-            distances.push(distance);
+            let (pos, change) = &self.colours[f as usize].new[i as usize];
+            targets.push(context(f, *pos).ok_or_else(|| SnpDecodeError(format!("no context at {} of colour {} for colour {}", pos, f, color)))?);
+            stored.push(change);
         }
         let found = find_contexts(sequence, &targets);
-        let mut changes: Vec<(usize, u8)> = Vec::with_capacity(snps.new.len() + targets.len());
+        let mut changes: Vec<(usize, &Stored)> = Vec::with_capacity(snps.new.len() + targets.len());
         for (j, starts) in found.iter().enumerate() {
             if starts.len() != 1 {
                 return Err(SnpDecodeError(format!("repeated SNP {} of colour {} found {} times", j, color, starts.len())))
             }
-            changes.push((starts[0] + FLANK, distances[j]));
+            changes.push((starts[0] + FLANK, stored[j]));
         }
-        changes.extend(snps.new.iter().map(|&(pos, d)| (pos as usize, d)));
-        for (pos, distance) in changes {
-            let index_base = sequence.get(pos).and_then(|&b| base_code(b))
-                .ok_or_else(|| SnpDecodeError(format!("SNP of colour {} at {} is not on an A, C, G or T of the contig", color, pos)))?;
-            sequence[pos] = b"ACGT"[(index_base as usize + distance as usize) % 4];
+        changes.extend(snps.new.iter().map(|(pos, change)| (*pos as usize, change)));
+        // From the end, so that indels do not move the positions still to change.
+        changes.sort_by_key(|&(pos, _)| std::cmp::Reverse(pos));
+        if changes.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(SnpDecodeError(format!("two SNPs of colour {} at the same position", color)))
+        }
+        let invalid = |pos: usize| SnpDecodeError(format!("SNP of colour {} at {} does not fit the contig", color, pos));
+        for (pos, change) in changes {
+            match change {
+                Stored::Distance(distance) => {
+                    let index_base = sequence.get(pos).and_then(|&b| base_code(b)).ok_or_else(|| invalid(pos))?;
+                    sequence[pos] = b"ACGT"[(index_base as usize + *distance as usize) % 4];
+                },
+                Stored::Deleted(bases) => {
+                    if pos > sequence.len() {
+                        return Err(invalid(pos))
+                    }
+                    sequence.splice(pos..pos, bases.iter().copied());
+                },
+                Stored::Inserted(len) => {
+                    if pos + *len as usize > sequence.len() {
+                        return Err(invalid(pos))
+                    }
+                    sequence.drain(pos..pos + *len as usize);
+                },
+            }
         }
         Ok(())
     }
@@ -782,8 +1006,8 @@ mod tests {
         let colours: Vec<Vec<Snp>> = vec![shared.to_vec(), shared.to_vec(), vec![shared[0], shared[1], own]];
         let contigs: Vec<Vec<u8>> = colours.iter().map(|_| original.clone()).collect();
         let edited_seqs: Vec<Vec<u8>> = colours.iter().zip(&contigs).map(|(c, s)| edit(s, c)).collect();
-        let called: Vec<Vec<EditedSnp>> = colours.iter().zip(&contigs).zip(&edited_seqs).map(|((c, s), e)| {
-            with_contexts(e, c.iter().map(|&snp| CalledSnp { snp, key: key(s, &snp) }).collect())
+        let called: Vec<Vec<EditedSnp>> = colours.iter().zip(&edited_seqs).map(|(c, e)| {
+            with_contexts(e, c.iter().map(|&snp| snp.into()).collect())
         }).collect();
         let edits: SnpEdits = postcard::from_bytes(&postcard::to_allocvec(&SnpEdits::with_repeats(&called)).unwrap()).unwrap();
         assert_eq!(edits.n_snps(), 7);
@@ -810,7 +1034,7 @@ mod tests {
         let colours: Vec<Vec<Snp>> = vec![vec![a], vec![b], vec![a, b]];
         let edited_seqs: Vec<Vec<u8>> = colours.iter().map(|c| edit(&original, c)).collect();
         let called: Vec<Vec<EditedSnp>> = colours.iter().zip(&edited_seqs).map(|(c, e)| {
-            with_contexts(e, c.iter().map(|&snp| CalledSnp { snp, key: key(&original, &snp) }).collect())
+            with_contexts(e, c.iter().map(|&snp| snp.into()).collect())
         }).collect();
         let edits = SnpEdits::with_repeats(&called);
         assert_eq!(edits.n_repeats(), 2);
@@ -823,6 +1047,29 @@ mod tests {
         let context = |f: u32, pos: u32| context_at(&edited_seqs[f as usize], pos as usize);
         for color in 0..3 {
             let mut sequence = edited_seqs[color].clone();
+            edits.revert(color as u32, &mut sequence, &context).unwrap();
+            assert_eq!(sequence, original, "colour {}", color);
+        }
+    }
+
+    #[test]
+    fn shared_indels_are_stored_once() {
+        // Two contigs with the same deletion and insertion (and the second with
+        // a SNP of its own): the second stores the indels as repeats.
+        let original = random_sequence(2000, 17);
+        let del = Edit { pos: 500, change: Change::Del { bases: original[500..502].to_vec() } };
+        let ins = Edit { pos: 1200, change: Change::Ins { bases: b"GA".to_vec() } };
+        let own = Edit::from(snp(1700, original[1700], b"ACGT"[(base_code(original[1700]).unwrap() as usize + 1) % 4]));
+        let colours = [vec![del.clone(), ins.clone()], vec![del, ins, own]];
+        let edited: Vec<(Vec<u8>, Vec<Edit>)> = colours.iter().map(|c| apply_edits(&original, c.clone()).unwrap()).collect();
+        assert_eq!(edited[0].0.len(), original.len());
+        let called: Vec<Vec<EditedSnp>> = edited.iter().map(|(e, moved)| with_contexts(e, moved.clone())).collect();
+        let edits: SnpEdits = postcard::from_bytes(&postcard::to_allocvec(&SnpEdits::with_repeats(&called)).unwrap()).unwrap();
+        assert_eq!(edits.n_snps(), 5);
+        assert_eq!(edits.n_repeats(), 2);
+        let context = |f: u32, pos: u32| context_at(&edited[f as usize].0, pos as usize);
+        for color in 0..2 {
+            let mut sequence = edited[color].0.clone();
             edits.revert(color as u32, &mut sequence, &context).unwrap();
             assert_eq!(sequence, original, "colour {}", color);
         }
@@ -908,19 +1155,43 @@ mod tests {
         let (sbwt, lcs) = kbo::build(&[reference.clone()], opts);
 
         // An isolated SNP, three within k of each other, one too close to the
-        // end to be followed by k - 1 bases, and an insertion (not a SNP).
+        // end to be followed by k - 1 bases, an extra base in the contig (a
+        // deletion), a missing one (an insertion), and a deleted base next to
+        // a SNP (substitutions alone do not get through).
         let mut contig = reference.clone();
         let mut expected = Vec::new();
         for pos in [600, 1500, 1510, 1540, 3990] {
             let base = b"ACGT"[(base_code(reference[pos]).unwrap() as usize + 1) % 4];
             contig[pos] = base;
             if pos < 3990 {
-                expected.push(snp(pos as u32, base, reference[pos]));
+                expected.push(Edit::from(snp(pos as u32, base, reference[pos])));
             }
         }
-        contig.insert(2500, b'A');
-        let called: Vec<Snp> = call_snps(&contig, &sbwt, &lcs).into_iter().map(|called| called.snp).collect();
-        assert_eq!(called, expected);
+        let other = |pos: usize, by: usize| b"ACGT"[(base_code(reference[pos]).unwrap() as usize + by) % 4];
+        let (extra, near) = (other(2499, 2), other(3300, 1));
+        contig[3300] = near;
+        contig.insert(3301, other(3301, 2));
+        contig.remove(2900);
+        contig.insert(2500, extra);
+        let called: Vec<Edit> = call_snps(&contig, &sbwt, &lcs).into_iter().map(|called| called.edit).collect();
+        let subs: Vec<Edit> = called.iter().filter(|e| matches!(e.change, Change::Sub { .. })).cloned().collect();
+        assert_eq!(subs[..4], expected[..]);
+        // The indels: the extra base and the missing one, and two edits for the
+        // SNP next to an extra base (which two depends on the bases).
+        assert!(called.iter().any(|e| matches!(e.change, Change::Del { .. })), "{:?}", called);
+        assert!(called.iter().any(|e| matches!(e.change, Change::Ins { .. })), "{:?}", called);
+        assert_eq!(called.len(), expected.len() + 4, "{:?}", called);
+        // Editing gives the reference but for the SNP too close to the end.
+        let (edited, moved) = apply_edits(&contig, called).unwrap();
+        let mut target = reference.clone();
+        target[3990] = contig[contig.len() - 10];
+        assert_eq!(edited, target);
+        // And reverting the stored edits gives the contig back.
+        let colours = vec![with_contexts(&edited, moved)];
+        let edits: SnpEdits = postcard::from_bytes(&postcard::to_allocvec(&SnpEdits::with_repeats(&colours)).unwrap()).unwrap();
+        let mut decoded = edited.clone();
+        edits.revert(0, &mut decoded, &|_, _| None).unwrap();
+        assert_eq!(decoded, contig);
         assert!(call_snps(&reference, &sbwt, &lcs).is_empty());
     }
 }

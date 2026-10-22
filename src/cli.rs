@@ -169,7 +169,7 @@ pub enum Commands {
         reorient_sampling: u64,
 
         // // Edit SNPs towards the index
-        #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs against the index before encoding (reads the input twice).")]
+        #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs and small indels against the index before encoding (reads the input twice).")]
         edit_snps: bool,
 
         #[arg(long = "edit-snps-max-shared", value_parser = clap::value_parser!(u64).range(1..), help = "Edit only SNPs that at most this many contigs have [default: edit all SNPs].")]

@@ -475,15 +475,12 @@ impl GraphBuilder {
         let strands: Vec<bool> = prepared.iter().map(|(reversed, _)| *reversed).collect();
         type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>, Vec<snps::EditedSnp>);
         let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edited)))| {
-            let mut oriented = if reversed { orientation::reverse_complement(sequence) } else { sequence.to_vec() };
-            if edited.iter().any(|snp| oriented.get(snp.snp.pos as usize) != Some(&snp.snp.base)) {
-                return Err(format!("contig {} differs from the one its SNPs were called on", first_color + i))
-            }
-            for snp in &edited {
-                oriented[snp.snp.pos as usize] = snp.snp.index_base;
-            }
+            let oriented = if reversed { orientation::reverse_complement(sequence) } else { sequence.to_vec() };
+            let edits = edited.into_iter().map(|called| called.edit).collect();
+            let (oriented, edits) = snps::apply_edits(&oriented, edits)
+                .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
             // Contexts in the edited contig, for storing shared SNPs once.
-            let edited = snps::with_contexts(&oriented, edited);
+            let edited = snps::with_contexts(&oriented, edits);
             let (dictionary, implicit) = crate::encode_sequence(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
             Ok((oriented.len(), dictionary, implicit, edited))
         }).collect();
