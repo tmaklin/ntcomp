@@ -30,7 +30,8 @@
 //! _k_-mers, so the same SBWT.
 //!
 //! **Format.** Magic `TAC5`, _k_ (u16), options (u8: bit 0 end flags, always
-//! set; bit 1 reverse-strand anchors, set by [encode]), number of
+//! set; bit 1 reverse-strand anchors, bit 2 packed hashed tables, both set by
+//! [encode]), number of
 //! rounds (u8), total bases (u64), numbers of long tigs, of unanchored short
 //! tigs and of tigs in each round (u32 each, little-endian), then one
 //! arithmetic-coded stream:
@@ -46,7 +47,9 @@
 //!
 //! **Model**, per base as two binary decisions (high bit, then low bit):
 //! - order-_n_ context counters for _n_ in [ORDERS] (direct tables while they
-//!   fit, hashed with a check above);
+//!   fit, hashed with a check above; with packed tables a slot is four 16-bit
+//!   values, three counters of an 11-bit probability and a count up to 31,
+//!   and a 16-bit check, so twice the slots fit in the same memory);
 //! - copy models: [N_FWD] forward and [N_RC] reverse-complement ones, each
 //!   following a different one of the latest positions of the hashed
 //!   [MINLEN]-mer, plus a [SHORT]-mer one looked up only in the first
@@ -80,8 +83,11 @@ const ORDER16: usize = 9;
 /// Count-weighted inputs: the highest orders, from this index of [ORDERS] on.
 const CONF_FROM: usize = 8;
 const N_CONF: usize = ORDERS.len() - CONF_FROM;
-/// Largest table sizes (log2 of the number of contexts or buckets).
+/// Largest table sizes (log2 of the number of contexts or buckets): hashed
+/// context tables with 32-bit counters (files without packed tables) and
+/// packed ones, and the copy models' match tables.
 const MAX_HASH_BITS: u32 = 25;
+const MAX_PACKED_HASH_BITS: u32 = 26;
 const MAX_MATCH_BITS: u32 = 26;
 /// Copy models: minimum match, forward and reverse-complement candidates.
 const MINLEN: usize = 20;
@@ -134,6 +140,21 @@ impl HTab {
     fn bucket(&self, key: u64) -> usize { (hash64(key, 99 + self.minlen) >> (64 - self.bits)) as usize * self.slots }
 }
 
+/// A counter as a packed 16-bit value: 11 bits of probability (the top bits
+/// of the 22-bit probability) and the count capped at 31.
+fn pack(counter: u32) -> u16 {
+    let n = (counter & 1023).min(31);
+    let q = (((counter >> 10) + (1 << 10)) >> 11).min(2047);
+    ((q << 5) | n) as u16
+}
+
+/// The counter a packed value stands for: the probability at the middle of
+/// its interval.
+fn unpack(packed: u16) -> u32 {
+    let (q, n) = ((packed >> 5) as u32, (packed & 31) as u32);
+    (((q << 11) | (1 << 10)) << 10) | n
+}
+
 struct Model {
     k: usize,
     t: Tables,
@@ -141,6 +162,9 @@ struct Model {
     n_direct: usize,
     direct: Vec<Vec<u32>>,
     hashed: Vec<Vec<u32>>,
+    /// The hashed tables with packed slots (three counters and a 16-bit
+    /// check), see [OPT_PACKED_TABLES].
+    packed: Option<Vec<Vec<u16>>>,
     tabs: Vec<HTab>,
     models: Vec<CopyModel>,
     mprob: Vec<u32>,
@@ -165,9 +189,9 @@ struct Model {
 
 impl Model {
     /// A model for `k`-mers and about `n` bases (the table sizes follow `n`).
-    fn new(k: usize, n: usize) -> Model {
+    fn new(k: usize, n: usize, packed: bool) -> Model {
         let lg = usize::BITS - n.max(1024).saturating_sub(1).leading_zeros(); // ceil(log2(n))
-        let hash_bits = lg.saturating_sub(3).clamp(10, MAX_HASH_BITS);
+        let hash_bits = if packed { lg.saturating_sub(2).clamp(10, MAX_PACKED_HASH_BITS) } else { lg.saturating_sub(3).clamp(10, MAX_HASH_BITS) };
         let match_bits = lg.saturating_sub(2).clamp(10, MAX_MATCH_BITS);
         let n_direct = ORDERS.iter().take_while(|&&o| 2 * o as u32 <= hash_bits).count();
         let t = Tables::new();
@@ -187,7 +211,8 @@ impl Model {
             k, t,
             hash_bits, n_direct,
             direct: ORDERS[..n_direct].iter().map(|&o| vec![C0; 4usize.pow(o as u32) * 4]).collect(),
-            hashed: ORDERS[n_direct..].iter().map(|_| vec![0u32; (1usize << hash_bits) * 4]).collect(),
+            hashed: if packed { Vec::new() } else { ORDERS[n_direct..].iter().map(|_| vec![0u32; (1usize << hash_bits) * 4]).collect() },
+            packed: packed.then(|| ORDERS[n_direct..].iter().map(|_| vec![0u16; (1usize << hash_bits) * 4]).collect()),
             tabs, models,
             mprob: vec![C0; N_MODELS * 28 * 2],
             weights: MIX_SETS.iter().map(|&n| vec![(W_ONE / 4) as i32; 3 * n * N_IN]).collect(),
@@ -204,13 +229,25 @@ impl Model {
         if oi < self.n_direct { return (ctx as usize) * 4 }
         let h = hash64(ctx, o);
         let i = ((h >> (64 - self.hash_bits)) as usize) * 4;
+        if let Some(packed) = &mut self.packed {
+            // A 16-bit check, never 0 (an empty slot).
+            let chk = ((h & 0xFFFF) as u16).max(1);
+            let t = &mut packed[oi - self.n_direct];
+            if t[i + 3] != chk { let c = pack(C0); t[i] = c; t[i + 1] = c; t[i + 2] = c; t[i + 3] = chk; }
+            return i
+        }
         let chk = (h & 0xFFFF) as u32 | 1 << 16;
         let t = &mut self.hashed[oi - self.n_direct];
         if t[i + 3] != chk { t[i] = C0; t[i + 1] = C0; t[i + 2] = C0; t[i + 3] = chk; }
         i
     }
     fn counter(&self, oi: usize, node: usize) -> u32 {
-        if oi < self.n_direct { self.direct[oi][self.slots[oi] + node] } else { self.hashed[oi - self.n_direct][self.slots[oi] + node] }
+        let s = self.slots[oi] + node;
+        if oi < self.n_direct { return self.direct[oi][s] }
+        match &self.packed {
+            Some(packed) => unpack(packed[oi - self.n_direct][s]),
+            None => self.hashed[oi - self.n_direct][s],
+        }
     }
     fn longest_bucket(&self) -> usize { self.models.iter().map(|cm| cm.len_bucket(self.k)).max().unwrap() }
 
@@ -320,7 +357,16 @@ impl Model {
             update(&mut self.apm2[a2], bit);
             for oi in 0..ORDERS.len() {
                 let s = self.slots[oi] + node;
-                if oi < self.n_direct { update(&mut self.direct[oi][s], bit) } else { update(&mut self.hashed[oi - self.n_direct][s], bit) }
+                if oi < self.n_direct {
+                    update(&mut self.direct[oi][s], bit)
+                } else if let Some(packed) = &mut self.packed {
+                    let c = &mut packed[oi - self.n_direct][s];
+                    let mut counter = unpack(*c);
+                    update(&mut counter, bit);
+                    *c = pack(counter);
+                } else {
+                    update(&mut self.hashed[oi - self.n_direct][s], bit)
+                }
             }
             for j in 0..N_MODELS {
                 if let Some(e) = self.preds[j] {
@@ -465,6 +511,8 @@ fn find_kmers(region: &[&[u8]], region_start: usize, w: usize, want: &mut HashMa
 /// (always set); anchors may be on the reverse strand.
 const OPT_END_FLAGS: u8 = 1;
 const OPT_RC_ANCHORS: u8 = 2;
+/// The hashed context tables have packed 16-bit slots, twice as many.
+const OPT_PACKED_TABLES: u8 = 4;
 
 /// The tigs in coding order, see the module docs; an anchored tig is
 /// (anchor position, on the reverse strand, sequence).
@@ -579,7 +627,7 @@ pub fn encode<W: Write>(
     }
     let n: usize = codes.iter().map(|t| t.len()).sum();
     let plan = plan(codes, k);
-    let mut model = Model::new(k, n);
+    let mut model = Model::new(k, n, true);
     let mut enc = Encoder::new();
     let mut ll: Vec<usize> = plan.long.iter().map(|t| t.len()).collect();
     code_lengths(&mut enc, &mut ll, plan.long.len());
@@ -605,7 +653,7 @@ pub fn encode<W: Write>(
     let body = enc.finish();
     out.write_all(MAGIC)?;
     out.write_all(&(k as u16).to_le_bytes())?;
-    out.write_all(&[OPT_END_FLAGS | OPT_RC_ANCHORS, plan.rounds.len() as u8])?;
+    out.write_all(&[OPT_END_FLAGS | OPT_RC_ANCHORS | OPT_PACKED_TABLES, plan.rounds.len() as u8])?;
     out.write_all(&(n as u64).to_le_bytes())?;
     for c in [plan.long.len(), plan.rest.len()].into_iter().chain(plan.rounds.iter().map(|r| r.len())) { out.write_all(&(c as u32).to_le_bytes())?; }
     out.write_all(&body)?;
@@ -622,13 +670,14 @@ pub fn decode<R: Read>(
     if data.len() < 24 || &data[..4] != MAGIC { return Err("not a tigs file (TAC5)".into()) }
     let k = u16::from_le_bytes([data[4], data[5]]) as usize;
     let (options, n_rounds) = (data[6], data[7] as usize);
-    if options & OPT_END_FLAGS == 0 || options & !(OPT_END_FLAGS | OPT_RC_ANCHORS) != 0 { return Err("unsupported tigs file options".into()) }
+    if options & OPT_END_FLAGS == 0 || options & !(OPT_END_FLAGS | OPT_RC_ANCHORS | OPT_PACKED_TABLES) != 0 { return Err("unsupported tigs file options".into()) }
     let rc_anchors = options & OPT_RC_ANCHORS != 0;
+    let packed = options & OPT_PACKED_TABLES != 0;
     let n = u64::from_le_bytes(data[8..16].try_into()?) as usize;
     let u32_at = |o: usize| -> Result<usize, E> { Ok(u32::from_le_bytes(data.get(o..o + 4).ok_or("truncated tigs file")?.try_into()?) as usize) };
     let (n_long, n_rest) = (u32_at(16)?, u32_at(20)?);
     let round_n: Vec<usize> = (0..n_rounds).map(|r| u32_at(24 + 4 * r)).collect::<Result<_, _>>()?;
-    let mut model = Model::new(k, n);
+    let mut model = Model::new(k, n, packed);
     let mut dec = Decoder::new(&data[24 + 4 * n_rounds..]);
     let mut ll = Vec::new();
     code_lengths(&mut dec, &mut ll, n_long);
@@ -710,7 +759,7 @@ mod tests {
         assert_eq!(p.rounds.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(p.rounds[0].iter().filter(|x| x.1).count(), 1);
         let bytes = encode(&tigs, k, Vec::new()).unwrap();
-        assert_eq!((bytes[6], bytes[7]), (OPT_END_FLAGS | OPT_RC_ANCHORS, 2));
+        assert_eq!((bytes[6], bytes[7]), (OPT_END_FLAGS | OPT_RC_ANCHORS | OPT_PACKED_TABLES, 2));
         let decoded = decode(bytes.as_slice()).unwrap();
         assert_eq!(canonical_sorted(&decoded), canonical_sorted(&tigs));
     }
