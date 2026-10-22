@@ -45,8 +45,6 @@
 use core::ops::Range;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::IndexSet;
 
@@ -411,31 +409,15 @@ impl GraphBuilder {
         lcs: &LcsArray,
     ) -> Vec<u32> {
         let strands = self.choose_strands(sequences);
-        // kbo builds an SBWT of every contig in a thread pool of its own. A rayon
-        // worker waiting for that pool runs other tasks meanwhile, so with rayon
-        // most of the batch would be building at once. Plain threads, one per
-        // rayon thread, keep the number of calls in progress at the thread count.
-        let next = AtomicUsize::new(0);
-        let called: Vec<Mutex<Vec<CalledSnp>>> = (0..sequences.len()).map(|_| Mutex::new(Vec::new())).collect();
-        std::thread::scope(|scope| {
-            for _ in 0..rayon::current_num_threads().min(sequences.len()) {
-                scope.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= sequences.len() {
-                        break
-                    }
-                    let snps = if strands[i] {
-                        snps::call_snps(&orientation::reverse_complement(sequences[i]), sbwt, lcs)
-                    } else {
-                        snps::call_snps(sequences[i], sbwt, lcs)
-                    };
-                    *called[i].lock().unwrap() = snps;
-                });
+        let called: Vec<Vec<CalledSnp>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
+            if reversed {
+                snps::call_snps(&orientation::reverse_complement(sequence), sbwt, lcs)
+            } else {
+                snps::call_snps(sequence, sbwt, lcs)
             }
-        });
-        let called = called.into_iter().map(|snps| snps.into_inner().unwrap());
+        }).collect();
         let first: u32 = self.called.len().try_into().unwrap();
-        for (snps, reversed) in called.zip(strands) {
+        for (snps, reversed) in called.into_iter().zip(strands) {
             for snp in &snps {
                 *self.snp_counts.entry(snp.key).or_default() += 1;
             }

@@ -18,10 +18,8 @@
 //! index's base before encoding gives fewer, longer entries; the original base
 //! is stored separately and put back after decoding.
 //!
-//! The SNPs are called with [kbo::call] against the index. A SNP pays off if
-//! few contigs share it: the graph already stores the nodes of a SNP that many
-//! contigs share only once. SNPs are identified across contigs by the change
-//! and [FLANK] bases on both sides.
+//! The SNPs are called by walking the index, see [call_snps]. SNPs are
+//! identified across contigs by the change and [FLANK] bases on both sides.
 //!
 //! ## Stored SNPs
 //!
@@ -62,7 +60,7 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use sbwt::LcsArray;
+use sbwt::{ExtendRight, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
@@ -126,50 +124,157 @@ fn key(
     hasher.finish()
 }
 
-/// SNPs among the variants kbo calls for `variants`: sorted, without
-/// overlapping calls, and with A, C, G or T on both sides.
-fn snps_from_variants(
-    sequence: &[u8],
-    mut variants: Vec<kbo::variant_calling::Variant>,
-) -> Vec<Snp> {
-    variants.sort_by_key(|v| v.query_pos);
-    let mut snps: Vec<Snp> = Vec::new();
-    let mut prev_end = 0;
-    let mut prev_pos = None;
-    for v in variants {
-        // Calls that overlap an earlier one are dropped, whatever their type.
-        let end = v.query_pos + v.query_chars.len();
-        if (v.query_chars.is_empty() && v.ref_chars.is_empty())
-            || end > sequence.len()
-            || v.query_pos < prev_end
-            || prev_pos == Some(v.query_pos)
-            || !v.ref_chars.iter().all(|&c| base_code(c).is_some()) {
-            continue;
+/// Most substitutions in one stretch of the contig not in the index, see
+/// [call_snps].
+const MAX_SUBSTITUTIONS: usize = 3;
+
+/// A pattern in the index: its colex interval and length (at most _k_).
+type Pattern = (std::ops::Range<usize>, usize);
+
+/// One step right in the index: the interval of `pattern` followed by `c`,
+/// dropping the pattern's first character first if it is _k_ long. None if
+/// that is not in the index.
+fn step_right(
+    sbwt: &SbwtIndex<SubsetMatrix>,
+    lcs: &LcsArray,
+    pattern: &Pattern,
+    c: u8,
+) -> Option<Pattern> {
+    let k = sbwt.k();
+    let (mut interval, mut len) = pattern.clone();
+    if len == k {
+        // The k-mers sharing the last k - 1 characters.
+        while interval.start > 0 && lcs.access(interval.start) >= k - 1 {
+            interval.start -= 1;
         }
-        prev_end = end;
-        prev_pos = Some(v.query_pos);
-        if v.query_chars.len() == 1 && v.ref_chars.len() == 1 {
-            let (base, index_base) = (sequence[v.query_pos], v.ref_chars[0]);
-            if base_code(base).is_some() && base != index_base {
-                snps.push(Snp { pos: v.query_pos.try_into().expect("contig position does not fit in u32"), base, index_base });
-            }
+        while interval.end < sbwt.n_sets() && lcs.access(interval.end) >= k - 1 {
+            interval.end += 1;
         }
+        len = k - 1;
     }
-    snps
+    let next = sbwt.extend_right(interval, c);
+    (!next.is_empty()).then_some((next, len + 1))
 }
 
-/// Calls the SNPs of `sequence` against the index.
+/// Steps right in the index by the characters of `sequence` from `from`,
+/// stopping before `until` or at the first one not in the index. Returns the
+/// pattern and the first position not taken.
+fn walk_right(
+    sbwt: &SbwtIndex<SubsetMatrix>,
+    lcs: &LcsArray,
+    sequence: &[u8],
+    mut pattern: Pattern,
+    from: usize,
+    until: usize,
+) -> (Pattern, usize) {
+    let mut pos = from;
+    while pos < until {
+        match step_right(sbwt, lcs, &pattern, sequence[pos]) {
+            Some(next) => {
+                pattern = next;
+                pos += 1;
+            },
+            None => break,
+        }
+    }
+    (pattern, pos)
+}
+
+/// Calls the SNPs of `sequence` against the index by walking its de Bruijn
+/// graph; sorted by position.
+///
+/// Where the contig's match in the index (its matching statistics), at least
+/// as long as a random match is unlikely to be ([random_match_threshold](kbo::derandomize::random_match_threshold)),
+/// cannot be extended by the next base at p, every other base b is tried:
+/// the match followed by b and then by the contig's bases, one step right in
+/// the index at a time. If that walk takes the next _k_ - 1 bases, every
+/// _k_-mer through p is in the index once p is b: a SNP. If no b gets that
+/// far, the one that walks furthest is taken and the base where its walk
+/// stops is substituted the same way, at most [MAX_SUBSTITUTIONS] times; a
+/// stretch whose walk does not get through has no SNPs. After a SNP the
+/// edited contig is walked on until its matching statistics are full _k_-mers
+/// again, and a base not in the index there is repaired from that walk.
 pub fn call_snps(
     sequence: &[u8],
     sbwt: &SbwtIndexVariant,
     lcs: &LcsArray,
 ) -> Vec<CalledSnp> {
-    let SbwtIndexVariant::SubsetMatrix(index) = sbwt;
-    let mut opts = kbo::CallOpts::default();
-    opts.sbwt_build_opts.k = index.k();
-    opts.sbwt_build_opts.num_threads = 1;
-    let variants = kbo::call(sbwt, lcs, sequence, opts);
-    snps_from_variants(sequence, variants).into_iter().map(|snp| CalledSnp { snp, key: key(sequence, &snp) }).collect()
+    let SbwtIndexVariant::SubsetMatrix(sbwt) = sbwt;
+    let k = sbwt.k();
+    let n = sequence.len();
+    if n <= k {
+        return Vec::new()
+    }
+    let min_match = kbo::derandomize::random_match_threshold(k, sbwt.n_kmers(), 4, kbo::CallOpts::default().max_error_prob);
+    let ms = StreamingIndex::new(sbwt, lcs).matching_statistics(sequence);
+
+    let mut snps: Vec<Snp> = Vec::new();
+    // The edited contig's match ending at i - 1, if a walk after a SNP
+    // stopped at i.
+    let mut carried: Option<Pattern> = None;
+    let mut i = 1;
+    while i < n {
+        let mut pattern = match carried.take() {
+            Some(pattern) => pattern,
+            None => {
+                let (prev_len, len) = (ms[i - 1].0, ms[i].0);
+                if prev_len < min_match || len >= (prev_len + 1).min(k) || base_code(sequence[i]).is_none() {
+                    i += 1;
+                    continue
+                }
+                (ms[i - 1].1.clone(), prev_len)
+            },
+        };
+
+        // Substitute until a walk takes k bases from the last substitution.
+        let mut pos = i;
+        let mut found: Vec<Snp> = Vec::new();
+        let repaired = loop {
+            if found.len() == MAX_SUBSTITUTIONS || pos + k > n || base_code(sequence[pos]).is_none() {
+                break None
+            }
+            let mut best: Option<(u8, Pattern, usize)> = None;
+            for &b in b"ACGT" {
+                if b == sequence[pos] {
+                    continue
+                }
+                let Some(after) = step_right(sbwt, lcs, &pattern, b) else { continue };
+                let (walked, reached) = walk_right(sbwt, lcs, sequence, after, pos + 1, pos + k);
+                if best.as_ref().is_none_or(|(_, _, furthest)| reached > *furthest) {
+                    best = Some((b, walked, reached));
+                }
+            }
+            let Some((b, walked, reached)) = best else { break None };
+            found.push(Snp { pos: pos.try_into().expect("contig position does not fit in u32"), base: sequence[pos], index_base: b });
+            if reached == pos + k {
+                break Some((walked, reached))
+            }
+            pattern = walked;
+            pos = reached;
+        };
+
+        match repaired {
+            Some((mut pattern, mut pos)) => {
+                snps.extend(found);
+                // The original matching statistics still contain the SNPs here.
+                while pos < n && ms[pos].0 < k {
+                    match step_right(sbwt, lcs, &pattern, sequence[pos]) {
+                        Some(next) => {
+                            pattern = next;
+                            pos += 1;
+                        },
+                        None => break,
+                    }
+                }
+                if pos < n && ms[pos].0 < k {
+                    carried = Some(pattern);
+                }
+                i = pos;
+            },
+            None => i += 1,
+        }
+    }
+    snps.into_iter().map(|snp| CalledSnp { snp, key: key(sequence, &snp) }).collect()
 }
 
 /// Error from reading the stored SNPs.
@@ -615,7 +720,6 @@ impl<'de> serde::Deserialize<'de> for SnpEdits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kbo::variant_calling::Variant;
 
     fn snp(pos: u32, base: u8, index_base: u8) -> Snp {
         Snp { pos, base, index_base }
@@ -737,7 +841,7 @@ mod tests {
         use super::super::{GraphBuilder, SuffixLen, Walkable, decode_path};
 
         let reference = random_sequence(4000, 7);
-        // kbo calls SNPs only if k is well above the length of random matches.
+        // SNPs are only called after matches longer than random ones.
         let k = 63;
         let mut opts = kbo::BuildOpts::default();
         opts.k = k as usize;
@@ -794,18 +898,29 @@ mod tests {
     }
 
     #[test]
-    fn only_non_overlapping_snps_are_kept() {
-        let sequence = b"AAAAACCCCCGGGGGTTTTT".to_vec();
-        let variant = |pos: usize, query: &[u8], reference: &[u8]| Variant { query_pos: pos, query_chars: query.to_vec(), ref_chars: reference.to_vec() };
-        let variants = vec![
-            variant(12, b"G", b"T"),   // SNP
-            variant(2, b"AAA", b""),   // deletion from the index, covers 2..5
-            variant(3, b"A", b"C"),    // overlaps the deletion
-            variant(12, b"G", b"A"),   // second call at the same position
-            variant(16, b"T", b"N"),   // not a base in the index
-            variant(7, b"C", b"GG"),   // not a SNP
-            variant(9, b"C", b"A"),    // SNP
-        ];
-        assert_eq!(snps_from_variants(&sequence, variants), vec![snp(9, b'C', b'A'), snp(12, b'G', b'T')]);
+    fn snps_are_called_by_walking_the_index() {
+        let reference = random_sequence(4000, 11);
+        let k = 63;
+        let mut opts = kbo::BuildOpts::default();
+        opts.k = k;
+        opts.add_revcomp = true;
+        opts.build_select = true;
+        let (sbwt, lcs) = kbo::build(&[reference.clone()], opts);
+
+        // An isolated SNP, three within k of each other, one too close to the
+        // end to be followed by k - 1 bases, and an insertion (not a SNP).
+        let mut contig = reference.clone();
+        let mut expected = Vec::new();
+        for pos in [600, 1500, 1510, 1540, 3990] {
+            let base = b"ACGT"[(base_code(reference[pos]).unwrap() as usize + 1) % 4];
+            contig[pos] = base;
+            if pos < 3990 {
+                expected.push(snp(pos as u32, base, reference[pos]));
+            }
+        }
+        contig.insert(2500, b'A');
+        let called: Vec<Snp> = call_snps(&contig, &sbwt, &lcs).into_iter().map(|called| called.snp).collect();
+        assert_eq!(called, expected);
+        assert!(call_snps(&reference, &sbwt, &lcs).is_empty());
     }
 }
