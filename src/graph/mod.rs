@@ -67,15 +67,15 @@ pub mod choices;
 pub mod collapsed;
 pub mod decoder;
 pub mod encoder;
-pub mod orientation;
 pub mod snps;
 
 pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};
-use crate::walk::IndexWalk;
+use crate::edits::{self, CalledEdit};
+use crate::strands::{self, StrandChooser};
+use crate::walk::{IndexWalk, LcsIndex};
 use collapsed::ChainCsr;
-use orientation::StrandChooser;
-use snps::{CalledSnp, SnpEdits};
+use snps::SnpEdits;
 
 type E = Box<dyn std::error::Error>;
 
@@ -220,7 +220,7 @@ pub struct GraphBuilder {
     /// Choose the strand of every contig added with [GraphBuilder::add_contig]
     reorient_contigs: bool,
 
-    /// One in this many _k_-mers is sampled for choosing the strands, see [orientation]
+    /// One in this many _k_-mers is sampled for choosing the strands, see [strands]
     reorient_sampling: u64,
 
     /// Created when the first contig is added with reorienting on
@@ -235,11 +235,11 @@ pub struct GraphBuilder {
     /// Edit SNPs shared by at most this many contigs, see [snps]
     snp_max_shared: usize,
 
-    /// Per colour from [GraphBuilder::call_snps]: the chosen strand and the
+    /// Per colour from [GraphBuilder::call_edits]: the chosen strand and the
     /// SNPs on it, until the contig is added
-    called: Vec<(bool, Vec<CalledSnp>)>,
+    called: Vec<(bool, Vec<CalledEdit>)>,
 
-    /// Number of contigs with each SNP (by [CalledSnp::key])
+    /// Number of contigs with each SNP (by [CalledEdit::key])
     snp_counts: HashMap<u64, usize>,
 
     /// Per colour: the edited SNPs
@@ -265,7 +265,7 @@ impl GraphBuilder {
             paths: Vec::new(),
             collapse_chains: false,
             reorient_contigs: false,
-            reorient_sampling: orientation::DEFAULT_SAMPLING,
+            reorient_sampling: strands::DEFAULT_SAMPLING,
             strand_chooser: None,
             reversed: Vec::new(),
             edit_snps: false,
@@ -286,7 +286,7 @@ impl GraphBuilder {
     }
 
     /// Store every contig added with [GraphBuilder::add_contig] on the strand
-    /// that shares the most with the contigs before it, see [orientation].
+    /// that shares the most with the contigs before it, see [strands].
     pub fn reorient_contigs(
         mut self,
         reorient: bool,
@@ -296,7 +296,7 @@ impl GraphBuilder {
     }
 
     /// Sample one in `one_in` _k_-mers for choosing the strands
-    /// ([orientation::DEFAULT_SAMPLING] by default); panics if `one_in` is 0.
+    /// ([strands::DEFAULT_SAMPLING] by default); panics if `one_in` is 0.
     pub fn reorient_sampling(
         mut self,
         one_in: u64,
@@ -308,7 +308,7 @@ impl GraphBuilder {
 
     /// Edit SNPs towards the index before encoding, see [snps].
     ///
-    /// Needs two passes over the contigs: [GraphBuilder::call_snps] for every
+    /// Needs two passes over the contigs: [GraphBuilder::call_edits] for every
     /// contig first, then [GraphBuilder::add_contig] for every contig in the
     /// same order. The edited SNPs, [GraphBuilder::snp_edits], have to be put
     /// back after decoding.
@@ -372,30 +372,32 @@ impl GraphBuilder {
     /// contig will get from [GraphBuilder::add_contig].
     ///
     /// Arguments as in [GraphBuilder::add_contig].
-    pub fn call_snps(
+    pub fn call_edits(
         &mut self,
         sequence: &[u8],
         sbwt: &SbwtIndexVariant,
         lcs: &LcsArray,
     ) -> u32 {
-        self.call_snps_batch(&[sequence], sbwt, lcs)[0]
+        self.call_edits_batch(&[sequence], sbwt, lcs)[0]
     }
 
-    /// Same as [GraphBuilder::call_snps] for the next `sequences.len()`
+    /// Same as [GraphBuilder::call_edits] for the next `sequences.len()`
     /// contigs, in order. The SNPs are called in parallel; the result is the
-    /// same as calling [GraphBuilder::call_snps] for each.
-    pub fn call_snps_batch(
+    /// same as calling [GraphBuilder::call_edits] for each.
+    pub fn call_edits_batch(
         &mut self,
         sequences: &[&[u8]],
         sbwt: &SbwtIndexVariant,
         lcs: &LcsArray,
     ) -> Vec<u32> {
         let strands = self.choose_strands(sequences);
-        let called: Vec<Vec<CalledSnp>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = sbwt;
+        let index = LcsIndex { sbwt, lcs };
+        let called: Vec<Vec<CalledEdit>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
             if reversed {
-                snps::call_snps(&orientation::reverse_complement(sequence), sbwt, lcs)
+                edits::call_edits(&strands::reverse_complement(sequence), &index)
             } else {
-                snps::call_snps(sequence, sbwt, lcs)
+                edits::call_edits(sequence, &index)
             }
         }).collect();
         let first: u32 = self.called.len().try_into().unwrap();
@@ -412,7 +414,7 @@ impl GraphBuilder {
     ///
     /// With [GraphBuilder::reorient_contigs] on, chooses the strand of the contig
     /// first and encodes that strand. With [GraphBuilder::edit_snps] on, the
-    /// strand comes from [GraphBuilder::call_snps], which must have been called
+    /// strand comes from [GraphBuilder::call_edits], which must have been called
     /// for this contig, and the SNPs that at most
     /// [GraphBuilder::edit_snps_max_shared] contigs have are edited before
     /// encoding. `sequence` is a normalized nucleotide sequence, and `sbwt`
@@ -437,7 +439,7 @@ impl GraphBuilder {
     ) -> Result<Vec<u32>, E> {
         let first_color = self.paths.len();
         // Strands and SNPs to edit, in order.
-        let prepared: Vec<(bool, Vec<snps::CalledSnp>)> = if self.edit_snps {
+        let prepared: Vec<(bool, Vec<CalledEdit>)> = if self.edit_snps {
             // The strands were chosen in the first pass.
             self.strand_chooser = None;
             if self.called.len() < first_color + sequences.len() {
@@ -457,9 +459,9 @@ impl GraphBuilder {
         let strands: Vec<bool> = prepared.iter().map(|(reversed, _)| *reversed).collect();
         type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>, Vec<snps::EditedSnp>);
         let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edited)))| {
-            let oriented = if reversed { orientation::reverse_complement(sequence) } else { sequence.to_vec() };
+            let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
             let edits = edited.into_iter().map(|called| called.edit).collect();
-            let (oriented, edits) = snps::apply_edits(&oriented, edits)
+            let (oriented, edits) = edits::apply_edits(&oriented, edits)
                 .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
             // Contexts in the edited contig, for storing shared SNPs once.
             let edited = snps::with_contexts(&oriented, edits);

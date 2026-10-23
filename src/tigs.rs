@@ -30,7 +30,7 @@
 //!    tips whose _g_ is within the ranges in [GapRules] are added. With
 //!    [GapRules::drop_repairable_bubbles], a bubble the archive can store as
 //!    edits is left out: one whose window (the gap with the core _k_-mers on
-//!    both sides) [call_snps](crate::graph::snps::call_snps) edits into core
+//!    both sides) [call_edits](crate::edits::call_edits) edits into core
 //!    _k_-mers only.
 //! 3. **Simplitigs**: an SBWT is built from the core and the gap _k_-mers
 //!    (this is the final index) and its de Bruijn graph is covered by greedy
@@ -60,7 +60,8 @@ use crate::walk::{IndexWalk, LcsIndex};
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
-use crate::graph::orientation::{reverse_complement, StrandChooser};
+use crate::edits;
+use crate::strands::{reverse_complement, StrandChooser};
 
 use crate::codecs;
 
@@ -315,34 +316,30 @@ fn colex_ranks(
         .collect()
 }
 
-/// Whether editing (SNPs and small indels, see
-/// [call_snps](crate::graph::snps::call_snps)) turns `window`, which starts
-/// and ends with a core _k_-mer, into core _k_-mers only.
+/// Whether editing (SNPs and small indels, see [edits::call_edits]) turns
+/// `window`, which starts and ends with a core _k_-mer, into core _k_-mers
+/// only. `walk` and `index` are the core index.
 fn repairable(
     window: &[u8],
-    core: &SbwtIndexVariant,
-    lcs: &LcsArray,
+    walk: &LcsIndex,
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
     k: usize,
 ) -> bool {
-    let edits: Vec<crate::graph::snps::Edit> = crate::graph::snps::call_snps(window, core, lcs).into_iter().map(|called| called.edit).collect();
+    let edits: Vec<edits::Edit> = edits::call_edits(window, walk).into_iter().map(|called| called.edit).collect();
     if edits.is_empty() {
         return false
     }
-    crate::graph::snps::apply_edits(window, edits)
+    edits::apply_edits(window, edits)
         .is_some_and(|(edited, _)| edited.len() >= k && index.matching_statistics(&edited)[k - 1..].iter().all(|m| m.0 == k))
 }
 
 /// The windows of the gaps of one input that `rules` fill, as sequences.
-/// `core` is the core index (for [GapRules::drop_repairable_bubbles]);
-/// `counts` holds the occurrences and windows per class, then the bubbles
+/// `index` and `walk` are the core index; `counts` holds the occurrences and windows per class, then the bubbles
 /// left out as repairable.
-#[allow(clippy::too_many_arguments)]
 fn input_gaps(
     seqs: &[Vec<u8>],
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
     walk: &LcsIndex,
-    core: (&SbwtIndexVariant, &LcsArray),
     k: usize,
     rules: &GapRules,
     gaps: &mut Vec<Vec<u8>>,
@@ -375,7 +372,7 @@ fn input_gaps(
             let class = match dead { 2 => 0, 1 => 1, _ => 2 };
             let range = [&rules.join, &rules.one_sided, &rules.bubble][class];
             if in_range(range, g) {
-                if class == 2 && rules.drop_repairable_bubbles && repairable(&seq[w0 - 1..w1 + k + 1], core.0, core.1, index, k) {
+                if class == 2 && rules.drop_repairable_bubbles && repairable(&seq[w0 - 1..w1 + k + 1], walk, index, k) {
                     counts[8] += 1;
                     continue
                 }
@@ -517,7 +514,7 @@ pub fn build<T: Sync>(
         let walk = LcsIndex { sbwt: core, lcs: &core_lcs };
         let per_input: Vec<(Vec<Vec<u8>>, [usize; 9])> = inputs.par_iter().map(|input| {
             let (mut gaps, mut counts) = (Vec::new(), [0usize; 9]);
-            input_gaps(&read(input), &index, &walk, (&core_sbwt, &core_lcs), k, &opts.gaps, &mut gaps, &mut counts);
+            input_gaps(&read(input), &index, &walk, k, &opts.gaps, &mut gaps, &mut counts);
             (gaps, counts)
         }).collect();
         per_input.into_iter().flat_map(|(gaps, c)| { for i in 0..9 { counts[i] += c[i]; } gaps }).collect()

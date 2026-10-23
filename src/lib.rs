@@ -26,7 +26,9 @@ use walk::IndexWalk;
 pub mod codecs;
 pub mod encode;
 pub mod decode;
+pub mod edits;
 pub mod graph;
+pub mod strands;
 pub mod walk;
 pub mod tigs;
 #[cfg(feature = "graph-view")]

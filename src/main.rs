@@ -165,7 +165,7 @@ fn finish_color(
     }
     // Contigs stored on the other strand are reverse complemented back.
     let sequence = if reversed.as_ref().is_some_and(|r| r[idx]) {
-        ntcomp::graph::orientation::reverse_complement(&sequence)
+        ntcomp::strands::reverse_complement(&sequence)
     } else {
         sequence
     };
@@ -537,7 +537,7 @@ fn main() {
                     for batch in query_files.chunks(batch_size) {
                         let contigs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = batch.par_iter().map(read_contigs).collect();
                         let sequences: Vec<&[u8]> = contigs.iter().flatten().map(|(_, seq)| seq.as_slice()).collect();
-                        let called = builder.call_snps_batch(&sequences, &sbwt, &lcs);
+                        let called = builder.call_edits_batch(&sequences, &sbwt, &lcs);
                         info!("Called SNPs of colors {}..={}", called.first().map_or(0, |c| *c), called.last().map_or(0, |c| *c));
                         progress.inc(batch.len() as u64);
                     }

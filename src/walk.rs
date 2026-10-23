@@ -27,7 +27,7 @@
 //! [lcs_from_sbwt]). Used by the parser ([crate::encode_sequence]), the
 //! decoder ([crate::graph::decode_path]), the node walks of the stored graph
 //! ([crate::graph::collapsed]) and the edit caller
-//! ([crate::graph::snps::call_snps]).
+//! ([crate::edits::call_edits]).
 //!
 //! The k-mers of a _group_ share their last _k_ − 1 characters: they are
 //! adjacent in colex order, with LCS values of at least _k_ − 1 between them,

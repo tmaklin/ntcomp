@@ -707,7 +707,7 @@ pub fn decode<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::orientation::reverse_complement;
+    use crate::strands::reverse_complement;
 
     fn random_seq(n: usize, seed: u64) -> Vec<u8> {
         let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
