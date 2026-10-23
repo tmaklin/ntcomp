@@ -243,6 +243,7 @@ fn main() {
             gap_one_sided,
             gap_bubble,
             gap_tip,
+            gap_drop_repairable,
             orient_sampling,
             partitions,
             prefix_precalc,
@@ -276,6 +277,7 @@ fn main() {
                 one_sided: *gap_one_sided,
                 bubble: *gap_bubble,
                 tip: *gap_tip,
+                drop_repairable_bubbles: *gap_drop_repairable,
             };
             opts.build_opts.k = *kmer_size;
             opts.build_opts.num_threads = *num_threads;

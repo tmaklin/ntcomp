@@ -27,7 +27,11 @@
 //!    _k_-mer before it has no successor and the one after it no predecessor
 //!    in the core (both are tig ends), *one-sided* if exactly one of them is
 //!    a dead end, and a *bubble* otherwise. The _k_-mers of the gaps and
-//!    tips whose _g_ is within the ranges in [GapRules] are added.
+//!    tips whose _g_ is within the ranges in [GapRules] are added. With
+//!    [GapRules::drop_repairable_bubbles], a bubble the archive can store as
+//!    edits is left out: one whose window (the gap with the core _k_-mers on
+//!    both sides) [call_snps](crate::graph::snps::call_snps) edits into core
+//!    _k_-mers only.
 //! 3. **Simplitigs**: an SBWT is built from the core and the gap _k_-mers
 //!    (this is the final index) and its de Bruijn graph is covered by greedy
 //!    simplitigs. The inputs are scanned in order; each tig starts at the
@@ -77,6 +81,9 @@ pub struct GapRules {
     pub bubble: GapRange,
     /// Runs at a contig end (their valid windows are added).
     pub tip: GapRange,
+    /// Leave out the bubbles that SNP and indel editing repairs against the
+    /// core (see the module docs).
+    pub drop_repairable_bubbles: bool,
 }
 
 impl Default for GapRules {
@@ -89,6 +96,7 @@ impl Default for GapRules {
             one_sided: Some((1500, usize::MAX)),
             bubble: Some((1000, usize::MAX)),
             tip: Some((1000, usize::MAX)),
+            drop_repairable_bubbles: false,
         }
     }
 }
@@ -139,6 +147,8 @@ pub struct TigStats {
     pub gaps: [usize; 4],
     /// Windows in those gap occurrences, by class.
     pub gap_windows: [usize; 4],
+    /// Bubble occurrences in range left out as repairable.
+    pub repairable_bubbles: usize,
     /// Canonical _k_-mers in the final index.
     pub kmers: usize,
     /// Tigs reversed by the layout.
@@ -304,15 +314,38 @@ fn colex_ranks(
         .collect()
 }
 
+/// Whether editing (SNPs and small indels, see
+/// [call_snps](crate::graph::snps::call_snps)) turns `window`, which starts
+/// and ends with a core _k_-mer, into core _k_-mers only.
+fn repairable(
+    window: &[u8],
+    core: &SbwtIndexVariant,
+    lcs: &LcsArray,
+    index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
+    k: usize,
+) -> bool {
+    let edits: Vec<crate::graph::snps::Edit> = crate::graph::snps::call_snps(window, core, lcs).into_iter().map(|called| called.edit).collect();
+    if edits.is_empty() {
+        return false
+    }
+    crate::graph::snps::apply_edits(window, edits)
+        .is_some_and(|(edited, _)| edited.len() >= k && index.matching_statistics(&edited)[k - 1..].iter().all(|m| m.0 == k))
+}
+
 /// The windows of the gaps of one input that `rules` fill, as sequences.
+/// `core` is the core index (for [GapRules::drop_repairable_bubbles]);
+/// `counts` holds the occurrences and windows per class, then the bubbles
+/// left out as repairable.
+#[allow(clippy::too_many_arguments)]
 fn input_gaps(
     seqs: &[Vec<u8>],
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
     dbg: &Dbg<SubsetMatrix>,
+    core: (&SbwtIndexVariant, &LcsArray),
     k: usize,
     rules: &GapRules,
     gaps: &mut Vec<Vec<u8>>,
-    counts: &mut [usize; 8],
+    counts: &mut [usize; 9],
 ) {
     for seq in seqs {
         let ranks = colex_ranks(index, seq, k);
@@ -342,6 +375,10 @@ fn input_gaps(
             let class = match dead { 2 => 0, 1 => 1, _ => 2 };
             let range = [&rules.join, &rules.one_sided, &rules.bubble][class];
             if in_range(range, g) {
+                if class == 2 && rules.drop_repairable_bubbles && repairable(&seq[w0 - 1..w1 + k + 1], core.0, core.1, index, k) {
+                    counts[8] += 1;
+                    continue
+                }
                 gaps.push(span.to_vec());
                 counts[class] += 1; counts[4 + class] += g;
             }
@@ -473,23 +510,24 @@ pub fn build<T: Sync>(
     let (core_sbwt, core_lcs) = build_index(&runs, &opts.build_opts);
     progress("core: SBWT built");
 
-    let SbwtIndexVariant::SubsetMatrix(core_sbwt) = core_sbwt;
-    let mut counts = [0usize; 8];
+    let mut counts = [0usize; 9];
     let gaps: Vec<Vec<u8>> = pool.install(|| {
-        let index = StreamingIndex::new(&core_sbwt, &core_lcs);
-        let dbg = Dbg::new(&core_sbwt, Some(&core_lcs), rayon::current_num_threads());
-        let per_input: Vec<(Vec<Vec<u8>>, [usize; 8])> = inputs.par_iter().map(|input| {
-            let (mut gaps, mut counts) = (Vec::new(), [0usize; 8]);
-            input_gaps(&read(input), &index, &dbg, k, &opts.gaps, &mut gaps, &mut counts);
+        let SbwtIndexVariant::SubsetMatrix(core) = &core_sbwt;
+        let index = StreamingIndex::new(core, &core_lcs);
+        let dbg = Dbg::new(core, Some(&core_lcs), rayon::current_num_threads());
+        let per_input: Vec<(Vec<Vec<u8>>, [usize; 9])> = inputs.par_iter().map(|input| {
+            let (mut gaps, mut counts) = (Vec::new(), [0usize; 9]);
+            input_gaps(&read(input), &index, &dbg, (&core_sbwt, &core_lcs), k, &opts.gaps, &mut gaps, &mut counts);
             (gaps, counts)
         }).collect();
-        per_input.into_iter().flat_map(|(gaps, c)| { for i in 0..8 { counts[i] += c[i]; } gaps }).collect()
+        per_input.into_iter().flat_map(|(gaps, c)| { for i in 0..9 { counts[i] += c[i]; } gaps }).collect()
     });
     drop(core_sbwt);
     drop(core_lcs);
     stats.gaps.copy_from_slice(&counts[0..4]);
     stats.gap_windows.copy_from_slice(&counts[4..8]);
-    progress(&format!("gaps filled (join, one-sided, bubble, tip): {:?}, windows {:?}", stats.gaps, stats.gap_windows));
+    stats.repairable_bubbles = counts[8];
+    progress(&format!("gaps filled (join, one-sided, bubble, tip): {:?}, windows {:?}; repairable bubbles left out: {}", stats.gaps, stats.gap_windows, stats.repairable_bubbles));
 
     runs.extend(gaps);
     let (sbwt, lcs) = build_index(&runs, &opts.build_opts);
@@ -569,6 +607,39 @@ mod tests {
     }
 
     #[test]
+    fn repairable_bubbles_are_left_out() {
+        let k = 31;
+        // Two inputs are the backbone (the core); a third has a SNP (a bubble
+        // the edits repair) and a fourth an insertion of 40 bases (a bubble
+        // they do not).
+        let backbone = random_seq(2000, 4);
+        let mut with_snp = backbone.clone();
+        with_snp[700] = if backbone[700] == b'A' { b'C' } else { b'A' };
+        let mut with_insert = backbone[..1300].to_vec();
+        with_insert.extend_from_slice(&random_seq(40, 5));
+        with_insert.extend_from_slice(&backbone[1300..]);
+        let inputs: Vec<Vec<Vec<u8>>> = vec![vec![backbone.clone()], vec![backbone.clone()], vec![with_snp.clone()], vec![with_insert.clone()]];
+        let read = |x: &Vec<Vec<u8>>| x.clone();
+        let mut opts = TigOpts::default();
+        opts.min_assemblies = 2;
+        opts.partitions = 2;
+        opts.build_opts.k = k;
+        opts.build_opts.num_threads = 2;
+        opts.gaps = GapRules { join: Some((1, usize::MAX)), one_sided: Some((1, usize::MAX)), bubble: Some((1, usize::MAX)), tip: Some((1, usize::MAX)), drop_repairable_bubbles: false };
+        let all = build(&inputs, &read, &opts, &|_| {});
+        assert_eq!((all.stats.gaps[2], all.stats.repairable_bubbles), (2, 0));
+        opts.gaps.drop_repairable_bubbles = true;
+        let dropped = build(&inputs, &read, &opts, &|_| {});
+        assert_eq!((dropped.stats.gaps[2], dropped.stats.repairable_bubbles), (1, 1));
+        // The SNP's k-mers are left out, the insertion's kept.
+        let (snp_kmers, insert_kmers) = (kmer_set(&[with_snp], k), kmer_set(&[with_insert], k));
+        let index = kmer_set(&dropped.tigs, k);
+        assert!(snp_kmers.difference(&kmer_set(&[backbone.clone()], k)).all(|x| !index.contains(x)));
+        assert!(insert_kmers.is_subset(&index));
+        assert!(snp_kmers.is_subset(&kmer_set(&all.tigs, k)));
+    }
+
+    #[test]
     fn build_core_gaps_and_layout() {
         let k = 15;
         // Three inputs share a backbone; one carries an insertion (a bubble of
@@ -589,7 +660,7 @@ mod tests {
         opts.partitions = 3;
         opts.build_opts.k = k;
         opts.build_opts.num_threads = 2;
-        opts.gaps = GapRules { join: Some((1, usize::MAX)), one_sided: Some((1, usize::MAX)), bubble: Some((1, usize::MAX)), tip: Some((1, usize::MAX)) };
+        opts.gaps = GapRules { join: Some((1, usize::MAX)), one_sided: Some((1, usize::MAX)), bubble: Some((1, usize::MAX)), tip: Some((1, usize::MAX)), drop_repairable_bubbles: false };
         let result = build(&inputs, &read, &opts, &|_| {});
 
         // Core = the backbone k-mers outside the insertion breakpoint (all three

@@ -103,6 +103,9 @@ pub enum Commands {
         #[arg(long = "gap-tip", default_value = "1000-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of runs at contig ends to fill.")]
         gap_tip: ntcomp::tigs::GapRange,
 
+        #[arg(long = "gap-drop-repairable", default_value_t = false, help_heading = "Tig options", help = "Leave out the bubbles that SNP and indel editing repairs against the core.")]
+        gap_drop_repairable: bool,
+
         #[arg(long = "orient-sampling", default_value_t = 8, help_heading = "Tig options", help = "Sample one in this many 31-mers for orienting the tigs.")]
         orient_sampling: u64,
 
