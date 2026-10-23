@@ -87,16 +87,17 @@ pub struct GapRules {
 }
 
 impl Default for GapRules {
-    /// All joins; one-sided gaps of at least 1500 windows; bubbles and tips
-    /// of at least 1000. The best rules found at 1,991 _E. coli_ assemblies
-    /// with a core of _k_-mers in at least 10 of them (INDEX_JOURNAL.md).
+    /// All joins and one-sided gaps; bubbles of at least 350 windows that
+    /// editing does not repair; tips of at least 250. The best rules found at
+    /// 1,991 _E. coli_ assemblies with a core of _k_-mers in at least 5 of
+    /// them, for archives with SNP and indel editing (INDEX_JOURNAL.md).
     fn default() -> Self {
         GapRules {
             join: Some((1, usize::MAX)),
-            one_sided: Some((1500, usize::MAX)),
-            bubble: Some((1000, usize::MAX)),
-            tip: Some((1000, usize::MAX)),
-            drop_repairable_bubbles: false,
+            one_sided: Some((1, usize::MAX)),
+            bubble: Some((350, usize::MAX)),
+            tip: Some((250, usize::MAX)),
+            drop_repairable_bubbles: true,
         }
     }
 }
@@ -128,7 +129,7 @@ impl Default for TigOpts {
         let mut build_opts = kbo::BuildOpts::default();
         build_opts.k = 255;
         TigOpts {
-            min_assemblies: 10,
+            min_assemblies: 5,
             partitions: 16,
             gaps: GapRules::default(),
             orient_sampling: 8,
@@ -582,9 +583,12 @@ mod tests {
     fn gap_ranges() {
         let rules = GapRules::default();
         assert!(in_range(&rules.join, 1));
-        assert!(!in_range(&rules.one_sided, 1499));
-        assert!(in_range(&rules.one_sided, 1500));
-        assert!(in_range(&rules.bubble, 1000));
+        assert!(in_range(&rules.one_sided, 1));
+        assert!(!in_range(&rules.bubble, 349));
+        assert!(in_range(&rules.bubble, 350));
+        assert!(!in_range(&rules.tip, 249));
+        assert!(in_range(&rules.tip, 250));
+        assert!(rules.drop_repairable_bubbles);
         assert!(!in_range(&None, 5));
     }
 

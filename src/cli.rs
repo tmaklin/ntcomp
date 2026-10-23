@@ -88,23 +88,23 @@ pub enum Commands {
         #[arg(short = 'k', default_value_t = 255, help_heading = "Tig options", help = "k-mer size.")]
         kmer_size: usize,
 
-        #[arg(short = 'T', long = "min-assemblies", default_value_t = 10, help_heading = "Tig options", help = "Core: canonical k-mers present in at least this many inputs.")]
+        #[arg(short = 'T', long = "min-assemblies", default_value_t = 5, help_heading = "Tig options", help = "Core: canonical k-mers present in at least this many inputs.")]
         min_assemblies: u32,
 
         #[arg(long = "gap-join", default_value = "1-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths (in k-mers) of gaps between two core tig ends to fill: <min>-<max|inf> or none.")]
         gap_join: ntcomp::tigs::GapRange,
 
-        #[arg(long = "gap-one-sided", default_value = "1500-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of gaps with exactly one flank a core tig end to fill.")]
+        #[arg(long = "gap-one-sided", default_value = "1-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of gaps with exactly one flank a core tig end to fill.")]
         gap_one_sided: ntcomp::tigs::GapRange,
 
-        #[arg(long = "gap-bubble", default_value = "1000-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of gaps with neither flank a core tig end to fill.")]
+        #[arg(long = "gap-bubble", default_value = "350-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of gaps with neither flank a core tig end to fill.")]
         gap_bubble: ntcomp::tigs::GapRange,
 
-        #[arg(long = "gap-tip", default_value = "1000-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of runs at contig ends to fill.")]
+        #[arg(long = "gap-tip", default_value = "250-inf", value_parser = parse_gap_range, help_heading = "Tig options", help = "Lengths of runs at contig ends to fill.")]
         gap_tip: ntcomp::tigs::GapRange,
 
-        #[arg(long = "gap-drop-repairable", default_value_t = false, help_heading = "Tig options", help = "Leave out the bubbles that SNP and indel editing repairs against the core.")]
-        gap_drop_repairable: bool,
+        #[arg(long = "gap-keep-repairable", default_value_t = false, help_heading = "Tig options", help = "Also fill the bubbles that SNP and indel editing repairs against the core (left out by default).")]
+        gap_keep_repairable: bool,
 
         #[arg(long = "orient-sampling", default_value_t = 8, help_heading = "Tig options", help = "Sample one in this many 31-mers for orienting the tigs.")]
         orient_sampling: u64,
