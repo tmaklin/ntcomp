@@ -40,7 +40,7 @@
 //! bit per entry. Its other repeats are *direct*: their ids.
 //!
 //! All colours are coded as one stream with the arithmetic coder
-//! ([crate::coder::arith]): the number of colours, then per colour
+//! ([crate::codecs::arith]): the number of colours, then per colour
 //! - the number of new SNPs (adaptive Elias gamma, by whether the previous
 //!   colour had none);
 //! - its new SNPs: the gap from the base after the previous new SNP (from the
@@ -71,7 +71,7 @@ use sbwt::{LcsArray, StreamingIndex};
 use crate::walk::{IndexWalk, LcsIndex, Pattern};
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
-use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
+use crate::codecs::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 
 /// Default for the largest number of contigs that may share a SNP for it to
 /// be edited: no limit, every SNP is edited.

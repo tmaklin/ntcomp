@@ -11,16 +11,22 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
-//! NLZ-OG: NLZ dictionaries stored as coloured paths in a shared graph.
-//! Entropy coding with adaptive models.
+//! Codecs shared by the archive format ([crate::graph]) and the index tigs
+//! ([crate::tigs]). None of them depends on the graph or the index.
 //!
 //! - [arith]: a binary arithmetic coder with adaptive bit models and helpers
-//!   for coding numbers with them; used by the archive format
-//!   ([crate::graph]) and the tig coder.
+//!   for coding numbers with them; used by the archive format and the tig
+//!   coder.
 //! - [mix]: the stretch and squash tables of logistic mixing, computed in
 //!   integer arithmetic; used by the context-mixing models.
+//! - [bits]: plain bit-level codes (fixed width, Elias gamma, truncated
+//!   binary); used for the colex ranks and the choice streams.
+//! - [lzma]: raw LZMA streams for archive sections (contig names, file
+//!   ranges).
 //! - [tigs]: the context-mixing DNA coder that stores the index tigs
 //!   ([crate::tigs::write_tigs], [crate::tigs::read_tigs]).
 pub mod arith;
+pub mod bits;
+pub mod lzma;
 pub mod mix;
 pub mod tigs;

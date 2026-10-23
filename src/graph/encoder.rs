@@ -19,8 +19,8 @@ use crate::FILE_HEADER_BYTES;
 use super::StoredGraph;
 use super::choices::Choices;
 use super::snps::SnpEdits;
-use super::bits::BitWriter;
-use super::lzma_wrapper;
+use crate::codecs::bits::BitWriter;
+use crate::codecs::lzma;
 
 use core::ops::Range;
 
@@ -206,7 +206,7 @@ impl<'a> GraphEncoder<'a> {
         }
         let names: Vec<&Vec<u8>> = ranges.iter().map(|(name, _)| name).collect();
         let counts: Vec<u32> = ranges.iter().map(|(_, range)| range.end - range.start).collect();
-        Ok(to_allocvec(&lzma_wrapper::compress(&to_allocvec(&(names, counts))?)?)?)
+        Ok(to_allocvec(&lzma::compress(&to_allocvec(&(names, counts))?)?)?)
     }
 
     /// Contig names are compressed with LZMA.
@@ -214,7 +214,7 @@ impl<'a> GraphEncoder<'a> {
         &self,
     ) -> Result<Vec<u8>, E> {
         match &self.contig_names {
-            Some(contig_names) => Ok(to_allocvec(&lzma_wrapper::compress(&to_allocvec(contig_names)?)?)?),
+            Some(contig_names) => Ok(to_allocvec(&lzma::compress(&to_allocvec(contig_names)?)?)?),
             None => Ok(Vec::new()),
         }
     }

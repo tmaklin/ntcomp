@@ -23,7 +23,7 @@ use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 use walk::IndexWalk;
 
-pub mod coder;
+pub mod codecs;
 pub mod encode;
 pub mod decode;
 pub mod graph;

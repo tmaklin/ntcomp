@@ -91,7 +91,7 @@
 //! contig lengths and are stored as they are.
 //!
 //! Every other suffix length is coded in chain order with the binary
-//! arithmetic coder of [crate::coder::arith], with adaptive models per
+//! arithmetic coder of [crate::codecs::arith], with adaptive models per
 //! context:
 //! - a flag: the length is implicit (0, see
 //!   [SuffixLen::Implicit](super::SuffixLen));
@@ -116,11 +116,11 @@
 //!
 //! ## Stored out-degrees and chain lengths
 //!
-//! One arithmetic-coded stream ([crate::coder::arith]) holds the out-degree of
+//! One arithmetic-coded stream ([crate::codecs::arith]) holds the out-degree of
 //! every junction except the sink, in junction order, then the number of
 //! inner nodes of every chain, in chain order, then the contig lengths (the
 //! suffix lengths of the edges out of the dummy source, in chain order). Each
-//! is an adaptive Elias-gamma code ([GammaModel](crate::coder::arith::GammaModel): of the degree, of the number
+//! is an adaptive Elias-gamma code ([GammaModel](crate::codecs::arith::GammaModel): of the degree, of the number
 //! of inner nodes + 1, of the contig length + 1).
 //! The chain lengths have one model per context: the out-degree of the
 //! chain's source junction (capped at 8) and the length of the previous chain
@@ -133,7 +133,7 @@
 //! either the next junction not reached yet or one reached before. Without
 //! the index the targets are coded first, in chain order, in their own
 //! stream; with it, in the node stream (see "Stored nodes"). Each target is
-//! coded with the binary arithmetic coder of [crate::coder::arith]: an adaptive
+//! coded with the binary arithmetic coder of [crate::codecs::arith]: an adaptive
 //! flag "the next new junction"; otherwise the distance d from the newest
 //! junction reached so far, as the bit length of d + 1 (a 6-bit adaptive tree)
 //! and the bits below its top one, the first [TARGET_MODELLED_BITS] of them
@@ -150,8 +150,8 @@ use super::{
     take_edge,
     GraphWalk,
 };
-use super::bits::{BitReader, BitWriter};
-use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
+use crate::codecs::bits::{BitReader, BitWriter};
+use crate::codecs::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 use crate::walk::IndexWalk;
 

@@ -32,7 +32,7 @@
 //! of earlier colours ([super::choice_model]); decoding needs the graph and
 //! rebuilds these streams.
 //!
-use super::bits::{BitReader, BitWriter};
+use crate::codecs::bits::{BitReader, BitWriter};
 use super::{choice_model, StoredGraph};
 
 /// Choice streams of every colour.

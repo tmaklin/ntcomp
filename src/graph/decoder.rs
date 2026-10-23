@@ -20,10 +20,10 @@ use crate::{
     FILE_HEADER_BYTES,
     decode_file_header,
 };
-use super::bits::BitReader;
+use crate::codecs::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
-use super::lzma_wrapper::{self, LzmaData};
+use crate::codecs::lzma::{self, LzmaData};
 use super::{LcsSource, StoredGraph};
 
 use sbwt::LcsArray;
@@ -73,10 +73,10 @@ fn read_contig_names<R: Read>(
     input: &mut R,
     n_bytes: u64,
 ) -> Result<Option<Vec<Vec<u8>>>, E> {
-    let Some(lzma) = read_section::<LzmaData, R>(input, n_bytes)? else {
+    let Some(section) = read_section::<LzmaData, R>(input, n_bytes)? else {
         return Ok(None)
     };
-    Ok(Some(postcard::from_bytes(&lzma_wrapper::decompress(&lzma)?)?))
+    Ok(Some(postcard::from_bytes(&lzma::decompress(&section)?)?))
 }
 
 /// Reads the file ranges written by the encoder (file names and contig counts,
@@ -85,10 +85,10 @@ fn read_file_ranges<R: Read>(
     input: &mut R,
     n_bytes: u64,
 ) -> Result<Option<Vec<(Vec<u8>, Range<u32>)>>, E> {
-    let Some(lzma) = read_section::<LzmaData, R>(input, n_bytes)? else {
+    let Some(section) = read_section::<LzmaData, R>(input, n_bytes)? else {
         return Ok(None)
     };
-    let (names, counts): (Vec<Vec<u8>>, Vec<u32>) = postcard::from_bytes(&lzma_wrapper::decompress(&lzma)?)?;
+    let (names, counts): (Vec<Vec<u8>>, Vec<u32>) = postcard::from_bytes(&lzma::decompress(&section)?)?;
     if names.len() != counts.len() {
         return Err(Box::new(ArchiveError("file ranges: names and counts differ".to_string())))
     }

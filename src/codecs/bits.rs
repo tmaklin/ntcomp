@@ -11,7 +11,7 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
-//! Bit-level codes used in the stored graph, written most significant bit first.
+//! Bit-level codes, written most significant bit first.
 //!
 
 /// Number of bits `k` and threshold `u` of the truncated binary code for `n` symbols.

@@ -14,7 +14,7 @@
 //! Context-mixing model for the choice section.
 //!
 //! The choices of all colours are coded as one stream with the arithmetic
-//! coder ([crate::coder::arith]). Colours are coded in order, each by walking
+//! coder ([crate::codecs::arith]). Colours are coded in order, each by walking
 //! its path through the graph, so the decoder needs the graph first. At every
 //! node with `n > 1` outgoing edges the rank of the taken edge is coded as
 //! binary decisions "is it candidate _c_?" over the candidates in order:
@@ -49,8 +49,8 @@
 //! comes from the file header, and the decoder stops at every colour's sink.
 use std::collections::HashMap;
 
-use crate::coder::arith::{code_tree, update, Coder, Decoder, Encoder, C0};
-use crate::coder::mix::{Tables, SMAX};
+use crate::codecs::arith::{code_tree, update, Coder, Decoder, Encoder, C0};
+use crate::codecs::mix::{Tables, SMAX};
 
 use super::choices::{ChoiceStream, ChoiceWriter, Choices};
 use super::{GraphWalk, StoredGraph, SINK_NODE, SOURCE_NODE};
