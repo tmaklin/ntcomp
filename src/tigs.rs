@@ -60,7 +60,7 @@ use crate::walk::{IndexWalk, LcsIndex};
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
-use crate::edits;
+use crate::edits::{self, base_code};
 use crate::strands::{reverse_complement, StrandChooser};
 
 use crate::codecs;
@@ -144,17 +144,51 @@ impl Default for TigOpts {
 pub struct TigStats {
     /// Canonical _k_-mers in the core.
     pub core_kmers: usize,
-    /// Gap occurrences whose _k_-mers were added, by class: join, one-sided,
-    /// bubble, tip.
-    pub gaps: [usize; 4],
-    /// Windows in those gap occurrences, by class.
-    pub gap_windows: [usize; 4],
-    /// Bubble occurrences in range left out as repairable.
-    pub repairable_bubbles: usize,
+    /// The gaps filled and left out.
+    pub gaps: GapCounts,
     /// Canonical _k_-mers in the final index.
     pub kmers: usize,
     /// Tigs reversed by the layout.
     pub reversed: usize,
+}
+
+/// Gap counts from [build], summed over the inputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GapCounts {
+    /// Gap occurrences whose _k_-mers were added, by class: join, one-sided,
+    /// bubble, tip.
+    pub filled: [usize; 4],
+    /// Windows in those gap occurrences, by class.
+    pub windows: [usize; 4],
+    /// Bubble occurrences in range left out as repairable.
+    pub repairable_bubbles: usize,
+}
+
+impl GapCounts {
+    /// The class of tips in [GapCounts::filled] and [GapCounts::windows].
+    const TIP: usize = 3;
+
+    /// Counts a filled gap occurrence of `class` with `g` windows.
+    fn fill(
+        &mut self,
+        class: usize,
+        g: usize,
+    ) {
+        self.filled[class] += 1;
+        self.windows[class] += g;
+    }
+
+    /// Adds the counts of `other`.
+    fn add(
+        &mut self,
+        other: &GapCounts,
+    ) {
+        for class in 0..4 {
+            self.filled[class] += other.filled[class];
+            self.windows[class] += other.windows[class];
+        }
+        self.repairable_bubbles += other.repairable_bubbles;
+    }
 }
 
 /// Result of [build]: the tigs and the index built from them.
@@ -192,8 +226,6 @@ const B2: u64 = 0xC2B2AE3D27D4EB4F;
 
 fn inv(b: u64) -> u64 { let mut x = b; for _ in 0..6 { x = x.wrapping_mul(2u64.wrapping_sub(b.wrapping_mul(x))); } x }
 fn pow(b: u64, e: usize) -> u64 { (0..e).fold(1u64, |a, _| a.wrapping_mul(b)) }
-fn code(c: u8) -> Option<u64> { match c { b'A' => Some(0), b'C' => Some(1), b'G' => Some(2), b'T' => Some(3), _ => None } }
-fn is_acgt(c: u8) -> bool { code(c).is_some() }
 
 /// Canonical hash of every _k_-mer window of `seq` (None for windows with a
 /// character other than A, C, G or T). Two 64-bit polynomial hashes per
@@ -205,11 +237,11 @@ fn hashes(seq: &[u8], k: usize) -> Vec<Option<u128>> {
     let (mut f1, mut f2, mut r1, mut r2) = (0u64, 0u64, 0u64, 0u64);
     let mut valid = 0usize; // consecutive ACGT bases ending here
     for i in 0..seq.len() {
-        match code(seq[i]) {
+        match base_code(seq[i]).map(u64::from) {
             None => { valid = 0; f1 = 0; f2 = 0; r1 = 0; r2 = 0; },
             Some(c) => {
                 if valid >= k {
-                    let o = code(seq[i - k]).unwrap();
+                    let o = base_code(seq[i - k]).map_or(0, u64::from);
                     f1 = f1.wrapping_sub(o.wrapping_mul(p1)); f2 = f2.wrapping_sub(o.wrapping_mul(p2));
                     r1 = r1.wrapping_sub(3 - o).wrapping_mul(i1); r2 = r2.wrapping_sub(3 - o).wrapping_mul(i2);
                     f1 = f1.wrapping_mul(B1).wrapping_add(c); f2 = f2.wrapping_mul(B2).wrapping_add(c);
@@ -334,8 +366,7 @@ fn repairable(
 }
 
 /// The windows of the gaps of one input that `rules` fill, as sequences.
-/// `index` and `walk` are the core index; `counts` holds the occurrences and windows per class, then the bubbles
-/// left out as repairable.
+/// `index` and `walk` are the core index; the gaps are counted in `counts`.
 fn input_gaps(
     seqs: &[Vec<u8>],
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
@@ -343,7 +374,7 @@ fn input_gaps(
     k: usize,
     rules: &GapRules,
     gaps: &mut Vec<Vec<u8>>,
-    counts: &mut [usize; 9],
+    counts: &mut GapCounts,
 ) {
     for seq in seqs {
         let ranks = colex_ranks(index, seq, k);
@@ -359,25 +390,25 @@ fn input_gaps(
             if w0 == 0 || w1 == nw - 1 {
                 if in_range(&rules.tip, g) {
                     // the valid windows of the run
-                    for piece in span.split(|&c| !is_acgt(c)).filter(|p| p.len() >= k) {
+                    for piece in span.split(|&c| base_code(c).is_none()).filter(|p| p.len() >= k) {
                         gaps.push(piece.to_vec());
                     }
-                    counts[3] += 1; counts[7] += g;
+                    counts.fill(GapCounts::TIP, g);
                 }
                 continue
             }
-            if span.iter().any(|&c| !is_acgt(c)) { continue }
+            if span.iter().any(|&c| base_code(c).is_none()) { continue }
             let (left, right) = (ranks[w0 - 1].unwrap(), ranks[w1 + 1].unwrap());
             let dead = (walk.out_degree(left) == 0) as usize + (walk.in_degree(right) == 0) as usize;
             let class = match dead { 2 => 0, 1 => 1, _ => 2 };
             let range = [&rules.join, &rules.one_sided, &rules.bubble][class];
             if in_range(range, g) {
                 if class == 2 && rules.drop_repairable_bubbles && repairable(&seq[w0 - 1..w1 + k + 1], walk, index, k) {
-                    counts[8] += 1;
+                    counts.repairable_bubbles += 1;
                     continue
                 }
                 gaps.push(span.to_vec());
-                counts[class] += 1; counts[4 + class] += g;
+                counts.fill(class, g);
             }
         }
     }
@@ -507,24 +538,22 @@ pub fn build<T: Sync>(
     let (core_sbwt, core_lcs) = build_index(&runs, &opts.build_opts);
     progress("core: SBWT built");
 
-    let mut counts = [0usize; 9];
+    let mut counts = GapCounts::default();
     let gaps: Vec<Vec<u8>> = pool.install(|| {
         let SbwtIndexVariant::SubsetMatrix(core) = &core_sbwt;
         let index = StreamingIndex::new(core, &core_lcs);
         let walk = LcsIndex { sbwt: core, lcs: &core_lcs };
-        let per_input: Vec<(Vec<Vec<u8>>, [usize; 9])> = inputs.par_iter().map(|input| {
-            let (mut gaps, mut counts) = (Vec::new(), [0usize; 9]);
+        let per_input: Vec<(Vec<Vec<u8>>, GapCounts)> = inputs.par_iter().map(|input| {
+            let (mut gaps, mut counts) = (Vec::new(), GapCounts::default());
             input_gaps(&read(input), &index, &walk, k, &opts.gaps, &mut gaps, &mut counts);
             (gaps, counts)
         }).collect();
-        per_input.into_iter().flat_map(|(gaps, c)| { for i in 0..9 { counts[i] += c[i]; } gaps }).collect()
+        per_input.into_iter().flat_map(|(gaps, c)| { counts.add(&c); gaps }).collect()
     });
     drop(core_sbwt);
     drop(core_lcs);
-    stats.gaps.copy_from_slice(&counts[0..4]);
-    stats.gap_windows.copy_from_slice(&counts[4..8]);
-    stats.repairable_bubbles = counts[8];
-    progress(&format!("gaps filled (join, one-sided, bubble, tip): {:?}, windows {:?}; repairable bubbles left out: {}", stats.gaps, stats.gap_windows, stats.repairable_bubbles));
+    stats.gaps = counts;
+    progress(&format!("gaps filled (join, one-sided, bubble, tip): {:?}, windows {:?}; repairable bubbles left out: {}", counts.filled, counts.windows, counts.repairable_bubbles));
 
     runs.extend(gaps);
     let (sbwt, lcs) = build_index(&runs, &opts.build_opts);
@@ -627,10 +656,10 @@ mod tests {
         opts.build_opts.num_threads = 2;
         opts.gaps = GapRules { join: Some((1, usize::MAX)), one_sided: Some((1, usize::MAX)), bubble: Some((1, usize::MAX)), tip: Some((1, usize::MAX)), drop_repairable_bubbles: false };
         let all = build(&inputs, &read, &opts, &|_| {});
-        assert_eq!((all.stats.gaps[2], all.stats.repairable_bubbles), (2, 0));
+        assert_eq!((all.stats.gaps.filled[2], all.stats.gaps.repairable_bubbles), (2, 0));
         opts.gaps.drop_repairable_bubbles = true;
         let dropped = build(&inputs, &read, &opts, &|_| {});
-        assert_eq!((dropped.stats.gaps[2], dropped.stats.repairable_bubbles), (1, 1));
+        assert_eq!((dropped.stats.gaps.filled[2], dropped.stats.gaps.repairable_bubbles), (1, 1));
         // The SNP's k-mers are left out, the insertion's kept.
         let (snp_kmers, insert_kmers) = (kmer_set(&[with_snp], k), kmer_set(&[with_insert], k));
         let index = kmer_set(&dropped.tigs, k);
@@ -676,7 +705,7 @@ mod tests {
         // The k-mers across the insertion point are in two inputs only, so
         // every input has a gap there whose flanks are both core tig ends
         // (three joins); the tail is a tip.
-        assert_eq!(result.stats.gaps, [3, 0, 0, 1]);
+        assert_eq!(result.stats.gaps.filled, [3, 0, 0, 1]);
         // The tig file restores the same k-mers.
         let bytes = write_tigs(&result.tigs, k, Vec::new()).unwrap();
         assert_eq!(kmer_set(&read_tigs(bytes.as_slice()).unwrap(), k), all);
