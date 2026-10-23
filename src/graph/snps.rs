@@ -616,7 +616,7 @@ fn code_all<C: Coder>(
             let (pos, stored) = truth.map_or((0, &Stored::Distance(1)), |t| (t.new[i as usize].0, &t.new[i as usize].1));
             let gap = m.gaps[previous_length.min(N_LENGTH_CONTEXTS - 1)].code(c, truth.map_or(1, |_| pos as u64 - next + 1)) - 1;
             previous_length = bit_length(gap + 1);
-            let pos: u32 = (next + gap).try_into().map_err(|_| error("position beyond 32 bits"))?;
+            let pos: u32 = next.checked_add(gap).and_then(|pos| pos.try_into().ok()).ok_or_else(|| error("position beyond 32 bits"))?;
             let symbol = match stored { Stored::Distance(d) => *d as u32 - 1, _ => 3 };
             let symbol = code_tree(c, &mut m.bases, 2, symbol);
             let stored = if symbol < 3 {
