@@ -52,8 +52,8 @@ use std::collections::HashMap;
 use crate::codecs::arith::{code_tree, update, Coder, Decoder, Encoder, C0};
 use crate::codecs::mix::{Apm, ApmRate, Tables, SMAX};
 
-use super::choices::{ChoiceStream, ChoiceWriter, Choices};
-use super::{GraphWalk, StoredGraph, SINK_NODE, SOURCE_NODE};
+use super::{ChoiceStream, ChoiceWriter, Choices};
+use crate::graph::{GraphWalk, StoredGraph, SINK_NODE, SOURCE_NODE};
 
 /// Reference colours per colour.
 const N_REFS: usize = 8;
@@ -393,7 +393,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
-    use super::super::{GraphBuilder, GraphWalk};
+    use crate::graph::{GraphBuilder, GraphWalk};
 
     /// Related colours: copies of a few ancestral paths through a sequence of
     /// bubbles, with new variants; starting from one of 40 first entries (a

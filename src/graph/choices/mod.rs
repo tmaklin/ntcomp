@@ -29,11 +29,13 @@
 //! choice. Related colours also make the same choices through the same parts
 //! of the graph. In the archive the choices of all colours are coded together
 //! by a context-mixing model that predicts each colour's choices from those
-//! of earlier colours ([super::choice_model]); decoding needs the graph and
+//! of earlier colours ([model]); decoding needs the graph and
 //! rebuilds these streams.
 //!
 use crate::codecs::bits::{BitReader, BitWriter};
-use super::{choice_model, StoredGraph};
+pub mod model;
+
+use super::StoredGraph;
 
 /// Choice streams of every colour.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -42,12 +44,12 @@ pub struct Choices {
 }
 
 impl Choices {
-    /// Codes the streams of the colours walking `graph`, see [choice_model].
+    /// Codes the streams of the colours walking `graph`, see [model].
     pub fn to_stored(
         &self,
         graph: &StoredGraph,
     ) -> Result<Vec<u8>, String> {
-        choice_model::encode(graph, self).map_err(|e| format!("choice streams: {}", e))
+        model::encode(graph, self).map_err(|e| format!("choice streams: {}", e))
     }
 
     /// Decodes the streams of `n_colors` colours walking `graph`, see [Choices::to_stored].
@@ -56,7 +58,7 @@ impl Choices {
         graph: &StoredGraph,
         n_colors: usize,
     ) -> Result<Self, String> {
-        choice_model::decode(graph, n_colors, stored).map_err(|e| format!("choice streams: {}", e))
+        model::decode(graph, n_colors, stored).map_err(|e| format!("choice streams: {}", e))
     }
 
     /// Total number of recorded choices.
