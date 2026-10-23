@@ -75,6 +75,7 @@ pub mod snps;
 
 pub use choices::Choices;
 use choices::{ChoiceReader, ChoiceWriter};
+use crate::walk::IndexWalk;
 use collapsed::ChainCsr;
 use orientation::StrandChooser;
 use snps::{CalledSnp, SnpEdits};
@@ -110,20 +111,7 @@ const SINK_COLEX: u32 = u32::MAX;
 /// [Implicit](SuffixLen::Implicit) suffix lengths are stored as a 0; a real suffix length can never be 0.
 const IMPLICIT_SUFFIX_LEN: u32 = 0;
 
-/// Walkable graph that implements random access to any colour (contig) stored inside.
-///
-/// Every dictionary entry covers at least one base, so the path of a contig of
-/// `n` bases has at most `n + 1` edges (counting the edge out of the source,
-/// which stores `n`). Walks stop with an error after that many edges, so a
-/// corrupt input cannot loop forever.
-pub trait Walkable {
-    /// Walk the path of `color` from the source to the sink.
-    fn walk_path(
-        &self,
-        choices: &Choices,
-        color: u32,
-    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError>;
-}
+pub use crate::walk::GraphWalk;
 
 /// Suffix length and type for an edge
 ///
@@ -155,7 +143,7 @@ pub struct ColexGraphEdge {
 }
 
 /// Decodes the nucleotide sequence of length `sequence_length` from its NLZ
-/// dictionary (colex rank, suffix length), as returned by [walk_path].
+/// dictionary (colex rank, suffix length), as returned by [GraphWalk::walk_path].
 ///
 /// The dictionary is processed in its own order, from the end of the sequence
 /// to the start, so that the end position of every entry is known.
@@ -163,9 +151,9 @@ pub struct ColexGraphEdge {
 /// the k-mer as far as the encoder could have extended it at that position and
 /// explicit and plain by taking the suffix length stored inside [SuffixLen].
 ///
-/// If `lcs` is given, the k-mers are extended by walking the de Bruijn graph
-/// of the SBWT, see [crate::left_extend_row], which is faster and gives the
-/// same sequence.
+/// The k-mers are extended by walking the de Bruijn graph of the SBWT
+/// ([IndexWalk::left_extend](crate::walk::IndexWalk::left_extend)), with
+/// `lcs` if given and with LCS values computed from the SBWT otherwise.
 ///
 /// Fails if the dictionary does not cover exactly `sequence_length` bases.
 pub fn decode_path(
@@ -179,12 +167,9 @@ pub fn decode_path(
     match sbwt {
         SbwtIndexVariant::SubsetMatrix(sbwt) => {
             let k = sbwt.k();
-            // Left extension of the k-mer at `colex_rank`, by walking the SBWT
-            // with `lcs` and from the k-mer's characters without.
-            let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| match lcs {
-                Some(lcs) => crate::left_extend_row(sbwt, lcs, colex_rank as usize, max_extension_len, implicit).0,
-                None => crate::left_extend_kmer(&sbwt.access_kmer(colex_rank as usize), None, sbwt, None, max_extension_len).0,
-            };
+            // Left extension of the k-mer at `colex_rank` by walking the SBWT.
+            let walk = crate::walk::WalkIndex { sbwt, lcs };
+            let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| walk.left_extend(colex_rank as usize, max_extension_len, implicit).0;
             for (colex_rank, suffix_len) in path {
                 let (kmer, len) = match suffix_len {
                     SuffixLen::Implicit => {
@@ -434,7 +419,7 @@ impl GraphBuilder {
     /// for this contig, and the SNPs that at most
     /// [GraphBuilder::edit_snps_max_shared] contigs have are edited before
     /// encoding. `sequence` is a normalized nucleotide sequence, and `sbwt`
-    /// and `lcs` are the index passed to [crate::encode_sequence_flagged].
+    /// and `lcs` are the index passed to [crate::encode_sequence].
     pub fn add_contig(
         &mut self,
         sequence: &[u8],
@@ -537,7 +522,7 @@ impl GraphBuilder {
     /// Same as [GraphBuilder::add_path] but stores the suffix length of the
     /// entries flagged in `implicit` as [SuffixLen::Implicit].
     ///
-    /// `dictionary` and `implicit` are the output of [crate::encode_sequence_flagged].
+    /// `dictionary` and `implicit` are the output of [crate::encode_sequence].
     pub fn add_path_with_flags(
         &mut self,
         sequence_length: usize,
@@ -691,7 +676,7 @@ pub enum LcsSource<'a> {
     /// The LCS array of the index.
     Array(&'a LcsArray),
 
-    /// Computed from the index with [crate::lcs_from_sbwt] (slower).
+    /// Computed from the index with [crate::walk::lcs_from_sbwt] (slower).
     Sbwt(&'a SbwtIndexVariant),
 }
 
@@ -703,7 +688,7 @@ impl LcsSource<'_> {
     ) -> u32 {
         match self {
             LcsSource::Array(lcs) => lcs.access(colex_rank as usize) as u32,
-            LcsSource::Sbwt(SbwtIndexVariant::SubsetMatrix(sbwt)) => crate::lcs_from_sbwt(sbwt, colex_rank as usize) as u32,
+            LcsSource::Sbwt(SbwtIndexVariant::SubsetMatrix(sbwt)) => crate::walk::lcs_from_sbwt(sbwt, colex_rank as usize) as u32,
         }
     }
 }
@@ -799,8 +784,28 @@ impl StoredGraph {
     }
 }
 
-impl Walkable for StoredGraph {
-    /// Walks the path of `color` from the source to the sink, see [walk_path].
+impl GraphWalk for StoredGraph {
+    fn n_nodes(&self) -> usize {
+        match self { StoredGraph::Csr(g) => g.n_nodes(), StoredGraph::Chains(g) => g.n_nodes() }
+    }
+
+    fn n_edges(&self) -> usize {
+        match self { StoredGraph::Csr(g) => g.n_edges(), StoredGraph::Chains(g) => g.n_edges() }
+    }
+
+    fn row(&self, node: usize) -> (usize, usize) {
+        match self { StoredGraph::Csr(g) => g.row(node), StoredGraph::Chains(g) => g.row(node) }
+    }
+
+    fn target(&self, edge: usize) -> usize {
+        match self { StoredGraph::Csr(g) => g.target(edge), StoredGraph::Chains(g) => g.target(edge) }
+    }
+
+    fn max_steps(&self, edge: usize) -> usize {
+        match self { StoredGraph::Csr(g) => g.max_steps(edge), StoredGraph::Chains(g) => g.max_steps(edge) }
+    }
+
+    /// Walks the path of `color` from the source to the sink, see [GraphWalk::walk_path].
     fn walk_path(
         &self,
         choices: &Choices,
@@ -822,19 +827,11 @@ pub struct Csr<N> {
     pub suffix_lens: Vec<u32>,
 }
 
-impl<N> Csr<N> {
-    /// Range of edge positions leaving `node`.
-    pub fn row(
-        &self,
-        node: usize,
-    ) -> (usize, usize) {
-        (self.row_ptrs[node] as usize, self.row_ptrs[node + 1] as usize)
-    }
-
+impl<N: Copy> Csr<N> where u32: From<N> {
     /// Walks the path of `color` from the source to the sink, calling
     /// `visit(node, edge position)` for every edge taken.
     ///
-    /// The walk is bounded by the contig length, see [Walkable].
+    /// The walk is bounded by the contig length, see [GraphWalk].
     pub fn walk(
         &self,
         choices: &Choices,
@@ -919,7 +916,28 @@ impl<N> Csr<N> {
     }
 }
 
-impl<N: Copy> Walkable for Csr<N> where u32: From<N> {
+impl<N: Copy> GraphWalk for Csr<N> where u32: From<N> {
+    fn n_nodes(&self) -> usize {
+        self.row_ptrs.len().saturating_sub(1)
+    }
+
+    fn n_edges(&self) -> usize {
+        self.column_indices.len()
+    }
+
+    /// Range of edge positions leaving `node`.
+    fn row(&self, node: usize) -> (usize, usize) {
+        (self.row_ptrs[node] as usize, self.row_ptrs[node + 1] as usize)
+    }
+
+    fn target(&self, edge: usize) -> usize {
+        self.column_indices[edge] as usize
+    }
+
+    fn max_steps(&self, edge: usize) -> usize {
+        (self.suffix_lens[edge] as usize).saturating_add(1)
+    }
+
     /// Walks the path of `color` from the source to the sink.
     ///
     /// Returns the sequence length stored on the source edge and the NLZ

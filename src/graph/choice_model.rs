@@ -53,8 +53,7 @@ use crate::coder::arith::{code_tree, update, Coder, Decoder, Encoder, C0};
 use crate::coder::mix::{Tables, SMAX};
 
 use super::choices::{ChoiceStream, ChoiceWriter, Choices};
-use super::collapsed::ChainCsr;
-use super::{Csr, StoredGraph, SINK_NODE, SOURCE_NODE};
+use super::{GraphWalk, StoredGraph, SINK_NODE, SOURCE_NODE};
 
 /// Reference colours per colour.
 const N_REFS: usize = 8;
@@ -90,33 +89,6 @@ const SCORE_ONE: u32 = 256;
 /// APM bins, and its fixed update rate (0.02 in 1/65536).
 const APM_BINS: usize = 33;
 const APM_RATE: i64 = 1311;
-
-/// The graph as the model sees it: nodes with ranked outgoing edges.
-trait ChoiceGraph {
-    fn n_nodes(&self) -> usize;
-    fn n_edges(&self) -> usize;
-    /// Edges `start..end` leaving `node`.
-    fn row(&self, node: usize) -> (usize, usize);
-    fn target(&self, edge: usize) -> usize;
-    /// Most steps a path that starts with `edge` can take (its contig length + 1).
-    fn max_steps(&self, edge: usize) -> usize;
-}
-
-impl ChoiceGraph for Csr<u32> {
-    fn n_nodes(&self) -> usize { self.row_ptrs.len().saturating_sub(1) }
-    fn n_edges(&self) -> usize { self.column_indices.len() }
-    fn row(&self, node: usize) -> (usize, usize) { Csr::row(self, node) }
-    fn target(&self, edge: usize) -> usize { self.column_indices[edge] as usize }
-    fn max_steps(&self, edge: usize) -> usize { (self.suffix_lens[edge] as usize).saturating_add(1) }
-}
-
-impl ChoiceGraph for ChainCsr {
-    fn n_nodes(&self) -> usize { self.row_ptrs.len().saturating_sub(1) }
-    fn n_edges(&self) -> usize { self.n_chains() }
-    fn row(&self, node: usize) -> (usize, usize) { ChainCsr::row(self, node) }
-    fn target(&self, edge: usize) -> usize { self.targets[edge] as usize }
-    fn max_steps(&self, edge: usize) -> usize { (self.chain_suffix_lens(edge)[0] as usize).saturating_add(1) }
-}
 
 /// Codes the choices of every colour with the model.
 pub fn encode(
@@ -181,7 +153,7 @@ struct Model {
 }
 
 impl Model {
-    fn new<G: ChoiceGraph>(g: &G) -> Model {
+    fn new<G: GraphWalk>(g: &G) -> Model {
         let t = Tables::new();
         let max_n = (0..g.n_nodes()).map(|j| { let (a, b) = g.row(j); b - a }).max().unwrap_or(1) as u32;
         let max_bits = 32 - max_n.saturating_sub(1).leading_zeros();
@@ -258,7 +230,7 @@ impl Model {
 }
 
 /// Codes (`choices` Some) or decodes the choices of colours `0..n_colors`.
-fn code_all<C: Coder, G: ChoiceGraph>(
+fn code_all<C: Coder, G: GraphWalk>(
     c: &mut C,
     g: &G,
     n_colors: usize,
@@ -428,7 +400,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
-    use super::super::{GraphBuilder, Walkable};
+    use super::super::{GraphBuilder, GraphWalk};
 
     /// Related colours: copies of a few ancestral paths through a sequence of
     /// bubbles, with new variants; starting from one of 40 first entries (a

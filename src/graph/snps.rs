@@ -66,7 +66,9 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use sbwt::{ExtendRight, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
+use sbwt::{LcsArray, StreamingIndex};
+
+use crate::walk::{IndexWalk, LcsIndex, Pattern};
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
@@ -169,58 +171,6 @@ const MAX_DELETED: usize = 3;
 /// Most index bases one insertion adds, see [call_snps].
 const MAX_INSERTED: usize = 2;
 
-/// A pattern in the index: its colex interval and length (at most _k_).
-type Pattern = (std::ops::Range<usize>, usize);
-
-/// One step right in the index: the interval of `pattern` followed by `c`,
-/// dropping the pattern's first character first if it is _k_ long. None if
-/// that is not in the index.
-fn step_right(
-    sbwt: &SbwtIndex<SubsetMatrix>,
-    lcs: &LcsArray,
-    pattern: &Pattern,
-    c: u8,
-) -> Option<Pattern> {
-    let k = sbwt.k();
-    let (mut interval, mut len) = pattern.clone();
-    if len == k {
-        // The k-mers sharing the last k - 1 characters.
-        while interval.start > 0 && lcs.access(interval.start) >= k - 1 {
-            interval.start -= 1;
-        }
-        while interval.end < sbwt.n_sets() && lcs.access(interval.end) >= k - 1 {
-            interval.end += 1;
-        }
-        len = k - 1;
-    }
-    let next = sbwt.extend_right(interval, c);
-    (!next.is_empty()).then_some((next, len + 1))
-}
-
-/// Steps right in the index by the characters of `sequence` from `from`,
-/// stopping before `until` or at the first one not in the index. Returns the
-/// pattern and the first position not taken.
-fn walk_right(
-    sbwt: &SbwtIndex<SubsetMatrix>,
-    lcs: &LcsArray,
-    sequence: &[u8],
-    mut pattern: Pattern,
-    from: usize,
-    until: usize,
-) -> (Pattern, usize) {
-    let mut pos = from;
-    while pos < until {
-        match step_right(sbwt, lcs, &pattern, sequence[pos]) {
-            Some(next) => {
-                pattern = next;
-                pos += 1;
-            },
-            None => break,
-        }
-    }
-    (pattern, pos)
-}
-
 /// An edit tried in a stretch the contig cannot extend: its change (as
 /// the base, the number of contig bases removed, or the bases added), the
 /// pattern after the walk following it, the contig position the walk
@@ -238,14 +188,13 @@ enum TriedChange {
 /// starting from the match `pattern`: at most [MAX_EDITS], substitutions only
 /// or also indels. None if the walk does not get through.
 fn repair(
-    sbwt: &SbwtIndex<SubsetMatrix>,
-    lcs: &LcsArray,
+    index: &LcsIndex,
     sequence: &[u8],
     mut pattern: Pattern,
     mut pos: usize,
     with_indels: bool,
 ) -> Option<(Vec<(usize, TriedChange)>, Pattern, usize)> {
-    let (k, n) = (sbwt.k(), sequence.len());
+    let (k, n) = (index.k(), sequence.len());
     let mut found: Vec<(usize, TriedChange)> = Vec::new();
     loop {
         if found.len() == MAX_EDITS || pos + k > n || base_code(sequence[pos]).is_none() {
@@ -256,8 +205,8 @@ fn repair(
             if b == sequence[pos] {
                 continue
             }
-            let Some(after) = step_right(sbwt, lcs, &pattern, b) else { continue };
-            let (walked, reached) = walk_right(sbwt, lcs, sequence, after, pos + 1, pos + k);
+            let Some(after) = index.step_right(&pattern, b) else { continue };
+            let (walked, reached) = index.walk_right(sequence, after, pos + 1, pos + k);
             tried.push((TriedChange::Sub(b), walked, reached, reached == pos + k));
         }
         if with_indels && !tried.iter().any(|t| t.3) {
@@ -266,7 +215,7 @@ fn repair(
                 if pos + d + k > n || !sequence[pos..pos + d].iter().all(|&c| base_code(c).is_some()) {
                     break
                 }
-                let (walked, reached) = walk_right(sbwt, lcs, sequence, pattern.clone(), pos + d, pos + d + k);
+                let (walked, reached) = index.walk_right(sequence, pattern.clone(), pos + d, pos + d + k);
                 if reached > pos + d {
                     tried.push((TriedChange::Del(d), walked, reached, reached == pos + d + k));
                 }
@@ -277,10 +226,10 @@ fn repair(
                 let mut longer = Vec::new();
                 for (bases, path) in &paths {
                     for &b in b"ACGT" {
-                        let Some(after) = step_right(sbwt, lcs, path, b) else { continue };
+                        let Some(after) = index.step_right(path, b) else { continue };
                         let mut bases = bases.clone();
                         bases.push(b);
-                        let (walked, reached) = walk_right(sbwt, lcs, sequence, after.clone(), pos, pos + k);
+                        let (walked, reached) = index.walk_right(sequence, after.clone(), pos, pos + k);
                         if reached > pos {
                             tried.push((TriedChange::Ins(bases.clone()), walked, reached, reached == pos + k));
                         }
@@ -337,6 +286,7 @@ pub fn call_snps(
     }
     let min_match = kbo::derandomize::random_match_threshold(k, sbwt.n_kmers(), 4, kbo::CallOpts::default().max_error_prob);
     let ms = StreamingIndex::new(sbwt, lcs).matching_statistics(sequence);
+    let index = LcsIndex { sbwt, lcs };
 
     let mut edits: Vec<Edit> = Vec::new();
     // The edited contig's match ending at i - 1, if a walk after an edit
@@ -356,8 +306,8 @@ pub fn call_snps(
             },
         };
 
-        let repaired = repair(sbwt, lcs, sequence, pattern.clone(), i, false)
-            .or_else(|| repair(sbwt, lcs, sequence, pattern, i, true));
+        let repaired = repair(&index, sequence, pattern.clone(), i, false)
+            .or_else(|| repair(&index, sequence, pattern, i, true));
         match repaired {
             Some((found, mut pattern, mut pos)) => {
                 for (at, change) in found {
@@ -370,7 +320,7 @@ pub fn call_snps(
                 }
                 // The original matching statistics still contain the edits here.
                 while pos < n && ms[pos].0 < k {
-                    match step_right(sbwt, lcs, &pattern, sequence[pos]) {
+                    match index.step_right(&pattern, sequence[pos]) {
                         Some(next) => {
                             pattern = next;
                             pos += 1;
@@ -664,7 +614,7 @@ fn code_all<C: Coder>(
         let (mut next, mut previous_length) = (0_u64, 0_usize);
         for i in 0..n_new {
             let (pos, stored) = truth.map_or((0, &Stored::Distance(1)), |t| (t.new[i as usize].0, &t.new[i as usize].1));
-            let gap = m.gaps[previous_length.min(N_LENGTH_CONTEXTS - 1)].code(c, pos as u64 - next + 1) - 1;
+            let gap = m.gaps[previous_length.min(N_LENGTH_CONTEXTS - 1)].code(c, truth.map_or(1, |_| pos as u64 - next + 1)) - 1;
             previous_length = bit_length(gap + 1);
             let pos: u32 = (next + gap).try_into().map_err(|_| error("position beyond 32 bits"))?;
             let symbol = match stored { Stored::Distance(d) => *d as u32 - 1, _ => 3 };
@@ -1085,7 +1035,7 @@ mod tests {
 
     #[test]
     fn builder_edits_snps_and_decoding_puts_them_back() {
-        use super::super::{GraphBuilder, SuffixLen, Walkable, decode_path};
+        use super::super::{GraphBuilder, SuffixLen, GraphWalk, decode_path};
 
         let reference = random_sequence(4000, 7);
         // SNPs are only called after matches longer than random ones.

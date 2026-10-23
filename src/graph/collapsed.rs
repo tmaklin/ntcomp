@@ -112,7 +112,7 @@
 //! edge's source node: a short entry's rank is the start of the SBWT interval
 //! of its suffix, so its length is always larger than LCS(r), often by one.
 //! The decoder takes LCS(r) from the LCS array or computes it from the SBWT
-//! with [crate::lcs_from_sbwt].
+//! with [crate::walk::lcs_from_sbwt].
 //!
 //! ## Stored out-degrees and chain lengths
 //!
@@ -148,11 +148,12 @@ use super::{
     SOURCE_COLEX,
     SOURCE_NODE,
     take_edge,
-    Walkable,
+    GraphWalk,
 };
 use super::bits::{BitReader, BitWriter};
 use crate::coder::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
+use crate::walk::IndexWalk;
 
 /// Smallest number of suffix lengths coded directly (not escaped): lengths
 /// up to this are coded directly even when _k_ is smaller (left extensions
@@ -416,55 +417,7 @@ impl SuffixModel {
     }
 }
 
-/// The index for deriving nodes by walks, see the module docs.
-#[derive(Clone, Copy)]
-pub struct WalkIndex<'a> {
-    pub sbwt: &'a SbwtIndex<SubsetMatrix>,
-    /// The LCS array: required to store a graph (for the matching
-    /// statistics of the walks), and makes the left extensions faster when
-    /// reading one; without it the LCS values come from the [LcsLookup].
-    pub lcs: Option<&'a LcsArray>,
-}
-
-impl WalkIndex<'_> {
-    /// The first _k_ bases of the phrase of the _k_-mer at `colex` with suffix
-    /// length `len` (0: implicit); None for a short entry or a rank outside
-    /// the index.
-    fn phrase_start(
-        &self,
-        colex: u32,
-        len: u32,
-    ) -> Option<Vec<u8>> {
-        let k = self.sbwt.k();
-        if (len != 0 && (len as usize) < k) || colex as usize >= self.sbwt.n_sets() {
-            return None
-        }
-        let max = if len == 0 { usize::MAX / 2 } else { len as usize - k };
-        let (phrase, _) = match self.lcs {
-            Some(lcs) => crate::left_extend_row(self.sbwt, lcs, colex as usize, max, len == 0),
-            None => crate::left_extend_kmer(&self.sbwt.access_kmer(colex as usize), None, self.sbwt, None, max),
-        };
-        Some(phrase[..k].to_vec())
-    }
-
-    /// The colex interval of the _k_-mers sharing the last _k_ − 1 bases with
-    /// the one at `rank`.
-    fn group(
-        &self,
-        lcs: LcsLookup,
-        rank: usize,
-    ) -> std::ops::Range<usize> {
-        let k = self.sbwt.k() as u32;
-        let (mut start, mut end) = (rank, rank + 1);
-        while start > 0 && lcs(start as u32) >= k - 1 {
-            start -= 1;
-        }
-        while end < self.sbwt.n_sets() && lcs(end as u32) >= k - 1 {
-            end += 1;
-        }
-        start..end
-    }
-}
+pub use crate::walk::WalkIndex;
 
 /// Largest number of predecessors of a _k_-mer (one per base).
 const MAX_IN_DEGREE: usize = 4;
@@ -496,14 +449,13 @@ fn code_walk<C: Coder>(
     c: &mut C,
     m: &mut WalkModels,
     index: &WalkIndex,
-    lcs: LcsLookup,
     start: &[u8],
     rows: Option<&[usize]>,
 ) -> Option<u32> {
     let k = index.sbwt.k();
     let mut cur = index.sbwt.search(start)?.start;
     for step in 0..k {
-        let group = index.group(lcs, index.sbwt.inverse_lf_step(cur)?);
+        let group = index.predecessors(cur)?;
         let in_degree = group.end - group.start;
         if in_degree > MAX_IN_DEGREE {
             return None
@@ -524,75 +476,80 @@ fn code_walk<C: Coder>(
     u32::try_from(cur).ok()
 }
 
+/// The walk index of the encoder and its streaming index (for the matching
+/// statistics that check a walk).
+type WriterWalk<'a> = (WalkIndex<'a>, StreamingIndex<'a, SbwtIndex<SubsetMatrix>, LcsArray>);
+
 /// Encoder side of the stored nodes: the ranks, the walks and their models.
 struct NodeWriter<'a> {
-    walk: Option<(WalkIndex<'a>, LcsLookup<'a>, StreamingIndex<'a, SbwtIndex<SubsetMatrix>, LcsArray>)>,
+    walk: Option<WriterWalk<'a>>,
     ranks: BitWriter,
     walks: Encoder,
     models: WalkModels,
     bound: u32,
 }
 
-impl NodeWriter<'_> {
-    /// Codes node `x` whose predecessor on its chain is `pred` (rank, suffix
-    /// length; None for the source).
-    /// The phrase start of the predecessor and its suffix length, if a walk
-    /// can start there.
-    fn start(
-        &self,
+impl<'a> NodeWriter<'a> {
+    /// The walk index and the phrase start of the predecessor `pred` (rank,
+    /// suffix length; None for the source) with its suffix length, if a walk
+    /// can start there. Borrows only the `walk` field, so the caller can code
+    /// with the other fields meanwhile.
+    fn start<'w>(
+        walk: &'w Option<WriterWalk<'a>>,
         pred: Option<(u32, u32)>,
-    ) -> Option<(Vec<u8>, u32)> {
-        match (&self.walk, pred) {
-            (Some((index, _, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
-            _ => None,
-        }
+    ) -> Option<(&'w WriterWalk<'a>, Vec<u8>, u32)> {
+        let (walk, (a, len)) = (walk.as_ref()?, pred?);
+        walk.0.phrase_start(a, len).map(|start| (walk, start, len))
     }
 
     /// The rows of the k-mers of `x` followed by `start` if the walk from
     /// `start` to `x` exists: every k-mer in the index, in-degrees at most
     /// [MAX_IN_DEGREE].
     fn walk_rows(
-        &self,
+        (index, streaming): &WriterWalk,
         start: &[u8],
         x: u32,
     ) -> Option<Vec<usize>> {
-        let (index, lcs, streaming) = self.walk.as_ref().unwrap();
         let k = index.sbwt.k();
         let mut bases = index.sbwt.access_kmer(x as usize);
         bases.extend_from_slice(start);
         let ms = streaming.matching_statistics(&bases);
         let rows: Vec<usize> = ms.iter().map(|m| m.1.start).collect();
         let derivable = (k - 1..2 * k).all(|p| ms[p].0 == k)
-            && (k..2 * k).all(|p| { let g = index.group(lcs, rows[p - 1]); g.end - g.start <= MAX_IN_DEGREE });
+            && (k..2 * k).all(|p| { let g = index.group(rows[p - 1]); g.end - g.start <= MAX_IN_DEGREE });
         derivable.then_some(rows)
     }
 
+    /// Codes the walk from `start` to `x` through `rows`.
     fn code_walk_to(
-        &mut self,
+        walks: &mut Encoder,
+        models: &mut WalkModels,
+        index: &WalkIndex,
         start: &[u8],
         rows: &[usize],
         x: u32,
     ) {
-        let (index, lcs, _) = self.walk.as_ref().unwrap();
-        let reached = code_walk(&mut self.walks, &mut self.models, index, lcs, start, Some(rows));
+        let reached = code_walk(walks, models, index, start, Some(rows));
         assert_eq!(reached, Some(x), "node walk does not reach the node");
     }
 
+    /// Codes node `x` whose predecessor on its chain is `pred` (rank, suffix
+    /// length; None for the source).
     fn node(
         &mut self,
         pred: Option<(u32, u32)>,
         x: u32,
         is_inner: bool,
     ) {
-        let Some((start, len)) = self.start(pred) else {
+        let Some((walk, start, len)) = Self::start(&self.walk, pred) else {
             self.ranks.write_truncated_binary(x, self.bound);
             return
         };
-        let rows = self.walk_rows(&start, x);
+        let rows = Self::walk_rows(walk, &start, x);
         let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
         code_bit(&mut self.walks, flag, rows.is_some() as u32);
         match rows {
-            Some(rows) => self.code_walk_to(&start, &rows, x),
+            Some(rows) => Self::code_walk_to(&mut self.walks, &mut self.models, &walk.0, &start, &rows, x),
             None => self.ranks.write_truncated_binary(x, self.bound),
         }
     }
@@ -608,11 +565,11 @@ impl NodeWriter<'_> {
         is_new: bool,
         targets: &mut TargetModels,
     ) {
-        if let Some((start, len)) = self.start(pred) {
-            let rows = if target == SINK_NODE { None } else { self.walk_rows(&start, rank) };
+        if let Some((walk, start, len)) = Self::start(&self.walk, pred) {
+            let rows = if target == SINK_NODE { None } else { Self::walk_rows(walk, &start, rank) };
             code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], rows.is_some() as u32);
             if let Some(rows) = rows {
-                self.code_walk_to(&start, &rows, rank);
+                Self::code_walk_to(&mut self.walks, &mut self.models, &walk.0, &start, &rows, rank);
                 if is_new {
                     targets.next_new += 1;
                 }
@@ -628,30 +585,22 @@ impl NodeWriter<'_> {
 
 /// Decoder side of the stored nodes, see [NodeWriter].
 struct NodeReader<'a, 'b> {
-    walk: Option<(WalkIndex<'a>, LcsLookup<'a>)>,
+    walk: Option<WalkIndex<'a>>,
     ranks: BitReader<'b>,
     walks: Decoder<'b>,
     models: WalkModels,
     bound: u32,
 }
 
-impl NodeReader<'_, '_> {
-    fn start(
-        &self,
+impl<'a> NodeReader<'a, '_> {
+    /// The walk index and the phrase start of the predecessor `pred` with its
+    /// suffix length, if a walk can start there; see [NodeWriter::start].
+    fn start<'w>(
+        walk: &'w Option<WalkIndex<'a>>,
         pred: Option<(u32, u32)>,
-    ) -> Option<(Vec<u8>, u32)> {
-        match (&self.walk, pred) {
-            (Some((index, _)), Some((a, len))) => index.phrase_start(a, len).map(|start| (start, len)),
-            _ => None,
-        }
-    }
-
-    fn walk_from(
-        &mut self,
-        start: &[u8],
-    ) -> Option<u32> {
-        let (index, lcs) = self.walk.as_ref().unwrap();
-        code_walk(&mut self.walks, &mut self.models, index, *lcs, start, None)
+    ) -> Option<(&'w WalkIndex<'a>, Vec<u8>, u32)> {
+        let (index, (a, len)) = (walk.as_ref()?, pred?);
+        index.phrase_start(a, len).map(|start| (index, start, len))
     }
 
     /// Decodes a node whose predecessor is `pred`.
@@ -660,10 +609,10 @@ impl NodeReader<'_, '_> {
         pred: Option<(u32, u32)>,
         is_inner: bool,
     ) -> Option<u32> {
-        if let Some((start, len)) = self.start(pred) {
+        if let Some((index, start, len)) = Self::start(&self.walk, pred) {
             let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
             if code_bit(&mut self.walks, flag, 0) == 1 {
-                return self.walk_from(&start)
+                return code_walk(&mut self.walks, &mut self.models, index, &start, None)
             }
         }
         self.ranks.read_truncated_binary(self.bound)
@@ -677,9 +626,9 @@ impl NodeReader<'_, '_> {
         targets: &mut TargetModels,
         junction_of: &std::collections::HashMap<u32, u32>,
     ) -> Option<(u32, Option<u32>)> {
-        if let Some((start, len)) = self.start(pred) {
+        if let Some((index, start, len)) = Self::start(&self.walk, pred) {
             if code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], 0) == 1 {
-                let rank = self.walk_from(&start)?;
+                let rank = code_walk(&mut self.walks, &mut self.models, index, &start, None)?;
                 if let Some(&junction) = junction_of.get(&rank) {
                     return Some((junction, None))
                 }
@@ -815,9 +764,8 @@ impl ChainCsr {
         let colex_bound = max_colex + 1;
 
         let walk = walk.map(|index| {
-            let lcs = lcs.expect("node walks need the LCS values");
             let streaming = StreamingIndex::new(index.sbwt, index.lcs.expect("storing node walks needs the LCS array"));
-            (index, lcs, streaming)
+            (index, streaming)
         });
         let derived = walk.is_some();
         let mut nodes = NodeWriter { walk, ranks: BitWriter::new(), walks: Encoder::new(), models: WalkModels::new(), bound: colex_bound };
@@ -929,10 +877,10 @@ impl ChainCsr {
             (_, Some(lcs)) => Some(lcs),
             (_, None) => return Err(GraphDecodeError("stored chains: the suffix lengths need the LCS array".to_string())),
         };
-        let walk = match (stored.derived, walk, lcs) {
-            (false, _, _) => None,
-            (true, Some(walk), Some(lcs)) => Some((walk, lcs)),
-            _ => return Err(GraphDecodeError("stored chains: the derived nodes need the index".to_string())),
+        let walk = match (stored.derived, walk) {
+            (false, _) => None,
+            (true, Some(walk)) => Some(walk),
+            (true, None) => return Err(GraphDecodeError("stored chains: the derived nodes need the index".to_string())),
         };
 
         // The targets set the node order: stored first, or with walks coded
@@ -1036,14 +984,6 @@ impl ChainCsr {
         self.targets.len()
     }
 
-    /// Range of chains leaving junction `junction`.
-    pub fn row(
-        &self,
-        junction: usize,
-    ) -> (usize, usize) {
-        (self.row_ptrs[junction] as usize, self.row_ptrs[junction + 1] as usize)
-    }
-
     /// Colex ranks of the inner nodes of `chain`.
     pub fn inner_nodes(
         &self,
@@ -1108,10 +1048,34 @@ impl ChainCsr {
     }
 }
 
-impl Walkable for ChainCsr {
+impl GraphWalk for ChainCsr {
+    /// Number of junctions.
+    fn n_nodes(&self) -> usize {
+        self.row_ptrs.len().saturating_sub(1)
+    }
+
+    /// Number of chains.
+    fn n_edges(&self) -> usize {
+        self.n_chains()
+    }
+
+    /// Range of chains leaving junction `node`.
+    fn row(&self, node: usize) -> (usize, usize) {
+        (self.row_ptrs[node] as usize, self.row_ptrs[node + 1] as usize)
+    }
+
+    /// The junction `edge` (a chain) ends at.
+    fn target(&self, edge: usize) -> usize {
+        self.targets[edge] as usize
+    }
+
+    fn max_steps(&self, edge: usize) -> usize {
+        (self.chain_suffix_lens(edge)[0] as usize).saturating_add(1)
+    }
+
     /// Walks the path of `color` from the source to the sink.
     ///
-    /// Same as the walk of the uncollapsed graph; the bound from [Walkable]
+    /// Same as the walk of the uncollapsed graph; the bound from [GraphWalk]
     /// counts uncollapsed edges.
     fn walk_path(
         &self,

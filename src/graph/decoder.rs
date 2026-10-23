@@ -226,7 +226,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
 mod tests {
     use super::*;
     use super::super::encoder::GraphEncoder;
-    use super::super::{GraphBuilder, Walkable};
+    use super::super::{GraphBuilder, GraphWalk};
     use super::super::snps::Snp;
 
     fn graph() -> (StoredGraph, Choices, Vec<Vec<(usize, Range<usize>)>>) {

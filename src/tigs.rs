@@ -56,7 +56,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rayon::prelude::*;
-use sbwt::dbg::{Dbg, Node};
+use crate::walk::{IndexWalk, LcsIndex};
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
@@ -341,7 +341,7 @@ fn repairable(
 fn input_gaps(
     seqs: &[Vec<u8>],
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
-    dbg: &Dbg<SubsetMatrix>,
+    walk: &LcsIndex,
     core: (&SbwtIndexVariant, &LcsArray),
     k: usize,
     rules: &GapRules,
@@ -370,9 +370,8 @@ fn input_gaps(
                 continue
             }
             if span.iter().any(|&c| !is_acgt(c)) { continue }
-            let left = Node { id: ranks[w0 - 1].unwrap() };
-            let right = Node { id: ranks[w1 + 1].unwrap() };
-            let dead = (dbg.outdegree(left) == 0) as usize + (dbg.indegree(right) == 0) as usize;
+            let (left, right) = (ranks[w0 - 1].unwrap(), ranks[w1 + 1].unwrap());
+            let dead = (walk.out_degree(left) == 0) as usize + (walk.in_degree(right) == 0) as usize;
             let class = match dead { 2 => 0, 1 => 1, _ => 2 };
             let range = [&rules.join, &rules.one_sided, &rules.bubble][class];
             if in_range(range, g) {
@@ -398,7 +397,7 @@ fn simplitigs<T: Sync>(
     let k = sbwt.k();
     let n = sbwt.n_sets();
     let index = StreamingIndex::new(sbwt, lcs);
-    let dbg = Dbg::new(sbwt, Some(lcs), rayon::current_num_threads());
+    let walk = LcsIndex { sbwt, lcs };
 
     // Colex rank of the reverse complement of every k-mer.
     let rc: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
@@ -418,7 +417,7 @@ fn simplitigs<T: Sync>(
     let is_used = |used: &[u64], v: usize| used[v / 64] >> (v % 64) & 1 == 1;
     let set_used = |used: &mut [u64], v: usize| used[v / 64] |= 1 << (v % 64);
     let complement = |c: u8| match c { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' };
-    let mut neighbors: Vec<(Node, u8)> = Vec::new();
+    let mut neighbors: Vec<(usize, u8)> = Vec::new();
     // Extends from `start` through unused k-mers; returns the labels taken.
     // While the tig follows its seed input, `seed(j)` (the input's label at
     // step j) is tried first; otherwise the labels in `order`.
@@ -428,10 +427,10 @@ fn simplitigs<T: Sync>(
         let mut on_seed = true;
         loop {
             neighbors.clear();
-            dbg.push_out_neighbors(Node { id: cur }, &mut neighbors);
+            walk.push_successors(cur, &mut neighbors);
             let s = if on_seed { seed(labels.len()) } else { None };
             let next = s.iter().chain(order.iter().filter(|&&c| Some(c) != s))
-                .find_map(|&c| neighbors.iter().find(|(v, l)| *l == c && !is_used(used, v.id)).map(|(v, l)| (v.id, *l)));
+                .find_map(|&c| neighbors.iter().find(|(v, l)| *l == c && !is_used(used, *v)).map(|(v, l)| (*v, *l)));
             match next {
                 Some((v, label)) => {
                     set_used(used, v);
@@ -515,10 +514,10 @@ pub fn build<T: Sync>(
     let gaps: Vec<Vec<u8>> = pool.install(|| {
         let SbwtIndexVariant::SubsetMatrix(core) = &core_sbwt;
         let index = StreamingIndex::new(core, &core_lcs);
-        let dbg = Dbg::new(core, Some(&core_lcs), rayon::current_num_threads());
+        let walk = LcsIndex { sbwt: core, lcs: &core_lcs };
         let per_input: Vec<(Vec<Vec<u8>>, [usize; 9])> = inputs.par_iter().map(|input| {
             let (mut gaps, mut counts) = (Vec::new(), [0usize; 9]);
-            input_gaps(&read(input), &index, &dbg, (&core_sbwt, &core_lcs), k, &opts.gaps, &mut gaps, &mut counts);
+            input_gaps(&read(input), &index, &walk, (&core_sbwt, &core_lcs), k, &opts.gaps, &mut gaps, &mut counts);
             (gaps, counts)
         }).collect();
         per_input.into_iter().flat_map(|(gaps, c)| { for i in 0..9 { counts[i] += c[i]; } gaps }).collect()

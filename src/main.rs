@@ -11,7 +11,7 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
-use ntcomp::graph::Walkable;
+use ntcomp::graph::GraphWalk;
 
 use std::io::BufWriter;
 use std::io::{Read, Write};
