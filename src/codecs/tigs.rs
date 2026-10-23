@@ -62,7 +62,8 @@
 //!   of the copy models, tig start), the order-2 context, the order-16 count,
 //!   and the base the longest copy predicts (with the agreement, or with a
 //!   differing predicted base); a final mixer over their outputs;
-//! - two APMs: by copy state, and by predicted base and agreement.
+//! - two APMs ([Apm], adaptive rate): by copy state, and by predicted base
+//!   and agreement.
 //!
 //! The stretch and squash tables come from [super::mix], computed in integer
 //! arithmetic, so they are the same on every platform.
@@ -70,7 +71,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use super::arith::{code_gamma, update, Coder, Decoder, Encoder, C0};
-use super::mix::{Tables, SMAX};
+use super::mix::{Apm, ApmRate, Tables, SMAX};
 
 type E = Box<dyn std::error::Error>;
 
@@ -170,8 +171,8 @@ struct Model {
     mprob: Vec<u32>,
     weights: Vec<Vec<i32>>,
     fweights: Vec<i32>,
-    apm: Vec<u32>,
-    apm2: Vec<u32>,
+    apm: Apm,
+    apm2: Apm,
     f: u64,
     r: u64,
     // Per-base state between predict and update.
@@ -181,7 +182,7 @@ struct Model {
     psub: [[u32; N_MIX]; 3],
     finputs: [[i32; N_MIX + 1]; 3],
     pmix: [u32; 3],
-    apm_at: [(usize, i32); 3],
+    apm_at: [usize; 3],
     apm2_at: [usize; 3],
     sel: usize,
     preds: [Option<u8>; N_MODELS],
@@ -195,8 +196,7 @@ impl Model {
         let match_bits = lg.saturating_sub(2).clamp(10, MAX_MATCH_BITS);
         let n_direct = ORDERS.iter().take_while(|&&o| 2 * o as u32 <= hash_bits).count();
         let t = Tables::new();
-        let apm_init = |n: usize| -> Vec<u32> { (0..n * 33).map(|j| { let x = ((j % 33) as i32 - 16) * 128; (t.sq(x) << 6).min((1 << 22) - 1) << 10 }).collect() };
-        let (apm, apm2) = (apm_init(3 * N_SEL), apm_init(3 * 16));
+        let (apm, apm2) = (Apm::new(&t, 3 * N_SEL, ApmRate::Adaptive), Apm::new(&t, 3 * 16, ApmRate::Adaptive));
         let main_slots = N_FWD.max(N_RC);
         let tabs = vec![
             HTab { minlen: MINLEN, slots: main_slots, bits: match_bits, data: vec![u32::MAX; (1usize << match_bits) * main_slots] },
@@ -219,7 +219,7 @@ impl Model {
             fweights: (0..3 * N_SEL * (N_MIX + 1)).map(|j| if j % (N_MIX + 1) == N_MIX { 0 } else { (W_ONE / N_MIX as i64) as i32 }).collect(),
             apm, apm2,
             f: 0, r: 0,
-            slots: [0; ORDERS.len()], inputs: [[0; N_IN]; 3], msel: [[0; N_MIX]; 3], psub: [[0; N_MIX]; 3], finputs: [[0; N_MIX + 1]; 3], pmix: [0; 3], apm_at: [(0, 0); 3], apm2_at: [0; 3], sel: 0, preds: [None; N_MODELS],
+            slots: [0; ORDERS.len()], inputs: [[0; N_IN]; 3], msel: [[0; N_MIX]; 3], psub: [[0; N_MIX]; 3], finputs: [[0; N_MIX + 1]; 3], pmix: [0; 3], apm_at: [0; 3], apm2_at: [0; 3], sel: 0, preds: [None; N_MODELS],
         }
     }
 
@@ -311,16 +311,10 @@ impl Model {
             self.finputs[node] = fx;
             self.pmix[node] = pm;
             self.inputs[node] = x;
-            // APMs over 33 bins of the clamped stretch.
-            let sc = s.clamp(-2047, 2047) + 2048;
-            let j = (sc >> 7) as usize; let fr = sc & 127;
-            let base = (node * N_SEL + self.sel) * 33 + j;
-            self.apm_at[node] = (base, fr);
-            let pa = ((self.apm[base] >> 16) as i64 * (128 - fr) as i64 + (self.apm[base + 1] >> 16) as i64 * fr as i64) >> 7;
-            let b2 = (node * 16 + key2) * 33 + j;
-            self.apm2_at[node] = b2;
-            let pa2 = ((self.apm2[b2] >> 16) as i64 * (128 - fr) as i64 + (self.apm2[b2 + 1] >> 16) as i64 * fr as i64) >> 7;
-            p[node] = ((pm as i64 + pa + 2 * pa2) / 4).clamp(1, 65535) as u32;
+            let (pa, at) = self.apm.refine(node * N_SEL + self.sel, s);
+            let (pa2, at2) = self.apm2.refine(node * 16 + key2, s);
+            (self.apm_at[node], self.apm2_at[node]) = (at, at2);
+            p[node] = ((pm as i64 + pa as i64 + 2 * pa2 as i64) / 4).clamp(1, 65535) as u32;
         }
         // k-mer exclusion.
         let mut excluded = 0u8;
@@ -351,10 +345,8 @@ impl Model {
             let err = ((bit as i64) << 16) - self.pmix[node] as i64;
             let w = &mut self.fweights[(node * N_SEL + self.sel) * (N_MIX + 1)..][..N_MIX + 1];
             for (wi, &x) in w.iter_mut().zip(&self.finputs[node]) { *wi += ((x as i64 * err + round) >> LR_SHIFT) as i32; }
-            let (b, fr) = self.apm_at[node];
-            let (a, a2) = if fr < 64 { (b, self.apm2_at[node]) } else { (b + 1, self.apm2_at[node] + 1) };
-            update(&mut self.apm[a], bit);
-            update(&mut self.apm2[a2], bit);
+            self.apm.update(self.apm_at[node], bit);
+            self.apm2.update(self.apm2_at[node], bit);
             for oi in 0..ORDERS.len() {
                 let s = self.slots[oi] + node;
                 if oi < self.n_direct {

@@ -12,12 +12,15 @@
 // at your option.
 //
 //! Logistic mixing: the stretch (ln(p / (1 - p))) and squash (its inverse)
-//! tables shared by the context-mixing models.
+//! tables shared by the context-mixing models, and the adaptive probability
+//! map ([Apm]) that refines their mixed predictions.
 //!
 //! The tables are computed in fixed-point integer arithmetic (no
 //! floating-point logarithms or exponentials), so they are the same on every
 //! platform and the models that use them predict exactly the same
 //! probabilities in the encoder and the decoder.
+
+use super::arith::update;
 
 /// Stretch range: +-SMAX in 1/256 nat.
 pub const SMAX: i32 = 4095;
@@ -106,6 +109,79 @@ impl Tables {
     #[inline] pub fn sq(&self, x: i32) -> u32 { self.squash[(x.clamp(-SMAX, SMAX) + SMAX) as usize] }
 }
 
+/// Bins of an [Apm] per context: the clamped stretch -2047..=2047 in steps
+/// of 128.
+const APM_BINS: usize = 33;
+
+/// How an [Apm] bin moves towards a coded bit.
+#[derive(Clone, Copy, Debug)]
+pub enum ApmRate {
+    /// As an adaptive bit model ([update]): fast at first, slower as its
+    /// count grows.
+    Adaptive,
+    /// By a fixed fraction (in 1/65536) of the distance to the bit.
+    Fixed(i64),
+}
+
+/// An adaptive probability map: refines a prediction (a stretch) by a
+/// context. Each context has [APM_BINS] bins over the stretch, starting at the
+/// identity (the squash of the bin's stretch); a prediction interpolates
+/// between the two bins around it, and only the nearer one learns the coded
+/// bit. The bins are counters of adaptive bit models (probability in the high
+/// 22 bits); a [ApmRate::Fixed] map keeps their counts at 0.
+pub struct Apm {
+    bins: Vec<u32>,
+    rate: ApmRate,
+}
+
+impl Apm {
+    /// A map with `n_contexts` contexts.
+    pub fn new(
+        t: &Tables,
+        n_contexts: usize,
+        rate: ApmRate,
+    ) -> Apm {
+        let bins = (0..n_contexts * APM_BINS).map(|j| {
+            let x = ((j % APM_BINS) as i32 - 16) * 128;
+            (t.sq(x) << 6).min((1 << 22) - 1) << 10
+        }).collect();
+        Apm { bins, rate }
+    }
+
+    /// The refined 16-bit probability of stretch `s` in context `ctx`, and the
+    /// bin that learns the coded bit ([Apm::update]).
+    #[inline]
+    pub fn refine(
+        &self,
+        ctx: usize,
+        s: i32,
+    ) -> (u32, usize) {
+        let sc = s.clamp(-2047, 2047) + 2048;
+        let base = ctx * APM_BINS + (sc >> 7) as usize;
+        let fr = sc & 127;
+        let p = ((self.bins[base] >> 16) as i64 * (128 - fr) as i64 + (self.bins[base + 1] >> 16) as i64 * fr as i64) >> 7;
+        (p as u32, if fr < 64 { base } else { base + 1 })
+    }
+
+    /// Moves `bin` towards the coded `bit`.
+    #[inline]
+    pub fn update(
+        &mut self,
+        bin: usize,
+        bit: u32,
+    ) {
+        let counter = &mut self.bins[bin];
+        match self.rate {
+            ApmRate::Adaptive => update(counter, bit),
+            ApmRate::Fixed(rate) => {
+                let p = (*counter >> 10) as i64;
+                let p = p + ((((bit as i64) << 22) - p) * rate >> 16);
+                *counter = (p as u32) << 10;
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +209,35 @@ mod tests {
         assert!(t.stretch.windows(2).all(|w| w[0] <= w[1]));
         assert!(t.squash.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(t.sq(0), 32768);
+    }
+
+    #[test]
+    fn apm_matches_its_first_versions() {
+        // The choice model's APM as first written: 22-bit probabilities in
+        // i32 with a fixed rate; the tig coder's: adaptive counters.
+        let t = Tables::new();
+        let (n_contexts, rate) = (3, 1311);
+        let mut fixed = Apm::new(&t, n_contexts, ApmRate::Fixed(rate));
+        let mut adaptive = Apm::new(&t, n_contexts, ApmRate::Adaptive);
+        let mut old_fixed: Vec<i32> = (0..n_contexts * 33).map(|i| (t.sq(((i % 33) as i32 - 16) * 128) as i32) << 6).collect();
+        let mut old_adaptive: Vec<u32> = (0..n_contexts * 33).map(|j| (t.sq(((j % 33) as i32 - 16) * 128) << 6).min((1 << 22) - 1) << 10).collect();
+        let mut x = 12345_u64;
+        for _ in 0..100_000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let (ctx, s, bit) = ((x % 3) as usize, ((x >> 8) % 8191) as i32 - 4095, ((x >> 32) % 10 < 7) as u32);
+            let sc = s.clamp(-2047, 2047) + 2048;
+            let (base, fr) = (ctx * 33 + (sc >> 7) as usize, sc & 127);
+            let near = if fr < 64 { base } else { base + 1 };
+
+            let p = ((old_fixed[base] >> 6) as i64 * (128 - fr) as i64 + (old_fixed[base + 1] >> 6) as i64 * fr as i64) >> 7;
+            assert_eq!(fixed.refine(ctx, s), (p as u32, near));
+            fixed.update(near, bit);
+            old_fixed[near] += ((((bit as i64) << 22) - old_fixed[near] as i64) * rate >> 16) as i32;
+
+            let p = ((old_adaptive[base] >> 16) as i64 * (128 - fr) as i64 + (old_adaptive[base + 1] >> 16) as i64 * fr as i64) >> 7;
+            assert_eq!(adaptive.refine(ctx, s), (p as u32, near));
+            adaptive.update(near, bit);
+            update(&mut old_adaptive[near], bit);
+        }
     }
 }

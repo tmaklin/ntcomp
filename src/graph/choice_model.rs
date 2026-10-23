@@ -42,7 +42,7 @@
 //! reference, other reference, other copy, plain rank) and: the out-degree;
 //! the votes and the top reference's score; the visits to the node and the
 //! candidate's position. A final mixer per class combines them, and an APM
-//! per class refines the result. Everything is integer arithmetic, so the
+//! ([Apm], fixed rate) per class refines the result. Everything is integer arithmetic, so the
 //! decoder repeats the predictions exactly.
 //!
 //! The format is the arithmetic-coded stream alone: the number of colours
@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 
 use crate::codecs::arith::{code_tree, update, Coder, Decoder, Encoder, C0};
-use crate::codecs::mix::{Tables, SMAX};
+use crate::codecs::mix::{Apm, ApmRate, Tables, SMAX};
 
 use super::choices::{ChoiceStream, ChoiceWriter, Choices};
 use super::{GraphWalk, StoredGraph, SINK_NODE, SOURCE_NODE};
@@ -86,8 +86,7 @@ const BIAS: i32 = 77;
 const FLAG: i32 = 256;
 /// A reference's score of 1.
 const SCORE_ONE: u32 = 256;
-/// APM bins, and its fixed update rate (0.02 in 1/65536).
-const APM_BINS: usize = 33;
+/// The APM's fixed update rate (0.02 in 1/65536).
 const APM_RATE: i64 = 1311;
 
 /// Codes the choices of every colour with the model.
@@ -127,7 +126,7 @@ struct Mixed {
     sets: [usize; 3],
     p_sub: [u32; 3],
     p_mix: u32,
-    apm: (usize, i32),
+    apm: usize,
 }
 
 struct Model {
@@ -138,7 +137,7 @@ struct Model {
     vote_ctr: Vec<u32>,
     weights: [Vec<i32>; 3],
     final_weights: Vec<i32>,
-    apm: Vec<i32>,
+    apm: Apm,
     /// Visits to every node, and how often every edge was taken.
     visits: Vec<u32>,
     taken: Vec<u32>,
@@ -158,7 +157,7 @@ impl Model {
         let max_n = (0..g.n_nodes()).map(|j| { let (a, b) = g.row(j); b - a }).max().unwrap_or(1) as u32;
         let max_bits = 32 - max_n.saturating_sub(1).leading_zeros();
         let w0 = (W_ONE * 3 / 10) as i32;
-        let apm = (0..N_CLASSES * APM_BINS).map(|i| (t.sq(((i % APM_BINS) as i32 - 16) * 128) as i32) << 6).collect();
+        let apm = Apm::new(&t, N_CLASSES, ApmRate::Fixed(APM_RATE));
         Model {
             t,
             trees: (0..=max_bits).map(|b| vec![C0; 1 << b]).collect(),
@@ -202,13 +201,9 @@ impl Model {
         }
         let s = self.dot(&self.final_weights[class * N_FIN..][..N_FIN], &fx);
         let p_mix = self.t.sq(s);
-        // APM over 33 bins of the clamped stretch.
-        let sc = s.clamp(-2047, 2047) + 2048;
-        let base = class * APM_BINS + (sc >> 7) as usize;
-        let fr = sc & 127;
-        let pa = ((self.apm[base] >> 6) as i64 * (128 - fr) as i64 + (self.apm[base + 1] >> 6) as i64 * fr as i64) >> 7;
-        let p = ((p_mix as i64 + 3 * pa) / 4).clamp(1, 65535) as u32;
-        (Mixed { x, fx, sets, p_sub, p_mix, apm: (base, fr) }, p)
+        let (pa, apm) = self.apm.refine(class, s);
+        let p = ((p_mix as i64 + 3 * pa as i64) / 4).clamp(1, 65535) as u32;
+        (Mixed { x, fx, sets, p_sub, p_mix, apm }, p)
     }
 
     fn learn(&mut self, m: &Mixed, class: usize, bit: u32) {
@@ -223,9 +218,7 @@ impl Model {
         for (w, &x) in self.final_weights[class * N_FIN..][..N_FIN].iter_mut().zip(&m.fx) {
             *w += ((x as i64 * err * LR_FINAL + round) >> 16) as i32;
         }
-        let (base, fr) = m.apm;
-        let a = &mut self.apm[if fr < 64 { base } else { base + 1 }];
-        *a += ((((bit as i64) << 22) - *a as i64) * APM_RATE >> 16) as i32;
+        self.apm.update(m.apm, bit);
     }
 }
 
