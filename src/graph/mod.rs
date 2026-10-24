@@ -99,12 +99,6 @@ const SOURCE_COLEX: u32 = u32::MAX - 1;
 /// Colex rank stored in the dummy sink node. Real colex ranks must be smaller.
 const SINK_COLEX: u32 = u32::MAX;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
-pub struct ColexGraphEdge {
-    pub weight: u32,
-    pub colors: Vec<u32>,
-}
-
 /// Serialized form of [StoredGraph] (the same bytes as its serde form).
 #[derive(serde::Serialize)]
 enum StoredGraphRef<'a> {

@@ -115,16 +115,20 @@ fn read_reversed<R: Read>(
     Ok(Some((0..n_colors).map(|_| bits.read_bits(1) == Some(1)).collect()))
 }
 
-/// Sections of an archive, in the order returned by [GraphDecoder::decode_from_read].
-pub type DecodedSections = (
-    StoredGraph,
-    Choices,
-    Option<Vec<super::ContigHash>>,
-    Option<Vec<Vec<u8>>>,
-    Option<Vec<(Vec<u8>, Range<u32>)>>,
-    Option<Vec<bool>>,
-    Option<SnpEdits>,
-);
+/// The sections of an archive ([GraphDecoder::decode_from_read]); the
+/// optional ones are None if the archive does not have them.
+pub struct DecodedSections {
+    pub graph: StoredGraph,
+    pub choices: Choices,
+    /// Hash of every contig.
+    pub hashes: Option<Vec<super::ContigHash>>,
+    pub contig_names: Option<Vec<Vec<u8>>>,
+    /// Input files: name and colours.
+    pub file_ranges: Option<Vec<(Vec<u8>, Range<u32>)>>,
+    /// Per contig: whether it is stored reverse complemented.
+    pub reversed: Option<Vec<bool>>,
+    pub snp_edits: Option<SnpEdits>,
+}
 
 /// Decodes the output from [GraphEncoder](super::encoder::GraphEncoder).
 pub struct GraphDecoder<'a, R: Read> {
@@ -206,7 +210,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         }
         let choices = Choices::from_stored(&read_bytes(reader, header.choice_bytes)?, &graph, header.n_queries as usize)?;
 
-        Ok((graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits))
+        Ok(DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
     }
 }
 
@@ -254,7 +258,7 @@ mod tests {
         let mut input = bytes.as_slice();
         let decoder = GraphDecoder::new(&mut input).unwrap();
         assert_eq!(decoder.header().n_queries, 2);
-        let (graph, choices, got_hashes, got_names, got_ranges, got_reversed, got_snps) = decoder.decode_from_read().unwrap();
+        let DecodedSections { graph, choices, hashes: got_hashes, contig_names: got_names, file_ranges: got_ranges, reversed: got_reversed, snp_edits: got_snps } = decoder.decode_from_read().unwrap();
         assert_eq!(got_reversed, Some(vec![false, true]));
         assert_eq!(got_snps, Some(snps));
         assert_eq!(got_hashes, Some(hashes));
@@ -271,9 +275,9 @@ mod tests {
         let (graph, choices, _) = graph();
         let bytes = encode(GraphEncoder::new(graph, choices));
         let mut input = bytes.as_slice();
-        let (_, choices, hashes, names, ranges, reversed, snps) = GraphDecoder::new(&mut input).unwrap().decode_from_read().unwrap();
-        assert_eq!(choices.streams.len(), 2);
-        assert!(hashes.is_none() && names.is_none() && ranges.is_none() && reversed.is_none() && snps.is_none());
+        let sections = GraphDecoder::new(&mut input).unwrap().decode_from_read().unwrap();
+        assert_eq!(sections.choices.streams.len(), 2);
+        assert!(sections.hashes.is_none() && sections.contig_names.is_none() && sections.file_ranges.is_none() && sections.reversed.is_none() && sections.snp_edits.is_none());
     }
 
     #[test]
@@ -283,7 +287,7 @@ mod tests {
         let mut input = bytes.as_slice();
         let decoder = GraphDecoder::new(&mut input).unwrap();
         assert_eq!(decoder.header().strand_bytes, 0);
-        assert!(decoder.decode_from_read().unwrap().5.is_none());
+        assert!(decoder.decode_from_read().unwrap().reversed.is_none());
 
         // One strand per colour is required.
         let (stored, choices, _) = graph();
@@ -337,7 +341,7 @@ mod tests {
         for array in [Some(index.lcs()), None] {
             let walk = crate::walk::WalkIndex { sbwt: index.sbwt(), lcs: array };
             let mut input = with_lcs.as_slice();
-            let (graph, choices, ..) = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(walk), Some(15)).unwrap();
+            let DecodedSections { graph, choices, .. } = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(walk), Some(15)).unwrap();
             for (color, walk) in walks.iter().enumerate() {
                 assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
             }

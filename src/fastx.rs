@@ -40,19 +40,6 @@ pub fn read_contigs<P: AsRef<Path>>(
     Ok(contigs)
 }
 
-/// The sequences of an input to an index: tigs written by `ntcomp tigs`
-/// (`.tigs.tac`, see [crate::tigs::read_tigs]) or a FASTA or FASTQ file.
-pub fn read_sequences<P: AsRef<Path>>(
-    path: P,
-) -> Result<Vec<Vec<u8>>, E> {
-    let path = path.as_ref();
-    if path.to_string_lossy().ends_with(".tigs.tac") {
-        let reader = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?);
-        return crate::tigs::read_tigs(reader).map_err(|e| format!("{}: {}", path.display(), e).into())
-    }
-    Ok(read_contigs(path)?.into_iter().map(|(_, sequence)| sequence).collect())
-}
-
 /// Writes a FASTA record of `name` and `sequence`, `columns` bases per
 /// line (at least one).
 pub fn write_fasta<W: Write>(

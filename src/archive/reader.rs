@@ -19,9 +19,9 @@ use std::ops::Range;
 
 use rayon::prelude::*;
 
-use crate::graph::decoder::{ArchiveError, GraphDecoder};
+use crate::graph::decoder::{ArchiveError, DecodedSections, GraphDecoder};
 use crate::graph::snps::{self, SnpEdits};
-use crate::graph::{contig_hash, Choices, ContigHash, GraphWalk, StoredGraph};
+use crate::graph::{contig_hash, Choices, ContigHash, Csr, GraphWalk, StoredGraph};
 use crate::index::Index;
 use crate::nlz::{self, SuffixLen};
 
@@ -62,7 +62,7 @@ impl<'a> ArchiveReader<'a> {
     ) -> Result<Self, E> {
         let decoder = GraphDecoder::new(input)?;
         let n_contigs = decoder.header().n_queries;
-        let (graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits) = decoder.decode_from_read_with_index(index)?;
+        let DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits } = decoder.decode_from_read_with_index(index)?;
         if hashes.as_ref().is_some_and(|h| h.len() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("{} hashes for {} contigs", hashes.map_or(0, |h| h.len()), n_contigs))))
         }
@@ -176,15 +176,14 @@ impl<'a> ArchiveReader<'a> {
         Ok(DecodedContig { color, sequence, hash_match })
     }
 
-    /// The stored graph with every colour's walk as its edges' colour sets,
-    /// for viewing.
-    #[cfg(feature = "graph-view")]
-    pub fn to_petgraph(
+    /// The uncollapsed graph and the colours using each of its edges
+    /// ([Csr::colorsets], recovered by walking every colour), for viewing.
+    pub fn into_colored_graph(
         self,
-    ) -> Result<petgraph::graph::Graph<u32, crate::graph::ColexGraphEdge>, E> {
+    ) -> Result<(Csr<u32>, Vec<Vec<u32>>), E> {
         let csr = self.graph.into_csr();
         let colorsets = csr.colorsets(&self.choices, self.n_contigs)?;
-        Ok(csr.to_petgraph(&colorsets))
+        Ok((csr, colorsets))
     }
 }
 

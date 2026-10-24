@@ -12,7 +12,7 @@
 // at your option.
 //
 
-use crate::graph::ColexGraphEdge;
+use crate::graph::{Csr, GraphWalk};
 
 use egui::CentralPanel;
 use egui_graphs::Graph;
@@ -21,6 +21,42 @@ use petgraph::prelude::StableGraph;
 use petgraph::Direction;
 use petgraph::prelude::*;
 use std::collections::HashMap;
+
+/// An edge of the viewed graph: its suffix length and the colours using it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+pub struct ColexGraphEdge {
+    pub weight: u32,
+    pub colors: Vec<u32>,
+}
+
+/// The graph `csr` as a petgraph graph, with `colorsets` from
+/// [Csr::colorsets] as the colours of its edges.
+pub fn to_petgraph(
+    csr: Csr<u32>,
+    colorsets: &[Vec<u32>],
+) -> petgraph::Graph<u32, ColexGraphEdge> {
+    let mut graph = petgraph::Graph::with_capacity(csr.node_weights.len(), csr.column_indices.len());
+
+    for weight in &csr.node_weights {
+        graph.add_node(*weight);
+    }
+
+    for source_idx in 0..csr.node_weights.len() {
+        let (start, end) = csr.row(source_idx);
+        for (pos, colorset) in colorsets.iter().enumerate().take(end).skip(start) {
+            graph.add_edge(
+                NodeIndex::new(source_idx),
+                NodeIndex::new(csr.column_indices[pos] as usize),
+                ColexGraphEdge {
+                    weight: csr.suffix_lens[pos],
+                    colors: colorset.clone(),
+                },
+            );
+        }
+    }
+
+    graph
+}
 
 /// Compresses linear chains of nodes (in_degree == 1 && out_degree == 1)
 /// into a single edge containing a vector of combined edge weights.

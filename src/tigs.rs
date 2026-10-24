@@ -558,6 +558,20 @@ pub fn write_tigs<W: Write>(
     codecs::tigs::encode(tigs, k, out)
 }
 
+/// The sequences of an input to an index: tigs written by [write_tigs]
+/// (a `.tigs.tac` file) or a FASTA or FASTQ file
+/// ([read_contigs](crate::fastx::read_contigs)).
+pub fn read_sequences<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Vec<Vec<u8>>, E> {
+    let path = path.as_ref();
+    if path.to_string_lossy().ends_with(".tigs.tac") {
+        let reader = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?);
+        return read_tigs(reader).map_err(|e| format!("{}: {}", path.display(), e).into())
+    }
+    Ok(crate::fastx::read_contigs(path)?.into_iter().map(|(_, sequence)| sequence).collect())
+}
+
 /// Reads tigs written by [write_tigs], in the coder's order and orientation:
 /// the same _k_-mers, so the same SBWT.
 pub fn read_tigs<R: Read>(
@@ -569,6 +583,7 @@ pub fn read_tigs<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::xorshift_sequence;
 
     #[test]
     fn hashes_are_canonical() {
@@ -596,11 +611,6 @@ mod tests {
     }
 
     // Random sequence for the end-to-end test.
-    fn random_seq(n: usize, seed: u64) -> Vec<u8> {
-        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
-        (0..n).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"ACGT"[(x >> 33) as usize % 4] }).collect()
-    }
-
     /// Canonical k-mers of a set of sequences.
     fn kmer_set(seqs: &[Vec<u8>], k: usize) -> HashSet<Vec<u8>> {
         let mut out = HashSet::new();
@@ -619,11 +629,11 @@ mod tests {
         // Two inputs are the backbone (the core); a third has a SNP (a bubble
         // the edits repair) and a fourth an insertion of 40 bases (a bubble
         // they do not).
-        let backbone = random_seq(2000, 4);
+        let backbone = xorshift_sequence(2000, 4);
         let mut with_snp = backbone.clone();
         with_snp[700] = if backbone[700] == b'A' { b'C' } else { b'A' };
         let mut with_insert = backbone[..1300].to_vec();
-        with_insert.extend_from_slice(&random_seq(40, 5));
+        with_insert.extend_from_slice(&xorshift_sequence(40, 5));
         with_insert.extend_from_slice(&backbone[1300..]);
         let inputs: Vec<Vec<Vec<u8>>> = vec![vec![backbone.clone()], vec![backbone.clone()], vec![with_snp.clone()], vec![with_insert.clone()]];
         let read = |x: &Vec<Vec<u8>>| x.clone();
@@ -651,9 +661,9 @@ mod tests {
         let k = 15;
         // Three inputs share a backbone; one carries an insertion (a bubble of
         // its own k-mers) and another a different tail (a tip).
-        let backbone = random_seq(400, 1);
-        let insert = random_seq(60, 2);
-        let tail = random_seq(80, 3);
+        let backbone = xorshift_sequence(400, 1);
+        let insert = xorshift_sequence(60, 2);
+        let tail = xorshift_sequence(80, 3);
         let mut with_insert = backbone[..200].to_vec();
         with_insert.extend_from_slice(&insert);
         with_insert.extend_from_slice(&backbone[200..]);

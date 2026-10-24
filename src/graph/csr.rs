@@ -13,17 +13,6 @@
 //
 //! The graph in compressed sparse row format.
 //!
-#[cfg(feature = "graph-view")]
-use petgraph::{
-    EdgeType,
-    graph::{
-        Graph,
-        NodeIndex,
-    },
-};
-
-#[cfg(feature = "graph-view")]
-use super::ColexGraphEdge;
 use super::choices::Choices;
 use super::paths::take_edge;
 use super::{GraphDecodeError, GraphWalk, SINK_NODE, SOURCE_NODE};
@@ -91,38 +80,6 @@ impl<N: Copy> Csr<N> where u32: From<N> {
             })?;
         }
         Ok(colorsets)
-    }
-
-    /// Converts to a petgraph graph with `colorsets` from [Csr::colorsets] as the edge colours.
-    #[cfg(feature = "graph-view")]
-    pub fn to_petgraph<Ty: EdgeType>(
-        self,
-        colorsets: &[Vec<u32>],
-    ) -> Graph<N, ColexGraphEdge, Ty>
-    where
-        N: Copy,
-    {
-        let mut graph = Graph::with_capacity(self.node_weights.len(), self.column_indices.len());
-
-        for weight in &self.node_weights {
-            graph.add_node(*weight);
-        }
-
-        for source_idx in 0..self.node_weights.len() {
-            let (start, end) = self.row(source_idx);
-            for (pos, colorset) in colorsets.iter().enumerate().take(end).skip(start) {
-                graph.add_edge(
-                    NodeIndex::new(source_idx),
-                    NodeIndex::new(self.column_indices[pos] as usize),
-                    ColexGraphEdge {
-                        weight: self.suffix_lens[pos],
-                        colors: colorset.clone(),
-                    },
-                );
-            }
-        }
-
-        graph
     }
 }
 

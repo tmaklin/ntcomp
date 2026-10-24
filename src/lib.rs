@@ -56,6 +56,13 @@ pub(crate) mod testing {
         }).collect()
     }
 
+    /// A random sequence of `n` bases from `seed`, by a xorshift generator
+    /// (the tig tests' data).
+    pub(crate) fn xorshift_sequence(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        (0..n).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"ACGT"[(x >> 33) as usize % 4] }).collect()
+    }
+
     /// Four related sequences (one with substitutions every 97, 211 and 401
     /// bases), so the de Bruijn graph branches, and their index for `k`.
     pub(crate) fn related_index(k: usize) -> (Vec<Vec<u8>>, Index) {

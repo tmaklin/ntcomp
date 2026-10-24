@@ -78,7 +78,7 @@ fn build(
     info!("Building SBWT index from {} files...", in_files.len());
     let mut seq_data: Vec<Vec<u8>> = Vec::new();
     for file in &in_files {
-        seq_data.append(&mut fastx::read_sequences(file).or_exit());
+        seq_data.append(&mut ntcomp::tigs::read_sequences(file).or_exit());
     }
 
     let index = Index::build(&seq_data, &args.build_opts());
@@ -309,7 +309,8 @@ fn graph_view(
         std::process::exit(1);
     }
     // Colour sets are not stored, recover them by walking every colour.
-    let graph = archive.to_petgraph().or_exit();
+    let (csr, colorsets) = archive.into_colored_graph().or_exit();
+    let graph = ntcomp::graphview::to_petgraph(csr, &colorsets);
 
     let native_options = eframe::NativeOptions::default();
     let ret = eframe::run_native(

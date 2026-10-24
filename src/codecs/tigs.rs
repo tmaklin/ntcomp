@@ -707,12 +707,8 @@ pub fn decode<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::xorshift_sequence;
     use crate::strands::reverse_complement;
-
-    fn random_seq(n: usize, seed: u64) -> Vec<u8> {
-        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
-        (0..n).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"ACGT"[(x >> 33) as usize % 4] }).collect()
-    }
 
     fn canonical_sorted(tigs: &[Vec<u8>]) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = tigs.iter().map(|t| { let r = reverse_complement(t); if r < *t { r } else { t.clone() } }).collect();
@@ -736,14 +732,14 @@ mod tests {
         // only anchor is on the reverse strand of the other (anchored in the
         // long tigs); a branch off the SNP variant (anchored in it); unrelated
         // tigs.
-        let a = random_seq(900, 1);
-        let b = random_seq(700, 2);
+        let a = xorshift_sequence(900, 1);
+        let b = xorshift_sequence(700, 2);
         let mut snp = a[300..300 + 2 * k - 1].to_vec();
         snp[k - 1] = if snp[k - 1] == b'A' { b'C' } else { b'A' };
-        let branch_rc = reverse_complement(&branch(&b[100..100 + k - 1], random_seq(15, 3), b[100 + k - 1]));
-        let reverse_only = branch(&reverse_complement(&b[400..400 + k - 1]), random_seq(10, 7), reverse_complement(&b[399..400])[0]);
-        let second = branch(&snp[1..k], random_seq(12, 4), snp[k]);
-        let mut tigs = vec![a, b, snp, branch_rc, reverse_only, second, random_seq(2 * k - 5, 5), random_seq(k, 6)];
+        let branch_rc = reverse_complement(&branch(&b[100..100 + k - 1], xorshift_sequence(15, 3), b[100 + k - 1]));
+        let reverse_only = branch(&reverse_complement(&b[400..400 + k - 1]), xorshift_sequence(10, 7), reverse_complement(&b[399..400])[0]);
+        let second = branch(&snp[1..k], xorshift_sequence(12, 4), snp[k]);
+        let mut tigs = vec![a, b, snp, branch_rc, reverse_only, second, xorshift_sequence(2 * k - 5, 5), xorshift_sequence(k, 6)];
         tigs.sort_by_key(|t| std::cmp::Reverse(t.len()));
         let codes: Vec<Vec<u8>> = tigs.iter().map(|t| t.iter().map(|&c| b"ACGT".iter().position(|&x| x == c).unwrap() as u8).collect()).collect();
         let p = plan(codes, k);
@@ -759,7 +755,7 @@ mod tests {
     #[test]
     fn rejects_repeated_kmers() {
         let k = 31;
-        let a = random_seq(200, 7);
+        let a = xorshift_sequence(200, 7);
         assert!(encode(&[a.clone(), a[10..80].to_vec()], k, Vec::new()).is_err());
     }
 
