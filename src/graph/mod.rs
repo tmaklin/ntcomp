@@ -70,7 +70,7 @@ pub use choices::Choices;
 pub use csr::Csr;
 pub use paths::GraphWalk;
 use paths::take_edge;
-use crate::walk::IndexWalk;
+use crate::walk::{IndexWalk, WalkIndex};
 use collapsed::ChainCsr;
 
 type E = Box<dyn std::error::Error>;
@@ -193,30 +193,6 @@ pub fn decode_path(
     Ok(sequence)
 }
 
-/// Source of LCS array values for decoding chains stored with LCS contexts,
-/// see [collapsed].
-#[derive(Clone, Copy)]
-pub enum LcsSource<'a> {
-    /// The LCS array of the index.
-    Array(&'a LcsArray),
-
-    /// Computed from the index with [crate::walk::lcs_from_sbwt] (slower).
-    Sbwt(&'a SbwtIndexVariant),
-}
-
-impl LcsSource<'_> {
-    /// LCS array value of `colex_rank`.
-    pub fn lcs(
-        &self,
-        colex_rank: u32,
-    ) -> u32 {
-        match self {
-            LcsSource::Array(lcs) => lcs.access(colex_rank as usize) as u32,
-            LcsSource::Sbwt(SbwtIndexVariant::SubsetMatrix(sbwt)) => crate::walk::lcs_from_sbwt(sbwt, colex_rank as usize) as u32,
-        }
-    }
-}
-
 /// Serialized form of [StoredGraph] (the same bytes as its serde form).
 #[derive(serde::Serialize)]
 enum StoredGraphRef<'a> {
@@ -239,51 +215,36 @@ pub enum StoredGraph {
 }
 
 impl StoredGraph {
-    /// Serializes the graph. With `lcs`, the suffix lengths of collapsed
-    /// chains are coded per LCS context, and with `sbwt` too their nodes are
-    /// derived by walks in the index where possible, see [collapsed]; reading
-    /// them back then needs an [LcsSource] (and the SBWT). `k` is the _k_-mer
-    /// size of the index (None if unknown), which sets the direct suffix
-    /// length symbols, see [collapsed::max_direct_suffix_len].
+    /// Serializes the graph. With the `index` (and its LCS array), the
+    /// suffix lengths of collapsed chains are coded per LCS context and their
+    /// nodes are derived by walks in the index where possible, see
+    /// [collapsed]; reading them back then needs the index. `k` is the
+    /// _k_-mer size of the index (None if unknown), which sets the direct
+    /// suffix length symbols, see [collapsed::max_direct_suffix_len].
     pub fn to_bytes(
         &self,
-        lcs: Option<&LcsArray>,
-        sbwt: Option<&SbwtIndexVariant>,
+        index: Option<WalkIndex>,
         k: Option<u32>,
     ) -> Result<Vec<u8>, postcard::Error> {
         let repr = match self {
             StoredGraph::Csr(csr) => StoredGraphRef::Csr(csr),
-            StoredGraph::Chains(chains) => match lcs {
-                Some(lcs) => {
-                    let lookup = |rank: u32| lcs.access(rank as usize) as u32;
-                    let walk = sbwt.map(|SbwtIndexVariant::SubsetMatrix(sbwt)| collapsed::WalkIndex { sbwt, lcs: Some(lcs) });
-                    StoredGraphRef::Chains(chains.to_stored_with(Some(&lookup), collapsed::max_direct_suffix_len(k), k, walk))
-                },
-                None => StoredGraphRef::Chains(chains.to_stored_with(None, 0, k, None)),
-            },
+            StoredGraph::Chains(chains) => StoredGraphRef::Chains(chains.to_stored_with(index, collapsed::max_direct_suffix_len(k), k, index.is_some())),
         };
         postcard::to_allocvec(&repr)
     }
 
-    /// Reads a graph written by [StoredGraph::to_bytes]; `lcs` is needed if
-    /// it was written with the LCS array, `sbwt` if it was written with the
-    /// SBWT too, and `k` must be the _k_-mer size it was written with (None
-    /// works for _k_ ≤ 255).
+    /// Reads a graph written by [StoredGraph::to_bytes]; `index` is needed if
+    /// it was written with the index (its LCS array is optional: the values
+    /// are otherwise computed from the SBWT, slower), and `k` must be the
+    /// _k_-mer size it was written with (None works for _k_ ≤ 255).
     pub fn from_bytes(
         bytes: &[u8],
-        lcs: Option<LcsSource>,
-        sbwt: Option<&SbwtIndexVariant>,
+        index: Option<WalkIndex>,
         k: Option<u32>,
     ) -> Result<Self, E> {
         Ok(match postcard::from_bytes(bytes)? {
             StoredGraphOwned::Csr(csr) => StoredGraph::Csr(csr),
-            StoredGraphOwned::Chains(stored) => {
-                let lookup = lcs.map(|source| move |rank: u32| source.lcs(rank));
-                let lookup: Option<collapsed::LcsLookup> = lookup.as_ref().map(|f| f as collapsed::LcsLookup);
-                let array = match lcs { Some(LcsSource::Array(array)) => Some(array), _ => None };
-                let walk = sbwt.map(|SbwtIndexVariant::SubsetMatrix(sbwt)| collapsed::WalkIndex { sbwt, lcs: array });
-                StoredGraph::Chains(ChainCsr::from_stored_with(stored, lookup, k, walk)?)
-            },
+            StoredGraphOwned::Chains(stored) => StoredGraph::Chains(ChainCsr::from_stored_with(stored, index, k)?),
         })
     }
 

@@ -24,7 +24,8 @@ use crate::codecs::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
 use crate::codecs::lzma::{self, LzmaData};
-use super::{LcsSource, StoredGraph};
+use super::StoredGraph;
+use crate::walk::WalkIndex;
 
 use sbwt::LcsArray;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
@@ -164,7 +165,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     pub fn decode_from_read(
         self,
     ) -> Result<DecodedSections, E> {
-        self.decode_from_read_with(None, None, None)
+        self.decode_from_read_with(None, None)
     }
 
     /// Same as [GraphDecoder::decode_from_read] for an archive written with
@@ -176,23 +177,17 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         sbwt: &SbwtIndexVariant,
         lcs: Option<&LcsArray>,
     ) -> Result<DecodedSections, E> {
-        let SbwtIndexVariant::SubsetMatrix(index) = sbwt;
-        let source = match lcs {
-            Some(lcs) => LcsSource::Array(lcs),
-            None => LcsSource::Sbwt(sbwt),
-        };
-        self.decode_from_read_with(Some(sbwt), Some(source), Some(index.k().try_into()?))
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = sbwt;
+        self.decode_from_read_with(Some(WalkIndex { sbwt, lcs }), Some(sbwt.k().try_into()?))
     }
 
-    /// Same as [GraphDecoder::decode_from_read]; `sbwt` is the index needed
-    /// if the archive was written with it (graph nodes derived by walks),
-    /// `lcs` gives the LCS array values needed if the archive was written with
-    /// the LCS array, and `k` the _k_-mer size it was written with (None works
-    /// for _k_ ≤ 255).
+    /// Same as [GraphDecoder::decode_from_read]; `index` is needed if the
+    /// archive was written with it (LCS contexts and graph nodes derived by
+    /// walks; its LCS array is optional), and `k` is the _k_-mer size it was
+    /// written with (None works for _k_ ≤ 255).
     pub fn decode_from_read_with(
         self,
-        sbwt: Option<&SbwtIndexVariant>,
-        lcs: Option<LcsSource>,
+        index: Option<WalkIndex>,
         k: Option<u32>,
     ) -> Result<DecodedSections, E> {
         let header = self.file_header;
@@ -206,7 +201,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
-        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, lcs, sbwt, k)?;
+        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, index, k)?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;

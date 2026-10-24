@@ -28,6 +28,7 @@ use std::io::Write;
 
 use postcard::to_allocvec;
 use sbwt::LcsArray;
+use crate::walk::WalkIndex;
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
 type E = Box<dyn std::error::Error>;
@@ -55,12 +56,10 @@ pub struct GraphEncoder<'a> {
     /// Edited SNPs
     snp_edits: Option<SnpEdits>,
 
-    /// LCS array of the index, for coding the suffix lengths per LCS context
-    lcs: Option<&'a LcsArray>,
-
-    /// The SBWT of the index: graph nodes are derived by walks in it, see
+    /// The index with its LCS array: the suffix lengths are coded per LCS
+    /// context and graph nodes are derived by walks in it, see
     /// [collapsed](super::collapsed).
-    sbwt: Option<&'a SbwtIndexVariant>,
+    index: Option<WalkIndex<'a>>,
 
     /// _k_-mer size of the index, for the direct suffix length symbols
     k: Option<u32>,
@@ -91,8 +90,7 @@ impl<'a> GraphEncoder<'a> {
             file_ranges: None,
             reversed: None,
             snp_edits: None,
-            lcs: None,
-            sbwt: None,
+            index: None,
             k: None,
         }
     }
@@ -144,10 +142,9 @@ impl<'a> GraphEncoder<'a> {
         sbwt: &'a SbwtIndexVariant,
         lcs: &'a LcsArray,
     ) -> Self {
-        let SbwtIndexVariant::SubsetMatrix(index) = sbwt;
-        self.lcs = Some(lcs);
-        self.sbwt = Some(sbwt);
-        self.k = Some(index.k().try_into().expect("k does not fit in u32"));
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = sbwt;
+        self.index = Some(WalkIndex { sbwt, lcs: Some(lcs) });
+        self.k = Some(sbwt.k().try_into().expect("k does not fit in u32"));
         self
     }
 
@@ -234,7 +231,7 @@ impl<'a> GraphEncoder<'a> {
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;
-        let graph_bytes = self.graph.to_bytes(self.lcs, self.sbwt, self.k)?;
+        let graph_bytes = self.graph.to_bytes(self.index, self.k)?;
         let choice_bytes = self.choices.to_stored(&self.graph)?;
 
         let header = FileHeader{

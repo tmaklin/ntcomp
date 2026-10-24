@@ -29,11 +29,11 @@
 use crate::codecs::arith::{Decoder, Encoder};
 use crate::codecs::bits::{BitReader, BitWriter};
 use crate::graph::{GraphDecodeError, GraphWalk, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
-use crate::walk::WalkIndex;
+use crate::walk::{IndexWalk, WalkIndex};
 use sbwt::StreamingIndex;
 
 use super::nodes::{code_targets, NodeReader, NodeWriter, TargetModels, WalkModels};
-use super::suffix_lens::{max_direct_suffix_len, LcsLookup, SuffixModel};
+use super::suffix_lens::{max_direct_suffix_len, SuffixModel};
 use super::topology::code_topology;
 use super::ChainCsr;
 
@@ -89,22 +89,23 @@ impl ChainCsr {
     pub fn to_stored(
         &self,
     ) -> StoredChains {
-        self.to_stored_with(None, 0, None, None)
+        self.to_stored_with(None, 0, None, false)
     }
 
-    /// Same as [ChainCsr::to_stored], with one suffix length code per LCS
-    /// value of the edge's source rank (capped at `lcs_cap`) if `lcs` gives
-    /// the LCS array value of a colex rank, direct suffix length symbols for
-    /// _k_-mer size `k`, and nodes derived by walks in `walk` (which needs
-    /// `lcs` and the LCS array), see the module docs and [nodes](super::nodes).
+    /// Same as [ChainCsr::to_stored], with the `index`: one suffix length
+    /// code per LCS value of the edge's source rank (capped at `lcs_cap`),
+    /// and if `derive`, nodes derived by walks in the index (which needs its
+    /// LCS array); and direct suffix length symbols for _k_-mer size `k`. See
+    /// the module docs, [suffix_lens](super::suffix_lens) and
+    /// [nodes](super::nodes).
     pub fn to_stored_with(
         &self,
-        lcs: Option<LcsLookup>,
+        index: Option<WalkIndex>,
         lcs_cap: u32,
         k: Option<u32>,
-        walk: Option<WalkIndex>,
+        derive: bool,
     ) -> StoredChains {
-        let lcs_cap = if lcs.is_some() { lcs_cap.max(1) } else { 0 };
+        let lcs_cap = if index.is_some() { lcs_cap.max(1) } else { 0 };
         let max_direct = max_direct_suffix_len(k);
         let n_junctions = self.junction_weights.len();
 
@@ -129,8 +130,9 @@ impl ChainCsr {
         assert!(max_colex < SOURCE_COLEX, "colex rank collides with dummy node ranks");
         let colex_bound = max_colex + 1;
 
-        let walk = walk.map(|index| {
-            let streaming = StreamingIndex::new(index.sbwt, index.lcs.expect("storing node walks needs the LCS array"));
+        let walk = derive.then(|| {
+            let index = index.expect("deriving nodes needs the index");
+            let streaming = StreamingIndex::new(index.sbwt, index.lcs.expect("deriving nodes needs the LCS array"));
             (index, streaming)
         });
         let derived = walk.is_some();
@@ -151,7 +153,7 @@ impl ChainCsr {
                     let source = if i == 0 { self.junction_weights[junction] } else { inner[i - 1] };
                     let from_source = junction == SOURCE_NODE as usize && i == 0;
                     if !from_source {
-                        let context = if lcs_cap > 0 { lcs.unwrap()(source).min(lcs_cap) as usize } else { 0 };
+                        let context = index.map_or(0, |index| index.lcs_at(source as usize).min(lcs_cap as usize));
                         model.code(&mut suffix_lens, context, len).expect("suffix length encode");
                     }
                     let pred = (!from_source).then_some((source, len));
@@ -189,18 +191,17 @@ impl ChainCsr {
     pub fn from_stored(
         stored: StoredChains,
     ) -> Result<Self, GraphDecodeError> {
-        Self::from_stored_with(stored, None, None, None)
+        Self::from_stored_with(stored, None, None)
     }
 
-    /// Same as [ChainCsr::from_stored]; `lcs` must give the LCS array value
-    /// of a colex rank if the chains were stored with LCS contexts, `k` must
-    /// be the _k_-mer size they were stored with (None for _k_ ≤ 255), and
-    /// `walk` the index if nodes were derived by walks.
+    /// Same as [ChainCsr::from_stored]; `index` is needed if the chains were
+    /// stored with it (LCS contexts or derived nodes; its LCS array is
+    /// optional, the values are otherwise computed from the SBWT), and `k`
+    /// must be the _k_-mer size they were stored with (None for _k_ ≤ 255).
     pub fn from_stored_with(
         stored: StoredChains,
-        lcs: Option<LcsLookup>,
+        index: Option<WalkIndex>,
         k: Option<u32>,
-        walk: Option<WalkIndex>,
     ) -> Result<Self, GraphDecodeError> {
         let max_direct = max_direct_suffix_len(k);
         if stored.max_direct != max_direct {
@@ -238,16 +239,14 @@ impl ChainCsr {
         let n_inner = *chain_ptrs.last().unwrap() as usize;
 
         let lcs_cap = stored.lcs_cap as u32;
-        let lcs = match (lcs_cap, lcs) {
-            (0, _) => None,
-            (_, Some(lcs)) => Some(lcs),
-            (_, None) => return Err(GraphDecodeError("stored chains: the suffix lengths need the LCS array".to_string())),
-        };
-        let walk = match (stored.derived, walk) {
-            (false, _) => None,
-            (true, Some(walk)) => Some(walk),
-            (true, None) => return Err(GraphDecodeError("stored chains: the derived nodes need the index".to_string())),
-        };
+        if index.is_none() && lcs_cap > 0 {
+            return Err(GraphDecodeError("stored chains: the suffix lengths need the index".to_string()))
+        }
+        if index.is_none() && stored.derived {
+            return Err(GraphDecodeError("stored chains: the derived nodes need the index".to_string()))
+        }
+        let lcs = if lcs_cap > 0 { index } else { None };
+        let walk = if stored.derived { index } else { None };
 
         // The targets set the node order: stored first, or with walks coded
         // where each chain ends.
@@ -296,10 +295,7 @@ impl ChainCsr {
                     let len = if from_source {
                         contig_lens[chain] as u32
                     } else {
-                        let context = match lcs {
-                            None => 0,
-                            Some(lcs) => lcs(source).min(lcs_cap) as usize,
-                        };
+                        let context = lcs.map_or(0, |index| index.lcs_at(source as usize).min(lcs_cap as usize));
                         model.code(&mut coded, context, 0).ok_or_else(|| truncated("suffix lengths"))?
                     };
                     suffix_lens.push(len);
@@ -461,26 +457,19 @@ mod tests {
 
         // For k <= 255 the coding is the same as without k.
         for k in [Some(31), Some(255)] {
-            assert_eq!(postcard::to_allocvec(&chains.to_stored_with(None, 0, k, None)).unwrap(), postcard::to_allocvec(&chains.to_stored()).unwrap());
+            assert_eq!(postcard::to_allocvec(&chains.to_stored_with(None, 0, k, false)).unwrap(), postcard::to_allocvec(&chains.to_stored()).unwrap());
         }
         assert_eq!(max_direct_suffix_len(Some(63)), MIN_DIRECT_SUFFIX_LEN);
         assert_eq!(max_direct_suffix_len(Some(300)), 300);
 
         // With k = 300 every length up to 300 is coded directly, and the chains
         // only decode with the same k.
-        let stored = chains.to_stored_with(None, 0, Some(300), None);
+        let stored = chains.to_stored_with(None, 0, Some(300), false);
         assert_eq!(stored.max_direct, 300);
         assert_eq!(chains.to_stored().max_direct, MIN_DIRECT_SUFFIX_LEN);
-        assert_eq!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300), None), None, Some(300), None).unwrap(), chains);
-        assert!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300), None), None, None, None).is_err());
-        assert!(ChainCsr::from_stored_with(chains.to_stored(), None, Some(300), None).is_err());
-
-        // The same with LCS contexts.
-        let lcs = |rank: u32| rank % 7;
-        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300), None);
-        assert_eq!(ChainCsr::from_stored_with(stored, Some(&lcs), Some(300), None).unwrap(), chains);
-        let stored = chains.to_stored_with(Some(&lcs), max_direct_suffix_len(Some(300)), Some(300), None);
-        assert!(ChainCsr::from_stored_with(stored, Some(&lcs), None, None).is_err());
+        assert_eq!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300), false), None, Some(300)).unwrap(), chains);
+        assert!(ChainCsr::from_stored_with(chains.to_stored_with(None, 0, Some(300), false), None, None).is_err());
+        assert!(ChainCsr::from_stored_with(chains.to_stored(), None, Some(300)).is_err());
     }
 
     #[test]

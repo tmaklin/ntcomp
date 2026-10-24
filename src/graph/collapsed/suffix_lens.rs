@@ -55,8 +55,6 @@ pub fn max_direct_suffix_len(
     k.unwrap_or(0).max(MIN_DIRECT_SUFFIX_LEN)
 }
 
-/// LCS array value of a colex rank, see [LcsSource](crate::graph::LcsSource).
-pub type LcsLookup<'a> = &'a (dyn Fn(u32) -> u32 + Sync);
 
 /// Adaptive models of the suffix lengths (see the module docs) for
 /// `n_contexts` contexts and direct lengths up to `max_direct`.

@@ -68,7 +68,7 @@ pub mod topology;
 pub use crate::walk::WalkIndex;
 pub use nodes::TARGET_MODELLED_BITS;
 pub use stored::StoredChains;
-pub use suffix_lens::{max_direct_suffix_len, LcsLookup, MIN_DIRECT_SUFFIX_LEN};
+pub use suffix_lens::{max_direct_suffix_len, MIN_DIRECT_SUFFIX_LEN};
 
 /// Graph of linear chains between junctions, in compressed sparse row format.
 ///
