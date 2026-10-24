@@ -11,25 +11,19 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
-use ntcomp::graph::GraphWalk;
-
+use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
-use std::path::PathBuf;
-
-use std::fs::File;
-
-use ntcomp::graph::{contig_hash, ContigHash};
-
-use indicatif::ProgressBar;
-use indicatif::ProgressStyle;
 
 use clap::Parser;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use log::info;
-use needletail::Sequence;
-use needletail::parser::SequenceRecord;
-
 use rayon::prelude::*;
+
+use ntcomp::archive::InputFile;
+use ntcomp::fastx;
+use ntcomp::{ArchiveReader, ArchiveWriter};
 
 mod cli;
 
@@ -44,121 +38,42 @@ fn init_log(log_max_level: usize) {
     .unwrap();
 }
 
-// Given a needletail parser, reads the next contig sequence
-fn read_from_fastx_parser(
-    reader: &mut dyn needletail::parser::FastxReader,
-) -> Option<SequenceRecord<'_>> {
-    let rec = reader.next();
-    match rec {
-        Some(Ok(seqrec)) => {
-            Some(seqrec)
-        },
-        None => None,
-        Some(Err(_)) => todo!(),
+/// Exits with an error message instead of a panic.
+trait OrExit<T> {
+    fn or_exit(self) -> T;
+}
+
+impl<T, D: std::fmt::Display> OrExit<T> for Result<T, D> {
+    fn or_exit(self) -> T {
+        self.unwrap_or_else(|e| {
+            eprintln!("ntcomp: {}", e);
+            std::process::exit(1)
+        })
     }
 }
 
-// Reads all sequence data from a fastX file
-fn read_fastx_file(
-    file: &str,
-) -> Vec<(String, Vec<u8>)> {
-    let mut seq_data: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Expected valid fastX file at {}", file));
-    while let Some(rec) = read_from_fastx_parser(&mut *reader) {
-        let seqrec = rec.normalize(true);
-        let seqname = String::from_utf8(rec.id().to_vec()).expect("UTF-8");
-        seq_data.push((seqname, seqrec.to_vec()));
+/// The input files: `files`, then those listed in `input_list`.
+fn input_files(
+    files: &[String],
+    input_list: &Option<String>,
+) -> Vec<String> {
+    let mut in_files = files.to_vec();
+    if let Some(list) = input_list {
+        in_files.extend(cli::read_input_list(list, b'\t').or_exit());
     }
-    seq_data
+    in_files
 }
 
-fn read_input_list(
-    input_list_file: &String,
-    delimiter: u8
-) -> Vec<(String, PathBuf)> {
-    let fs = match std::fs::File::open(input_list_file) {
-        Ok(fs) => fs,
-        Err(e) => panic!("  Error in reading --input-list: {}", e),
-    };
-
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(false)
-        .from_reader(fs);
-
-    reader.records().map(|line| {
-        if let Ok(record) = line {
-            if record.len() > 1 {
-                (record[0].to_string(), PathBuf::from(record[1].to_string()))
-            } else {
-                (record[0].to_string(), PathBuf::from(record[0].to_string()))
-            }
-        } else {
-            panic!("  Error in reading --input-list: {}", input_list_file);
-        }
-    }).collect::<Vec<(String, PathBuf)>>()
-}
-
-/// Contig names and normalized sequences of `query_file`.
-fn read_contigs(
-    query_file: &PathBuf,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
-    let mut contigs = Vec::new();
-    while let Some(rec) = read_from_fastx_parser(&mut *reader) {
-        contigs.push((rec.id().to_vec(), rec.normalize(true).to_vec()));
-    }
-    contigs
-}
-
-/// Decodes the stored (edited) sequence of `color` from the graph, before the
-/// SNPs are put back.
-fn decode_edited(
-    color: u32,
-    graph: &ntcomp::graph::StoredGraph,
-    choices: &ntcomp::graph::Choices,
-    sbwt: &sbwt::sbwt_index_variant::SbwtIndexVariant,
-    lcs: &sbwt::LcsArray,
-) -> Result<Vec<u8>, String> {
-    let sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(index) = sbwt;
-
-    let (sequence_length, dictionary) = graph.walk_path(choices, color).map_err(|e| e.to_string())?;
-    let k = index.k() as u32;
-    let dictionary = dictionary.into_iter().map(|(colex_rank, len)| (colex_rank, ntcomp::nlz::SuffixLen::from_stored(len, k))).collect();
-
-    ntcomp::nlz::decode_dictionary(dictionary, sequence_length as usize, sbwt, Some(lcs)).map_err(|e| e.to_string())
-}
-
-/// Contexts of SNPs in edited sequences, by colour and position, for putting
-/// back repeated SNPs (see [ntcomp::graph::snps]).
-type SnpContexts = std::collections::HashMap<(u32, u32), [u8; ntcomp::graph::snps::CONTEXT]>;
-
-/// Puts the SNPs of `color` back into its edited sequence, restores its
-/// strand and checks its hash. Returns the sequence and whether the hash
-/// matches (None if the archive has no hashes).
-fn finish_color(
-    color: u32,
-    mut sequence: Vec<u8>,
-    hashes: &Option<Vec<ContigHash>>,
-    reversed: &Option<Vec<bool>>,
-    snp_edits: &Option<ntcomp::graph::snps::SnpEdits>,
-    contexts: &SnpContexts,
-) -> Result<(Vec<u8>, Option<bool>), String> {
-    let idx = color as usize;
-    // Edited SNPs are put back on the stored strand.
-    if let Some(snp_edits) = snp_edits {
-        snp_edits.revert(color, &mut sequence, &|f, pos| contexts.get(&(f, pos)).copied()).map_err(|e| e.to_string())?;
-    }
-    // Contigs stored on the other strand are reverse complemented back.
-    let sequence = if reversed.as_ref().is_some_and(|r| r[idx]) {
-        ntcomp::strands::reverse_complement(&sequence)
-    } else {
-        sequence
-    };
-
-    // Not checked if the archive has no hashes.
-    let hash_match = hashes.as_ref().map(|hashes| contig_hash(&sequence) == hashes[idx]);
-    Ok((sequence, hash_match))
+/// Reads `files` in parallel, as archive inputs named by their file name
+/// without extensions.
+fn read_input_files(
+    files: &[std::path::PathBuf],
+) -> Vec<InputFile> {
+    files.par_iter().map(|path| {
+        let contigs = fastx::read_contigs(path).map_err(|e| e.to_string())?;
+        let name = path.file_prefix().unwrap_or_default().as_encoded_bytes().to_vec();
+        Ok((name, contigs))
+    }).collect::<Result<Vec<InputFile>, String>>().or_exit()
 }
 
 fn main() {
@@ -191,31 +106,19 @@ fn main() {
             sbwt_build_options.add_revcomp = true;
             sbwt_build_options.build_select = true;
 
-            let mut in_files = seq_files.clone();
-            if let Some(list) = input_list {
-                let contents = read_input_list(list, b'\t');
-                let contents_iter = contents.iter().map(|(_, path)| path.to_str().unwrap().to_string());
-                in_files.extend(contents_iter);
-            }
-
+            let in_files = input_files(seq_files, input_list);
             info!("Building SBWT index from {} files...", in_files.len());
             let mut seq_data: Vec<Vec<u8>> = Vec::new();
-            in_files.iter().for_each(|file| {
-                if file.ends_with(".tigs.tac") {
-                    // index tigs written by `ntcomp tigs`
-                    let reader = std::io::BufReader::new(File::open(file).unwrap_or_else(|_| panic!("Expected tigs at {}", file)));
-                    seq_data.append(&mut ntcomp::tigs::read_tigs(reader).unwrap_or_else(|e| panic!("Could not read tigs from {}: {}", file, e)));
-                } else {
-                    seq_data.append(&mut read_fastx_file(file).into_iter().map(|(_, seq)| seq).collect::<Vec<Vec<u8>>>());
-                }
-            });
+            for file in &in_files {
+                seq_data.append(&mut fastx::read_sequences(file).or_exit());
+            }
 
             let (sbwt, lcs) = kbo::build(&seq_data, sbwt_build_options);
 
-            info!("Serializing SBWT index to {}.sbwt ...", output_prefix.as_ref().unwrap());
-            info!("Serializing LCS array to {}.lcs ...", output_prefix.as_ref().unwrap());
-            kbo::index::serialize_sbwt(output_prefix.as_ref().unwrap(), &sbwt, &lcs);
-
+            let output_prefix = output_prefix.as_ref().unwrap();
+            info!("Serializing SBWT index to {}.sbwt ...", output_prefix);
+            info!("Serializing LCS array to {}.lcs ...", output_prefix);
+            kbo::index::serialize_sbwt(output_prefix, &sbwt, &lcs);
         },
         Some(cli::Commands::Tigs {
             seq_files,
@@ -240,11 +143,7 @@ fn main() {
         }) => {
             init_log(if *verbose { 2 } else { 1 });
 
-            let mut in_files = seq_files.clone();
-            if let Some(list) = input_list {
-                let contents = read_input_list(list, b'\t');
-                in_files.extend(contents.iter().map(|(_, path)| path.to_str().unwrap().to_string()));
-            }
+            let in_files = input_files(seq_files, input_list);
 
             // The indexes are built on disk: in memory, sorting the k-mers takes
             // k / 4 bytes each.
@@ -252,7 +151,7 @@ fn main() {
                 Some(dir) => (dir.clone(), false),
                 None => (format!("{}.tmp", output_prefix), true),
             };
-            std::fs::create_dir_all(&temp_dir).unwrap_or_else(|e| panic!("Could not create {}: {}", temp_dir, e));
+            std::fs::create_dir_all(&temp_dir).map_err(|e| format!("creating {}: {}", temp_dir, e)).or_exit();
 
             let mut opts = ntcomp::tigs::TigOpts::default();
             opts.min_assemblies = *min_assemblies;
@@ -272,7 +171,7 @@ fn main() {
             opts.build_opts.temp_dir = Some(temp_dir.clone());
 
             info!("Choosing the index k-mers from {} inputs...", in_files.len());
-            let read = |file: &String| read_fastx_file(file).into_iter().map(|(_, seq)| seq).collect::<Vec<Vec<u8>>>();
+            let read = |file: &String| fastx::read_contigs(file).or_exit().into_iter().map(|(_, sequence)| sequence).collect::<Vec<Vec<u8>>>();
             let result = ntcomp::tigs::build(&in_files, &read, &opts, &|msg| info!("{}", msg));
             if own_temp_dir {
                 let _ = std::fs::remove_dir_all(&temp_dir);
@@ -283,18 +182,17 @@ fn main() {
 
             let tigs_path = format!("{}.tigs.tac", output_prefix);
             info!("Writing {}...", tigs_path);
-            let out = BufWriter::new(File::create(&tigs_path).unwrap_or_else(|_| panic!("Could not create {}", tigs_path)));
-            ntcomp::tigs::write_tigs(&result.tigs, *kmer_size, out).unwrap_or_else(|e| panic!("Could not write {}: {}", tigs_path, e)).flush().unwrap();
+            let out = BufWriter::new(File::create(&tigs_path).map_err(|e| format!("creating {}: {}", tigs_path, e)).or_exit());
+            ntcomp::tigs::write_tigs(&result.tigs, *kmer_size, out).map_err(|e| format!("writing {}: {}", tigs_path, e)).or_exit().flush().or_exit();
 
             if *fasta {
                 let fasta_path = format!("{}.tigs.fasta", output_prefix);
                 info!("Writing {}...", fasta_path);
-                let mut out = BufWriter::new(File::create(&fasta_path).unwrap_or_else(|_| panic!("Could not create {}", fasta_path)));
+                let mut out = BufWriter::new(File::create(&fasta_path).map_err(|e| format!("creating {}: {}", fasta_path, e)).or_exit());
                 for (i, tig) in result.tigs.iter().enumerate() {
-                    writeln!(out, ">{}", i).unwrap();
-                    out.write_all(tig).unwrap();
-                    out.write_all(b"\n").unwrap();
+                    fastx::write_fasta(&mut out, i.to_string().as_bytes(), tig, usize::MAX).or_exit();
                 }
+                out.flush().or_exit();
             }
             if *index {
                 info!("Serializing the index to {}.sbwt and {}.lcs ...", output_prefix, output_prefix);
@@ -308,38 +206,12 @@ fn main() {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
             info!("Loading SBWT index...");
-
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
-            // Number of records to store in each block
-            let block_size = 65536;
-
-            let _ = ntcomp::nlz::legacy::write_header(&mut stdout);
-
             info!("Encoding fastX data...");
-            let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
-            let mut dictionaries: Vec<Vec<(usize, std::ops::Range<usize>)>> = Vec::new();
-            let mut num_records = 0;
-
-            while let Some(rec) = read_from_fastx_parser(&mut *reader) {
-                let seqrec = rec.normalize(true);
-                num_records += 1;
-
-                dictionaries.push(ntcomp::nlz::parse(&seqrec, &sbwt, &lcs).unwrap().0);
-
-                if num_records % block_size == 0 {
-                    let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::nlz::legacy::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
-                    let _ = ntcomp::nlz::legacy::write_block_to(&u64_encoding, block_size, &mut stdout);
-                    dictionaries.clear();
-                }
-            }
-            if num_records % block_size != 0 {
-                let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::nlz::legacy::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
-                let _ = ntcomp::nlz::legacy::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
-            }
-
-            let _ = stdout.flush();
-            // TODO rewind back to start and fill file header
+            let contigs = fastx::read_contigs(query_file).or_exit();
+            ntcomp::nlz::legacy::write_file(contigs.iter().map(|(_, sequence)| sequence), &sbwt, &lcs, &mut stdout).or_exit();
+            stdout.flush().or_exit();
         },
 
         Some(cli::Commands::Decode {
@@ -348,27 +220,19 @@ fn main() {
         }) => {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
-            // info!("Loading SBWT index...");
             let (sbwt, _) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
-
-            // info!("Reading encoded data...");
-            let mut conn = std::fs::File::open(input_path).unwrap();
-
-            // File header
-            let _ = ntcomp::nlz::legacy::read_header(&mut conn);
+            let mut input = File::open(input_path).map_err(|e| format!("{}: {}", input_path.display(), e)).or_exit();
 
             info!("Decoding encoded data...");
             let mut i = 0;
-            while let Ok(encoding) = ntcomp::nlz::legacy::read_block(&mut conn) {
-                let records = ntcomp::nlz::legacy::decode_sequence(&encoding, &sbwt);
-                records.iter().for_each(|nucleotides| {
-                    let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
-                    let _ = writeln!(&mut stdout,
-                                     "{}", nucleotides.iter().map(|x| *x as char).collect::<String>());
-                    let _ = stdout.flush();
-                    i += 1;
-                });
-            }
+            ntcomp::nlz::legacy::read_file(&mut input, &sbwt, |nucleotides| {
+                i += 1;
+                writeln!(&mut stdout, ">seq.{}", i)?;
+                stdout.write_all(&nucleotides)?;
+                stdout.write_all(b"\n")?;
+                Ok(())
+            }).or_exit();
+            stdout.flush().or_exit();
         },
         Some(cli::Commands::Graph {
             query_files,
@@ -398,119 +262,74 @@ fn main() {
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
             if *decompress {
-                assert!(query_files.len() == 1);
-                let mut input = std::io::BufReader::new(File::open(&query_files[0]).unwrap());
-
-                let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
-                let header = decoder.header();
-                let (graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits) = decoder.decode_from_read_with_index(&sbwt, Some(&lcs)).unwrap();
+                if query_files.len() != 1 {
+                    eprintln!("ntcomp: decompressing takes one archive, got {}", query_files.len());
+                    std::process::exit(1);
+                }
+                let archive_path = query_files[0].to_string_lossy();
+                let in_archive = |e: &dyn std::fmt::Display| format!("archive {}: {}", archive_path, e);
+                let mut input = std::io::BufReader::new(File::open(&query_files[0]).map_err(|e| in_archive(&e)).or_exit());
+                let archive = ArchiveReader::open(&mut input, &sbwt, &lcs).map_err(|e| in_archive(&e)).or_exit();
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
-                if !contigs.is_empty() && contig_names.is_none() {
-                    eprintln!("ntcomp: archive {} has no contig names", query_files[0].to_string_lossy());
-                    std::process::exit(1);
-                }
                 for name in contigs {
-                    let matches: Vec<u32> = contig_names.iter().flatten().enumerate()
-                        .filter(|(_, x)| x.as_slice() == name.as_bytes() || x.split(|c| *c == b' ').next() == Some(name.as_bytes()))
-                        .map(|(i, _)| i as u32)
-                        .collect();
-                    if matches.is_empty() {
-                        eprintln!("ntcomp: contig {} not found in archive {}", name, query_files[0].to_string_lossy());
-                        std::process::exit(1);
-                    }
-                    want_colors.extend(matches);
+                    want_colors.extend(archive.find_contig(name).map_err(|e| in_archive(&e)).or_exit());
                 }
                 if want_colors.is_empty() {
-                    want_colors = (0..header.n_queries).collect();
+                    want_colors = (0..archive.n_contigs()).collect();
                 }
-                if let Some(bad) = want_colors.iter().find(|&&c| c >= header.n_queries) {
-                    eprintln!("ntcomp: color {} out of range (archive {} contains {} contigs)", bad, query_files[0].to_string_lossy(), header.n_queries);
-                    std::process::exit(1);
-                }
+                let mut decoder = archive.decoder(&want_colors).map_err(|e| in_archive(&e)).or_exit();
 
                 if !fasta {
                     eprintln!("color\taccession\tcontig\tdecoded_len\thash_match\tseconds");
                 }
                 // Colours are decoded in parallel in chunks of about `batch_size` input
                 // files' worth of contigs, and written in the requested order.
-                let n_files = file_ranges.as_ref().map_or(0, |ranges| ranges.len()).max(1);
-                let chunk_size = batch_size * (header.n_queries as usize).div_ceil(n_files).max(1);
-                // Repeated SNPs are located by contexts from the edited sequences of
-                // earlier colours: the positions needed, by colour.
-                let mut wanted_contexts: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-                if let Some(edits) = &snp_edits {
-                    for &color in &want_colors {
-                        for (f, pos) in edits.context_sources(color) { wanted_contexts.entry(f).or_default().push(pos); }
-                    }
-                }
-                let mut contexts: SnpContexts = SnpContexts::new();
-                let record = |contexts: &mut SnpContexts, color: u32, edited: &[u8]| {
-                    for &pos in wanted_contexts.get(&color).map_or(&[][..], |v| v.as_slice()) {
-                        if let Some(context) = ntcomp::graph::snps::context_at(edited, pos as usize) { contexts.insert((color, pos), context); }
-                    }
-                };
+                let chunk_size = batch_size * (archive.n_contigs() as usize).div_ceil(archive.n_files().max(1)).max(1);
+                let mut failed = false;
                 for chunk in want_colors.chunks(chunk_size) {
                     let start_time = std::time::Instant::now();
-                    let edited: Vec<Result<Vec<u8>, String>> = chunk.par_iter().map(|&color| {
-                        decode_edited(color, &graph, &choices, &sbwt, &lcs)
-                    }).collect();
-                    for (&color, sequence) in chunk.iter().zip(&edited) {
-                        if let Ok(sequence) = sequence { record(&mut contexts, color, sequence); }
-                    }
-                    // Contexts from colours not decoded yet (random access).
-                    if let Some(edits) = &snp_edits {
-                        let mut missing: Vec<u32> = chunk.iter().flat_map(|&c| edits.context_sources(c)).filter(|key| !contexts.contains_key(key)).map(|(f, _)| f).collect();
-                        missing.sort_unstable();
-                        missing.dedup();
-                        let sources: Vec<(u32, Result<Vec<u8>, String>)> = missing.par_iter().map(|&f| (f, decode_edited(f, &graph, &choices, &sbwt, &lcs))).collect();
-                        for (f, sequence) in sources {
-                            let sequence = sequence.unwrap_or_else(|e| panic!("decoding color {f} failed: {e}"));
-                            record(&mut contexts, f, &sequence);
-                        }
-                    }
+                    let decoded = decoder.decode(chunk).map_err(|e| in_archive(&e)).or_exit();
                     let seconds = start_time.elapsed().as_secs_f64() / chunk.len() as f64;
-                    let decoded: Vec<Result<(Vec<u8>, Option<bool>, f64), String>> = chunk.par_iter().zip(edited.into_par_iter()).map(|(&color, sequence)| {
-                        finish_color(color, sequence?, &hashes, &reversed, &snp_edits, &contexts).map(|(s, h)| (s, h, seconds))
-                    }).collect();
 
                     for (&color, decoded) in chunk.iter().zip(decoded) {
-                        let idx = color as usize;
-                        let (sequence, hash_match, seconds) = decoded.unwrap_or_else(|e| panic!("decoding color {color} failed: {e}"));
-                        assert!(hash_match != Some(false), "hash mismatch for color {color}");
-
-                        let contig_name: Vec<u8> = contig_names.as_ref().map_or_else(|| format!("color_{}", color).into_bytes(), |names| names[idx].clone());
+                        let contig = match decoded {
+                            Ok(contig) => contig,
+                            Err(e) => {
+                                eprintln!("ntcomp: {}", in_archive(&e));
+                                failed = true;
+                                continue
+                            },
+                        };
+                        failed |= contig.hash_match == Some(false);
+                        let contig_name: Vec<u8> = archive.contig_name(color).map_or_else(|| format!("color_{}", color).into_bytes(), |name| name.to_vec());
                         if !fasta {
-                            let file_name = file_ranges.as_ref()
-                                .and_then(|ranges| ranges.iter().position(|(_, range)| range.contains(&color)).map(|i| String::from_utf8_lossy(&ranges[i].0).to_string()))
-                                .unwrap_or("NA".to_string());
-                            let hash_match = hash_match.map_or("NA".to_string(), |x| x.to_string());
-                            eprintln!("{}\t{}\t{}\t{}\t{}\t{:.3}", color, file_name, String::from_utf8_lossy(&contig_name), sequence.len(), hash_match, seconds);
+                            let file_name = archive.file_name(color).map_or("NA".to_string(), |name| String::from_utf8_lossy(name).to_string());
+                            let hash_match = contig.hash_match.map_or("NA".to_string(), |x| x.to_string());
+                            eprintln!("{}\t{}\t{}\t{}\t{}\t{:.3}", color, file_name, String::from_utf8_lossy(&contig_name), contig.sequence.len(), hash_match, seconds);
                         } else {
-                            stdout.write_all(b">").unwrap();
-                            stdout.write_all(&contig_name).unwrap();
-                            stdout.write_all(b"\n").unwrap();
-                            sequence.chunks(*fasta_columns).for_each(|chunk| {
-                                stdout.write_all(chunk).unwrap();
-                                stdout.write_all(b"\n").unwrap();
-                            });
+                            fastx::write_fasta(&mut stdout, &contig_name, &contig.sequence, *fasta_columns).or_exit();
                         }
                     }
                 }
-                stdout.flush().unwrap();
+                stdout.flush().or_exit();
+                if failed {
+                    std::process::exit(1);
+                }
             } else {
                 let n_queries = query_files.len();
 
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let mut builder = ntcomp::graph::GraphBuilder::new()
+                let builder = ntcomp::graph::GraphBuilder::new()
                     .collapse_chains(*collapse_chains)
                     .reorient_contigs(*reorient)
                     .reorient_sampling(*reorient_sampling)
                     .edit_snps(*edit_snps)
                     .edit_snps_max_shared(edit_snps_max_shared.map_or(ntcomp::graph::snps::DEFAULT_MAX_SHARED, |max| max as usize));
+                let mut writer = ArchiveWriter::new(builder, &sbwt, &lcs);
 
                 // First pass for SNP editing: choose the strands and call the SNPs of every
                 // contig, `batch_size` input files at a time.
@@ -518,66 +337,27 @@ fn main() {
                     let progress = ProgressBar::new(n_queries as u64);
                     progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} calling SNPs").unwrap());
                     for batch in query_files.chunks(batch_size) {
-                        let contigs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = batch.par_iter().map(read_contigs).collect();
-                        let sequences: Vec<&[u8]> = contigs.iter().flatten().map(|(_, seq)| seq.as_slice()).collect();
-                        let called = builder.call_edits_batch(&sequences, &sbwt, &lcs);
+                        let called = writer.call_edits(&read_input_files(batch));
                         info!("Called SNPs of colors {}..={}", called.first().map_or(0, |c| *c), called.last().map_or(0, |c| *c));
                         progress.inc(batch.len() as u64);
                     }
                     progress.finish();
                 }
 
-                // Hash of every (normalized) input contig, checked after decoding
-                let mut hashes: Vec<ContigHash> = Vec::new();
-
-                let mut contig_names: Vec<Vec<u8>> = Vec::with_capacity(n_queries);
-                let mut file_ranges: Vec<(Vec<u8>, core::ops::Range<u32>)> = Vec::with_capacity(n_queries);
-
-                let mut color: u32 = 0;
                 for batch in query_files.chunks(batch_size) {
-                    let contigs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = batch.par_iter().map(read_contigs).collect();
-                    let sequences: Vec<&[u8]> = contigs.iter().flatten().map(|(_, seq)| seq.as_slice()).collect();
-                    hashes.par_extend(sequences.par_iter().map(|seq| contig_hash(seq)));
-
-                    let added = builder.add_contigs(&sequences, &sbwt, &lcs).unwrap();
+                    let added = writer.add_files(&read_input_files(batch)).or_exit();
                     for &added in &added {
-                        info!("Encoded color {}{}", added, if builder.reversed()[added as usize] { " (reverse complemented)" } else { "" });
+                        info!("Encoded color {}{}", added, if writer.reversed()[added as usize] { " (reverse complemented)" } else { "" });
                     }
-
-                    for (query_file, file_contigs) in batch.iter().zip(&contigs) {
-                        let start = color;
-                        for (name, _) in file_contigs {
-                            contig_names.push(name.clone());
-                            assert_eq!(added[(color - added[0]) as usize], color);
-                            color += 1;
-                        }
-                        let filename: Vec<u8> = query_file.file_prefix().unwrap().as_encoded_bytes().to_vec();
-                        file_ranges.push((filename, start..color));
-                    }
-
                     progress.inc(batch.len() as u64);
                 }
                 progress.finish();
 
-                let reversed = builder.reversed().to_vec();
-                let snp_edits = builder.snp_edits();
-                let (graph, choices) = builder.finish();
-
-                let mut encoder = ntcomp::graph::encoder::GraphEncoder::new(graph, choices)
-                    .with_hashes(hashes)
-                    .with_contig_names(contig_names)
-                    .with_file_ranges(file_ranges)
-                    .with_reversed(reversed)
-                    .with_index(&sbwt, &lcs);
-                if let Some(snp_edits) = snp_edits {
-                    encoder = encoder.with_snp_edits(snp_edits);
-                }
-
-                let sizes = encoder.encode_to_write(&mut stdout).unwrap();
+                let sizes = writer.write(&mut stdout).or_exit();
                 info!("{}", sizes);
             }
 
-            let _ = stdout.flush();
+            stdout.flush().or_exit();
         },
         #[cfg(feature = "graph-view")]
         Some(cli::Commands::GraphView {
@@ -589,19 +369,14 @@ fn main() {
 
             let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
 
-            let mut input = std::io::BufReader::new(File::open(&input_path).unwrap());
-            let decoder = ntcomp::graph::decoder::GraphDecoder::new(&mut input).unwrap();
-            let header = decoder.header();
-            let (stored_graph, choices, _hashes, _contig_names, _file_ranges, _reversed, _snp_edits) = decoder.decode_from_read_with_index(&sbwt, Some(&lcs)).unwrap();
-
+            let mut input = std::io::BufReader::new(File::open(input_path).map_err(|e| format!("{}: {}", input_path.display(), e)).or_exit());
+            let archive = ArchiveReader::open(&mut input, &sbwt, &lcs).or_exit();
+            if *color >= archive.n_contigs() as usize {
+                eprintln!("ntcomp: color {} out of range ({} contigs)", color, archive.n_contigs());
+                std::process::exit(1);
+            }
             // Colour sets are not stored, recover them by walking every colour.
-            let graph: petgraph::graph::Graph<u32, ntcomp::graph::ColexGraphEdge> = {
-                let csr = stored_graph.into_csr();
-                let colorsets = csr.colorsets(&choices, header.n_queries).unwrap();
-                csr.to_petgraph(&colorsets)
-            };
-
-            let colors: Vec<u32> = (0..header.n_queries).collect();
+            let graph = archive.to_petgraph().or_exit();
 
             let native_options = eframe::NativeOptions::default();
             let ret = eframe::run_native(
@@ -610,7 +385,7 @@ fn main() {
                 Box::new(|_| Ok(Box::new
                                  (ntcomp::graphview::BasicApp::new(
                                      graph,
-                                     colors[*color],
+                                     *color as u32,
                                  )))),
             );
             ret.unwrap();

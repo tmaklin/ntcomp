@@ -227,6 +227,24 @@ pub enum Commands {
     },
 }
 
+/// The input files listed in `input_list_file`: a path, or a name and a path
+/// separated by `delimiter`, on each line.
+pub fn read_input_list(
+    input_list_file: &str,
+    delimiter: u8,
+) -> Result<Vec<String>, String> {
+    let error = |e: &dyn std::fmt::Display| format!("reading --input-list {}: {}", input_list_file, e);
+    let fs = std::fs::File::open(input_list_file).map_err(|e| error(&e))?;
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .from_reader(fs);
+    reader.records().map(|line| {
+        let record = line.map_err(|e| error(&e))?;
+        Ok(record[record.len().min(2) - 1].to_string())
+    }).collect()
+}
+
 /// Parses a gap length range: `<min>-<max>`, `<min>-inf` or `none`.
 fn parse_gap_range(s: &str) -> Result<ntcomp::tigs::GapRange, String> {
     if s == "none" { return Ok(None) }

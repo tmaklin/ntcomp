@@ -13,6 +13,8 @@
 //
 //! ntcomp: compressing assemblies against an SBWT index.
 //!
+//! - [archive]: compressing collections of assemblies into an archive and
+//!   decompressing any of their contigs ([ArchiveWriter], [ArchiveReader]);
 //! - [nlz]: the NLZ dictionaries of sequences against the index, and the
 //!   plain NLZ file format;
 //! - [graph]: NLZ-OG, the dictionaries of many sequences as coloured paths in
@@ -20,10 +22,13 @@
 //! - [tigs]: the index tigs, the _k_-mer set of the index;
 //! - [walk]: walking the de Bruijn graph of the index; [edits]: SNPs and
 //!   small indels towards the index; [strands]: choosing the strand of each
-//!   contig; [codecs]: the codecs shared by the formats.
+//!   contig; [codecs]: the codecs shared by the formats; [fastx]: reading
+//!   and writing FASTA and FASTQ files.
 //!
+pub mod archive;
 pub mod codecs;
 pub mod edits;
+pub mod fastx;
 pub mod graph;
 pub mod nlz;
 pub mod strands;
@@ -31,6 +36,8 @@ pub mod walk;
 pub mod tigs;
 #[cfg(feature = "graph-view")]
 pub mod graphview;
+
+pub use archive::{ArchiveReader, ArchiveWriter};
 
 /// Test data shared by the modules' tests.
 #[cfg(test)]

@@ -36,6 +36,63 @@ type E = Box<dyn std::error::Error>;
 /// Size of the (unused, all zero) file header.
 pub const HEADER_BYTES: usize = 50;
 
+/// Records (sequences) per block.
+pub const BLOCK_RECORDS: usize = 65536;
+
+/// Writes the plain NLZ file of `sequences` (normalized, see
+/// [crate::fastx::read_contigs]) parsed against `sbwt` with its LCS array
+/// `lcs`: the header, then blocks of [BLOCK_RECORDS] sequences.
+pub fn write_file<W: std::io::Write, S: AsRef<[u8]>>(
+    sequences: impl IntoIterator<Item = S>,
+    sbwt: &SbwtIndexVariant,
+    lcs: &sbwt::LcsArray,
+    out: &mut W,
+) -> Result<(), E> {
+    write_header(out)?;
+    let mut dictionaries = Vec::with_capacity(BLOCK_RECORDS);
+    for sequence in sequences {
+        dictionaries.push(super::parse(sequence.as_ref(), sbwt, lcs)?.0);
+        if dictionaries.len() == BLOCK_RECORDS {
+            write_dictionaries(&dictionaries, sbwt, out)?;
+            dictionaries.clear();
+        }
+    }
+    if !dictionaries.is_empty() {
+        write_dictionaries(&dictionaries, sbwt, out)?;
+    }
+    Ok(())
+}
+
+/// Writes `dictionaries` as one block.
+fn write_dictionaries<W: std::io::Write>(
+    dictionaries: &[Vec<(usize, std::ops::Range<usize>)>],
+    sbwt: &SbwtIndexVariant,
+    out: &mut W,
+) -> Result<(), E> {
+    let mut u64_encoding: Vec<u64> = Vec::new();
+    for dictionary in dictionaries {
+        u64_encoding.extend(encode::encode_dictionary(dictionary, sbwt)?);
+    }
+    write_block_to(&u64_encoding, dictionaries.len(), out)
+}
+
+/// Reads a plain NLZ file written by [write_file] with the index `sbwt`,
+/// calling `visit` with every sequence in order. Reading stops at the first
+/// block that cannot be read (the end of the file).
+pub fn read_file<R: std::io::Read>(
+    input: &mut R,
+    sbwt: &SbwtIndexVariant,
+    mut visit: impl FnMut(Vec<u8>) -> Result<(), E>,
+) -> Result<(), E> {
+    read_header(input)?;
+    while let Ok(encoding) = read_block(input) {
+        for sequence in decode_sequence(&encoding, sbwt) {
+            visit(sequence)?;
+        }
+    }
+    Ok(())
+}
+
 /// Writes the file header.
 pub fn write_header<W: std::io::Write>(
     sink: &mut W,
