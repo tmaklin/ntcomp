@@ -20,7 +20,7 @@
 //! arithmetic coder of [crate::codecs::arith], with adaptive models per
 //! context:
 //! - a flag: the length is implicit (0, see
-//!   [SuffixLen::Implicit](crate::graph::SuffixLen));
+//!   [SuffixLen::Implicit](crate::nlz::SuffixLen::Implicit));
 //! - a flag: the length is above D;
 //! - a length up to D: length − 1 through an adaptive binary tree;
 //! - a length above D: length − D as its bit length (a 6-bit adaptive tree

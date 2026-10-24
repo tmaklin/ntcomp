@@ -14,8 +14,7 @@
 //! Encoder for creating a valid NLZ-OG archive.
 //!
 //! Can be read back with [GraphDecoder](super::decoder::GraphDecoder).
-use crate::FileHeader;
-use crate::FILE_HEADER_BYTES;
+use super::header::{FileHeader, FILE_HEADER_BYTES};
 use super::StoredGraph;
 use super::choices::Choices;
 use super::snps::SnpEdits;

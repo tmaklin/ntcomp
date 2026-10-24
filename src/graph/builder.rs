@@ -31,7 +31,8 @@ use crate::walk::LcsIndex;
 use super::choices::{ChoiceWriter, Choices};
 use super::collapsed::ChainCsr;
 use super::snps::{self, SnpEdits};
-use super::{Csr, GraphWalk, StoredGraph, E, IMPLICIT_SUFFIX_LEN, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
+use crate::nlz::{self, IMPLICIT_SUFFIX_LEN};
+use super::{Csr, GraphWalk, StoredGraph, E, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
 
 /// Builds the graph and remembers the path each colour takes.
 pub struct GraphBuilder {
@@ -42,7 +43,7 @@ pub struct GraphBuilder {
     /// (source node, target node, suffix length); edge id is the position in the set
     edges: IndexSet<(u32, u32, u32)>,
 
-    /// Per edge id: true if the suffix length is implicit, see [SuffixLen](super::SuffixLen)
+    /// Per edge id: true if the suffix length is implicit, see [SuffixLen](crate::nlz::SuffixLen)
     implicit: Vec<bool>,
 
     /// Per colour: edge ids (indexes into `edges`) in traversal order
@@ -252,7 +253,7 @@ impl GraphBuilder {
     /// for this contig, and the SNPs that at most
     /// [GraphBuilder::edit_snps_max_shared] contigs have are edited before
     /// encoding. `sequence` is a normalized nucleotide sequence, and `sbwt`
-    /// and `lcs` are the index passed to [crate::encode_sequence].
+    /// and `lcs` are the index passed to [nlz::parse].
     pub fn add_contig(
         &mut self,
         sequence: &[u8],
@@ -299,7 +300,7 @@ impl GraphBuilder {
                 .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
             // Contexts in the edited contig, for storing shared SNPs once.
             let edited = snps::with_contexts(&oriented, edits);
-            let (dictionary, implicit) = crate::encode_sequence(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
+            let (dictionary, implicit) = nlz::parse(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
             Ok((oriented.len(), dictionary, implicit, edited))
         }).collect();
 
@@ -342,7 +343,7 @@ impl GraphBuilder {
 
     /// Adds the dictionary of the next colour.
     ///
-    /// `dictionary` is the output of [crate::encode_sequence]. The edge out of
+    /// `dictionary` is the output of [nlz::parse]. The edge out of
     /// the source node stores `sequence_length`.
     pub fn add_path(
         &mut self,
@@ -353,9 +354,9 @@ impl GraphBuilder {
     }
 
     /// Same as [GraphBuilder::add_path] but stores the suffix length of the
-    /// entries flagged in `implicit` as [SuffixLen::Implicit](super::SuffixLen::Implicit).
+    /// entries flagged in `implicit` as [SuffixLen::Implicit](crate::nlz::SuffixLen::Implicit).
     ///
-    /// `dictionary` and `implicit` are the output of [crate::encode_sequence].
+    /// `dictionary` and `implicit` are the output of [nlz::parse].
     pub fn add_path_with_flags(
         &mut self,
         sequence_length: usize,

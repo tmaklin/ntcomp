@@ -14,7 +14,7 @@
 use ntcomp::graph::GraphWalk;
 
 use std::io::BufWriter;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use std::fs::File;
@@ -123,24 +123,10 @@ fn decode_edited(
     let sbwt::sbwt_index_variant::SbwtIndexVariant::SubsetMatrix(index) = sbwt;
 
     let (sequence_length, dictionary) = graph.walk_path(choices, color).map_err(|e| e.to_string())?;
+    let k = index.k() as u32;
+    let dictionary = dictionary.into_iter().map(|(colex_rank, len)| (colex_rank, ntcomp::nlz::SuffixLen::from_stored(len, k))).collect();
 
-    // Transform from Vec<(u32, u32)> to Vec<(u32, SuffixLen)>
-    //
-    // TODO Should return the correct value directly from walking the graph.
-    // This requires the graph knowing the value of k, or passing it in to walk_path.
-    //
-    let dictionary = dictionary.into_iter().map(|(colex_rank, len)| {
-        let suffix_len = if len > index.k() as u32 {
-            ntcomp::graph::SuffixLen::Explicit { suffix_len: len }
-        } else if len == 0 {
-            ntcomp::graph::SuffixLen::Implicit
-        } else {
-            ntcomp::graph::SuffixLen::Plain { suffix_len: len }
-        };
-        (colex_rank, suffix_len)
-    }).collect::<Vec<(u32, ntcomp::graph::SuffixLen)>>();
-
-    ntcomp::graph::decode_path(dictionary, sequence_length as usize, sbwt, Some(lcs)).map_err(|e| e.to_string())
+    ntcomp::nlz::decode_dictionary(dictionary, sequence_length as usize, sbwt, Some(lcs)).map_err(|e| e.to_string())
 }
 
 /// Contexts of SNPs in edited sequences, by colour and position, for putting
@@ -328,8 +314,7 @@ fn main() {
             // Number of records to store in each block
             let block_size = 65536;
 
-            let header_bytes = ntcomp::encode_file_header(0,0,0,0).unwrap();
-            let _ = stdout.write_all(&header_bytes);
+            let _ = ntcomp::nlz::legacy::write_header(&mut stdout);
 
             info!("Encoding fastX data...");
             let mut reader = needletail::parse_fastx_file(query_file).unwrap_or_else(|_| panic!("Expected valid fastX file"));
@@ -340,17 +325,17 @@ fn main() {
                 let seqrec = rec.normalize(true);
                 num_records += 1;
 
-                dictionaries.push(ntcomp::encode_sequence(&seqrec, &sbwt, &lcs).unwrap().0);
+                dictionaries.push(ntcomp::nlz::parse(&seqrec, &sbwt, &lcs).unwrap().0);
 
                 if num_records % block_size == 0 {
-                    let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
-                    let _ = ntcomp::write_block_to(&u64_encoding, block_size, &mut stdout);
+                    let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::nlz::legacy::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
+                    let _ = ntcomp::nlz::legacy::write_block_to(&u64_encoding, block_size, &mut stdout);
                     dictionaries.clear();
                 }
             }
             if num_records % block_size != 0 {
-                let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
-                let _ = ntcomp::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
+                let u64_encoding = dictionaries.iter().flat_map(|x| ntcomp::nlz::legacy::encode::encode_dictionary(x, &sbwt).unwrap()).collect::<Vec<u64>>();
+                let _ = ntcomp::nlz::legacy::write_block_to(&u64_encoding, num_records % block_size, &mut stdout);
             }
 
             let _ = stdout.flush();
@@ -370,14 +355,12 @@ fn main() {
             let mut conn = std::fs::File::open(input_path).unwrap();
 
             // File header
-            let mut header_bytes: [u8; ntcomp::FILE_HEADER_BYTES] = [0_u8; ntcomp::FILE_HEADER_BYTES];
-            let _ = conn.read_exact(&mut header_bytes);
-            let _file_header = ntcomp::decode_file_header(&header_bytes).unwrap();
+            let _ = ntcomp::nlz::legacy::read_header(&mut conn);
 
             info!("Decoding encoded data...");
             let mut i = 0;
-            while let Ok(encoding) = ntcomp::read_block(&_file_header, &sbwt, &mut conn) {
-                let records = ntcomp::decode_sequence(&encoding, &sbwt);
+            while let Ok(encoding) = ntcomp::nlz::legacy::read_block(&mut conn) {
+                let records = ntcomp::nlz::legacy::decode_sequence(&encoding, &sbwt);
                 records.iter().for_each(|nucleotides| {
                     let _ = writeln!(&mut stdout, ">seq.{}", i + 1);
                     let _ = writeln!(&mut stdout,

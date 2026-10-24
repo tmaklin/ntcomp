@@ -152,9 +152,10 @@ impl<N: Copy> GraphWalk for Csr<N> where u32: From<N> {
     ///
     /// Returns the sequence length stored on the source edge and the NLZ
     /// dictionary as (colex rank, suffix length) pairs, in the order produced by
-    /// [crate::encode_sequence].
+    /// [crate::nlz::parse].
     ///
-    /// The returned value can be passed to [decode_path](super::decode_path) to recover the nucleotide
+    /// The returned value can be passed to [decode_dictionary](crate::nlz::decode_dictionary) (with
+    /// [SuffixLen::from_stored](crate::nlz::SuffixLen::from_stored)) to recover the nucleotide
     /// sequence.
     ///
     fn walk_path(

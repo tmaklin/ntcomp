@@ -20,8 +20,8 @@ use dsi_bitstream::codes::RiceRead;
 use dsi_bitstream::codes::MinimalBinaryRead;
 use flate2::write::GzDecoder;
 
-use crate::BlockHeader;
-use crate::encode::Codec;
+use super::BlockHeader;
+use super::encode::Codec;
 
 type E = Box<dyn std::error::Error>;
 

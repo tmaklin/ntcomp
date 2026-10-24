@@ -601,6 +601,7 @@ impl<'de> serde::Deserialize<'de> for SnpEdits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::random_sequence;
     use crate::edits::apply_edits;
 
     fn snp(pos: u32, base: u8, index_base: u8) -> Snp {
@@ -733,17 +734,10 @@ mod tests {
         }
     }
 
-    fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
-        let mut state = seed;
-        (0..len).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            b"ACGT"[(state >> 62) as usize]
-        }).collect()
-    }
-
     #[test]
     fn builder_edits_snps_and_decoding_puts_them_back() {
-        use super::super::{GraphBuilder, SuffixLen, GraphWalk, decode_path};
+        use super::super::{GraphBuilder, GraphWalk};
+        use crate::nlz::{decode_dictionary, SuffixLen};
 
         let reference = random_sequence(4000, 7);
         // SNPs are only called after matches longer than random ones.
@@ -782,14 +776,8 @@ mod tests {
             let mut edited_seqs: Vec<Vec<u8>> = Vec::new();
             for color in 0..contigs.len() {
                 let (len, dictionary) = graph.walk_path(&choices, color as u32).unwrap();
-                let dictionary = dictionary.into_iter().map(|(colex, len)| (colex, if len == 0 {
-                    SuffixLen::Implicit
-                } else if len > k {
-                    SuffixLen::Explicit { suffix_len: len }
-                } else {
-                    SuffixLen::Plain { suffix_len: len }
-                })).collect();
-                edited_seqs.push(decode_path(dictionary, len as usize, &sbwt, Some(&lcs)).unwrap());
+                let dictionary = dictionary.into_iter().map(|(colex, len)| (colex, SuffixLen::from_stored(len, k))).collect();
+                edited_seqs.push(decode_dictionary(dictionary, len as usize, &sbwt, Some(&lcs)).unwrap());
             }
             if max_shared > 1 {
                 assert!(edits.n_repeats() > 0, "the second contig repeats the first one's SNPs");

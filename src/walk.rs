@@ -19,8 +19,8 @@
 //! row, so they are shared by every way of reaching the index:
 //! [LcsIndex] (the SBWT with its LCS array) and [WalkIndex] (the LCS array
 //! optional, the values otherwise computed from the SBWT with
-//! [lcs_from_sbwt]). Used by the parser ([crate::encode_sequence]), the
-//! decoder ([crate::graph::decode_path]), the node walks of the stored graph
+//! [lcs_from_sbwt]). Used by the parser ([crate::nlz::parse]), the
+//! decoder ([crate::nlz::decode_dictionary]), the node walks of the stored graph
 //! ([crate::graph::collapsed]) and the edit caller
 //! ([crate::edits::call_edits]).
 //!
@@ -171,7 +171,7 @@ pub trait IndexWalk {
     ///
     /// With `check`, extends while the _k_-mer has exactly one predecessor, at
     /// most `max_extension_len` characters, and returns whether the extension
-    /// stopped there: the same as [crate::left_extend_kmer] without a
+    /// stopped there: the same as [crate::nlz::left_extend_kmer] without a
     /// reference on the _k_-mer at `row`. Without `check`, takes
     /// `max_extension_len` steps without looking at the in-degrees, for a
     /// length known to be an extension (each _k_-mer on the way has one
@@ -346,4 +346,23 @@ pub fn lcs_from_sbwt(
         }
     }
     sbwt.k()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::related_index;
+    use sbwt::sbwt_index_variant::SbwtIndexVariant;
+
+    #[test]
+    fn lcs_array_and_lcs_from_sbwt_agree() {
+        for k in [15, 31] {
+            let (_, variant, lcs) = related_index(k);
+            let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+            assert_eq!(lcs.len(), sbwt.n_sets());
+            for rank in 0..lcs.len() {
+                assert_eq!(lcs_from_sbwt(sbwt, rank), lcs.access(rank), "k {} rank {}", k, rank);
+            }
+        }
+    }
 }

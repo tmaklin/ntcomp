@@ -347,6 +347,9 @@ mod tests {
     use crate::graph::*;
     use super::super::tests::{builder, dicts, expected, many_paths};
     use super::super::{max_direct_suffix_len, ChainCsr, MIN_DIRECT_SUFFIX_LEN};
+    use crate::nlz::IMPLICIT_SUFFIX_LEN;
+    use crate::testing::related_index;
+    use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
     use core::ops::Range;
 
@@ -501,5 +504,79 @@ mod tests {
                 assert_eq!(decoded, expected(d));
             }
         }
+    }
+
+    #[test]
+    fn lcs_context_suffix_codes_roundtrip() {
+        let (seqs, variant, lcs) = related_index(15);
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let mut builder = crate::graph::GraphBuilder::new();
+        for seq in &seqs {
+            let (dictionary, implicit) = crate::nlz::parse(seq, &variant, &lcs).unwrap();
+            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+        }
+        let (chains, _) = builder.to_chains();
+        let from_array = crate::walk::WalkIndex { sbwt, lcs: Some(&lcs) };
+        let from_sbwt = crate::walk::WalkIndex { sbwt, lcs: None };
+        for cap in [1, 8, 255] {
+            let stored = chains.to_stored_with(Some(from_array), cap, Some(15), false);
+            let bytes = postcard::to_allocvec(&stored).unwrap();
+            // Encoded with the array, decoded with values computed from the SBWT (and vice versa).
+            let decoded = crate::graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(from_sbwt), Some(15)).unwrap();
+            assert_eq!(decoded, chains, "cap {}", cap);
+            let stored = chains.to_stored_with(Some(from_sbwt), cap, Some(15), false);
+            assert_eq!(crate::graph::collapsed::ChainCsr::from_stored_with(stored, Some(from_array), Some(15)).unwrap(), chains);
+            // The index is required to decode.
+            let stored: crate::graph::collapsed::StoredChains = postcard::from_bytes(&bytes).unwrap();
+            assert!(crate::graph::collapsed::ChainCsr::from_stored_with(stored, None, Some(15)).is_err());
+        }
+        // Without contexts nothing changes.
+        assert_eq!(crate::graph::collapsed::ChainCsr::from_stored(chains.to_stored()).unwrap(), chains);
+    }
+
+    #[test]
+    fn nodes_derived_by_walks_roundtrip() {
+        use crate::graph::GraphWalk;
+        let (seqs, variant, lcs) = related_index(15);
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let mut builder = crate::graph::GraphBuilder::new();
+        for seq in &seqs {
+            let (dictionary, implicit) = crate::nlz::parse(seq, &variant, &lcs).unwrap();
+            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+        }
+        let (chains, _) = builder.to_chains();
+        let walk = crate::graph::collapsed::WalkIndex { sbwt, lcs: Some(&lcs) };
+        let plain = chains.to_stored_with(Some(walk), 255, Some(15), false);
+        let stored = chains.to_stored_with(Some(walk), 255, Some(15), true);
+        assert!(stored.derived && !plain.derived);
+        // Some nodes are derived: fewer ranks are stored.
+        assert!(stored.node_ranks.len() < plain.node_ranks.len(), "{} vs {}", stored.node_ranks.len(), plain.node_ranks.len());
+        // With walks the targets are coded where each chain ends, some of
+        // them junctions reached before.
+        assert!(stored.targets.is_empty() && !plain.targets.is_empty());
+        let mut reached = vec![false; chains.junction_weights.len()];
+        let mut reached_before = 0;
+        for junction in 0..chains.junction_weights.len() {
+            let (start, end) = chains.row(junction);
+            for chain in start..end {
+                let target = chains.targets[chain] as usize;
+                reached_before += reached[target] as usize;
+                reached[target] = true;
+            }
+        }
+        assert!(reached_before > 0, "no chain ends at a junction reached before");
+        let bytes = postcard::to_allocvec(&stored).unwrap();
+        // Decoded with the LCS array, and with LCS values computed from the SBWT (no array).
+        let decoded = crate::graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(walk), Some(15)).unwrap();
+        assert_eq!(decoded, chains);
+        let no_array = crate::graph::collapsed::WalkIndex { sbwt, lcs: None };
+        let decoded = crate::graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), Some(no_array), Some(15)).unwrap();
+        assert_eq!(decoded, chains);
+        // The derived nodes need the index.
+        assert!(crate::graph::collapsed::ChainCsr::from_stored_with(postcard::from_bytes(&bytes).unwrap(), None, Some(15)).is_err());
+        // A corrupt walk stream is an error, not a panic.
+        let mut bad: crate::graph::collapsed::StoredChains = postcard::from_bytes(&bytes).unwrap();
+        bad.node_walks.truncate(bad.node_walks.len() / 2);
+        let _ = crate::graph::collapsed::ChainCsr::from_stored_with(bad, Some(walk), Some(15));
     }
 }

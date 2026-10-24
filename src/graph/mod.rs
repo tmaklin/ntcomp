@@ -51,17 +51,15 @@
 //! - [paths]: walking a colour's path with its choices ([GraphWalk]);
 //! - [choices]: the choice streams and the model that codes them;
 //! - [snps]: the archive's SNP section;
-//! - [encoder], [decoder]: the archive file.
+//! - [encoder], [decoder]: the archive file; [header]: its header.
 //!
-use sbwt::LcsArray;
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
-
 pub mod builder;
 pub mod choices;
 pub mod collapsed;
 pub mod csr;
 pub mod decoder;
 pub mod encoder;
+pub mod header;
 pub mod paths;
 pub mod snps;
 
@@ -70,7 +68,7 @@ pub use choices::Choices;
 pub use csr::Csr;
 pub use paths::GraphWalk;
 use paths::take_edge;
-use crate::walk::{IndexWalk, WalkIndex};
+use crate::walk::WalkIndex;
 use collapsed::ChainCsr;
 
 type E = Box<dyn std::error::Error>;
@@ -101,96 +99,10 @@ const SOURCE_COLEX: u32 = u32::MAX - 1;
 /// Colex rank stored in the dummy sink node. Real colex ranks must be smaller.
 const SINK_COLEX: u32 = u32::MAX;
 
-/// [Implicit](SuffixLen::Implicit) suffix lengths are stored as a 0; a real suffix length can never be 0.
-const IMPLICIT_SUFFIX_LEN: u32 = 0;
-
-/// Suffix length and type for an edge
-///
-/// Classifies the suffix length for a dictionary entry by specifying whether
-/// its implicit (for a left extended _k_-mer but can be inferred), explicit
-/// (left extended and needs to be declared), or plain (subsequence of a plan
-/// _k_-mer). Stores the value for explicit and plain types.
-///
-pub enum SuffixLen {
-    /// The dictionary entry is a left extended _k_-mer whose extension stopped
-    /// where [crate::left_extend_kmer] stops, so [decode_path] recovers the
-    /// length by extending the _k_-mer as far as possible.
-    Implicit,
-
-    /// Entry is a left extended _k_-mer, whose extension stops after an
-    /// explicit number of extensions, so [decode_path] needs to know the
-    /// length.
-    Explicit { suffix_len: u32 },
-
-    /// Entry is a plain _k_-mer whose suffix length is less or equal to the
-    /// value of k.
-    Plain { suffix_len: u32 },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct ColexGraphEdge {
     pub weight: u32,
     pub colors: Vec<u32>,
-}
-
-/// Decodes the nucleotide sequence of length `sequence_length` from its NLZ
-/// dictionary (colex rank, suffix length), as returned by [GraphWalk::walk_path].
-///
-/// The dictionary is processed in its own order, from the end of the sequence
-/// to the start, so that the end position of every entry is known.
-/// [Implicit](SuffixLen::Implicit) suffix lengths are recovered by extending
-/// the k-mer as far as the encoder could have extended it at that position and
-/// explicit and plain by taking the suffix length stored inside [SuffixLen].
-///
-/// The k-mers are extended by walking the de Bruijn graph of the SBWT
-/// ([IndexWalk::left_extend](crate::walk::IndexWalk::left_extend)), with
-/// `lcs` if given and with LCS values computed from the SBWT otherwise.
-///
-/// Fails if the dictionary does not cover exactly `sequence_length` bases.
-pub fn decode_path(
-    path: Vec<(u32, SuffixLen)>,
-    sequence_length: usize,
-    sbwt: &SbwtIndexVariant,
-    lcs: Option<&LcsArray>,
-) -> Result<Vec<u8>, GraphDecodeError> {
-    let mut sequence: Vec<u8> = vec![0; sequence_length];
-    let mut end = sequence_length;
-    match sbwt {
-        SbwtIndexVariant::SubsetMatrix(sbwt) => {
-            let k = sbwt.k();
-            // Left extension of the k-mer at `colex_rank` by walking the SBWT.
-            let walk = crate::walk::WalkIndex { sbwt, lcs };
-            let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| walk.left_extend(colex_rank as usize, max_extension_len, implicit).0;
-            for (colex_rank, suffix_len) in path {
-                let (kmer, len) = match suffix_len {
-                    SuffixLen::Implicit => {
-                        // The encoder extends at most end - k - 1 characters.
-                        let new_kmer = extend(colex_rank, end.saturating_sub(k + 1), true);
-                        let len = new_kmer.len();
-                        (new_kmer, len)
-                    },
-                    SuffixLen::Explicit { suffix_len: len } => {
-                        let new_kmer = extend(colex_rank, (len - k as u32) as usize, false);
-                        assert_eq!(new_kmer.len(), len as usize);
-                        (new_kmer, len as usize)
-                    },
-                    SuffixLen::Plain { suffix_len: len } => {
-                        (sbwt.access_kmer(colex_rank as usize), len as usize)
-                    },
-                };
-                if len > end {
-                    return Err(GraphDecodeError(format!("dictionary covers more than {} bases", sequence_length)))
-                }
-                sequence[(end - len)..end].copy_from_slice(&kmer[(kmer.len() - len)..]);
-                end -= len;
-            }
-        },
-    };
-    if end != 0 {
-        return Err(GraphDecodeError(format!("dictionary covers {} of {} bases", sequence_length - end, sequence_length)))
-    }
-
-    Ok(sequence)
 }
 
 /// Serialized form of [StoredGraph] (the same bytes as its serde form).

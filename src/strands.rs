@@ -171,14 +171,7 @@ pub struct StrandSketches {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
-        let mut state = seed;
-        (0..len).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            b"ACGT"[(state >> 62) as usize]
-        }).collect()
-    }
+    use crate::testing::random_sequence;
 
     #[test]
     fn reverse_complement_roundtrip() {

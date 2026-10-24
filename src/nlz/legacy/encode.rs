@@ -24,8 +24,8 @@ use dsi_bitstream::codes::MinimalBinaryWrite;
 
 use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
-use crate::BlockHeader;
-use crate::encode_block_header;
+use super::BlockHeader;
+use super::encode_block_header;
 
 type E = Box<dyn std::error::Error>;
 

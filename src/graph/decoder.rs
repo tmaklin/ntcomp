@@ -15,11 +15,7 @@
 //!
 //! Reads the output from [GraphEncoder](super::encoder::GraphEncoder).
 //!
-use crate::{
-    FileHeader,
-    FILE_HEADER_BYTES,
-    decode_file_header,
-};
+use super::header::{decode_file_header, FileHeader, FILE_HEADER_BYTES};
 use crate::codecs::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
@@ -223,6 +219,7 @@ mod tests {
     use super::super::encoder::GraphEncoder;
     use super::super::{GraphBuilder, GraphWalk};
     use super::super::snps::Snp;
+    use crate::testing::related_index;
 
     fn graph() -> (StoredGraph, Choices, Vec<Vec<(usize, Range<usize>)>>) {
         let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
@@ -324,5 +321,32 @@ mod tests {
         bytes[FILE_HEADER_BYTES - 8..FILE_HEADER_BYTES].copy_from_slice(&0_u64.to_le_bytes());
         let mut input = bytes.as_slice();
         assert!(GraphDecoder::new(&mut input).unwrap().decode_from_read().is_err());
+    }
+
+    #[test]
+    fn archives_written_with_the_index_decode_with_or_without_its_lcs_array() {
+        use crate::graph::{StoredGraph, GraphWalk};
+        let (seqs, variant, lcs) = related_index(15);
+        let mut builder = crate::graph::GraphBuilder::new().collapse_chains(true);
+        for seq in &seqs {
+            builder.add_contig(seq, &variant, &lcs).unwrap();
+        }
+        let (stored, choices) = builder.finish();
+        let walks: Vec<_> = (0..seqs.len() as u32).map(|c| stored.walk_path(&choices, c).unwrap()).collect();
+        let mut with_lcs = Vec::new();
+        crate::graph::encoder::GraphEncoder::new(stored, choices).with_index(&variant, &lcs).encode_to_write(&mut with_lcs).unwrap();
+
+        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        for array in [Some(&lcs), None] {
+            let index = crate::walk::WalkIndex { sbwt, lcs: array };
+            let mut input = with_lcs.as_slice();
+            let (graph, choices, ..) = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(index), Some(15)).unwrap();
+            for (color, walk) in walks.iter().enumerate() {
+                assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
+            }
+            assert!(matches!(graph, StoredGraph::Chains(_)));
+        }
+        let mut input = with_lcs.as_slice();
+        assert!(crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read().is_err());
     }
 }
