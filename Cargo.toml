@@ -27,7 +27,6 @@ bincode = { version = "2", features = ["serde"] }
 bitnuc = "0.2"
 dsi-bitstream = "0.8"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-kbo = { path = "vendor/kbo", version = "0.5.2" }
 sbwt = "=0.6.2"
 
 ## collection
