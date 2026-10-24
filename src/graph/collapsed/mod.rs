@@ -50,7 +50,9 @@
 //!   chain targets ([nodes]);
 //! - the suffix lengths ([suffix_lens]).
 //!
+use crate::nlz::{Dictionary, Entry};
 use super::{
+    stored_entry,
     Csr,
     Choices,
     GraphDecodeError,
@@ -280,13 +282,13 @@ impl GraphWalk for ChainCsr {
         &self,
         choices: &Choices,
         color: u32,
-    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
+    ) -> Result<Dictionary, GraphDecodeError> {
         let mut reader = choices
             .reader(color)
             .ok_or_else(|| GraphDecodeError(format!("no choice stream for colour {}", color)))?;
         let mut junction = SOURCE_NODE as usize;
         let mut sequence_length = 0_u32;
-        let mut dictionary: Vec<(u32, u32)> = Vec::new();
+        let mut entries: Vec<Entry> = Vec::new();
         let mut n_edges = 0_usize;
 
         loop {
@@ -304,16 +306,16 @@ impl GraphWalk for ChainCsr {
             }
 
             if junction != SOURCE_NODE as usize {
-                dictionary.push((self.junction_weights[junction], suffix_lens[0]));
+                entries.push(stored_entry(self.junction_weights[junction], suffix_lens[0]));
             }
-            dictionary.extend(inner.iter().copied().zip(suffix_lens[1..].iter().copied()));
+            entries.extend(inner.iter().zip(&suffix_lens[1..]).map(|(&colex_rank, &len)| stored_entry(colex_rank, len)));
 
             junction = self.targets[chain] as usize;
             if junction == SINK_NODE as usize {
                 if !reader.is_finished() {
                     return Err(GraphDecodeError(format!("unused choices left for colour {}", color)))
                 }
-                return Ok((sequence_length, dictionary))
+                return Ok(Dictionary { sequence_len: sequence_length as usize, entries })
             }
         }
     }
@@ -337,9 +339,10 @@ mod tests {
     use super::super::*;
 
     use core::ops::Range;
+    use crate::testing::dictionary;
 
-    pub(super) fn expected(dict: &[(usize, Range<usize>)]) -> Vec<(u32, u32)> {
-        dict.iter().map(|(s, r)| (r.start as u32, *s as u32)).collect()
+    pub(super) fn expected(dict: &[(usize, Range<usize>)]) -> crate::nlz::Dictionary {
+        dictionary(dict)
     }
 
     // Shared linear stretches (50 -> 60 -> 70) and a repeat at node 10.
@@ -355,7 +358,7 @@ mod tests {
     pub(super) fn builder(dicts: &[Vec<(usize, Range<usize>)>]) -> GraphBuilder {
         let mut builder = GraphBuilder::new();
         for d in dicts {
-            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+            builder.add_dictionary(&dictionary(d));
         }
         builder
     }
@@ -374,9 +377,9 @@ mod tests {
         let chains: ChainCsr = postcard::from_bytes(&bytes).unwrap();
 
         for (color, d) in dicts.iter().enumerate().rev() {
-            let (len, decoded) = chains.walk_path(&choices, color as u32).unwrap();
+            let decoded = chains.walk_path(&choices, color as u32).unwrap();
             assert_eq!(decoded, expected(d));
-            assert_eq!(len as usize, d.iter().map(|x| x.0).sum::<usize>());
+            assert_eq!(decoded.sequence_len, d.iter().map(|x| x.0).sum::<usize>());
         }
     }
 
@@ -387,7 +390,7 @@ mod tests {
         let expanded = chains.to_csr();
 
         for (color, d) in dicts.iter().enumerate() {
-            let (_, decoded) = expanded.walk_path(&choices, color as u32).unwrap();
+            let decoded = expanded.walk_path(&choices, color as u32).unwrap();
             assert_eq!(decoded, expected(d));
         }
     }

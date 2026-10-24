@@ -14,11 +14,11 @@
 //! NLZ: a sequence as a dictionary of _k_-mers of an SBWT index.
 //!
 //! The parse ([parse]) covers a sequence, from its end to its start, with
-//! entries that are each a _k_-mer of the index (its colex rank) and a suffix
-//! length ([SuffixLen]): the entry's last bases, or the _k_-mer left-extended
-//! through the de Bruijn graph of the index for as long as the extension is
-//! unique. [decode_dictionary] recovers the sequence from the entries with
-//! the index. NLZ-OG ([crate::graph]) stores the dictionaries of many
+//! the entries of its [Dictionary]: each a _k_-mer of the index (its colex
+//! rank) and the number of bases it covers ([Entry]), the _k_-mer's last
+//! bases or the _k_-mer left-extended through the de Bruijn graph of the
+//! index for as long as the extension is unique. [Dictionary::decode]
+//! recovers the sequence from the entries with the index. NLZ-OG ([crate::graph]) stores the dictionaries of many
 //! sequences as coloured paths in a shared graph; [legacy] is the plain NLZ
 //! file format, which stores them one after another.
 //!
@@ -33,49 +33,27 @@ pub mod legacy;
 
 type E = Box<dyn std::error::Error>;
 
-/// [Implicit](SuffixLen::Implicit) suffix lengths are stored as a 0; a real
-/// suffix length can never be 0.
-pub const IMPLICIT_SUFFIX_LEN: u32 = 0;
-
-/// Suffix length and type for an edge
-///
-/// Classifies the suffix length for a dictionary entry by specifying whether
-/// its implicit (for a left extended _k_-mer but can be inferred), explicit
-/// (left extended and needs to be declared), or plain (subsequence of a plan
-/// _k_-mer). Stores the value for explicit and plain types.
-///
+/// One entry of an NLZ dictionary: the _k_-mer at `colex_rank` of the index,
+/// covering the `len` bases of the sequence before the next entry: the
+/// _k_-mer's last `len` bases if `len` ≤ _k_, else the _k_-mer left-extended
+/// to `len` bases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SuffixLen {
-    /// The dictionary entry is a left extended _k_-mer whose extension stopped
-    /// where [left_extend_kmer] stops, so [decode_dictionary] recovers the
-    /// length by extending the _k_-mer as far as possible.
-    Implicit,
-
-    /// Entry is a left extended _k_-mer, whose extension stops after an
-    /// explicit number of extensions, so [decode_dictionary] needs to know the
-    /// length.
-    Explicit { suffix_len: u32 },
-
-    /// Entry is a plain _k_-mer whose suffix length is less or equal to the
-    /// value of k.
-    Plain { suffix_len: u32 },
+pub struct Entry {
+    pub colex_rank: u32,
+    pub len: u32,
+    /// The _k_-mer is left-extended until the extension stops where
+    /// [left_extend_kmer] stops (the index has no unique left extension), so
+    /// decoding recovers `len` by extending the _k_-mer as far as possible;
+    /// `len` may then be unknown (0).
+    pub implicit: bool,
 }
 
-impl SuffixLen {
-    /// The suffix length `len` as stored on the graph's edges
-    /// ([IMPLICIT_SUFFIX_LEN] for an implicit one), for _k_-mer size `k`.
-    pub fn from_stored(
-        len: u32,
-        k: u32,
-    ) -> SuffixLen {
-        if len == IMPLICIT_SUFFIX_LEN {
-            SuffixLen::Implicit
-        } else if len > k {
-            SuffixLen::Explicit { suffix_len: len }
-        } else {
-            SuffixLen::Plain { suffix_len: len }
-        }
-    }
+/// The NLZ dictionary of a sequence ([parse]): its entries from the end of
+/// the sequence to its start, covering its `sequence_len` bases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dictionary {
+    pub sequence_len: usize,
+    pub entries: Vec<Entry>,
 }
 
 /// Left extends `kmer_start` while the extension is unique in the SBWT, by at
@@ -141,19 +119,14 @@ pub fn left_extend_kmer(
 }
 
 /// The NLZ parse of a nucleotide sequence against an SBWT index: its
-/// dictionary, from the end of the sequence to the start.
-///
-/// Returns the dictionary and, for every dictionary entry, a boolean denoting
-/// whether its suffix length is *implicit*: the entry is a left extended k-mer
-/// whose extension stopped where [left_extend_kmer] stops as well, so the
-/// decoder can recover the length by extending the k-mer as far as possible.
+/// [Dictionary], from the end of the sequence to the start.
 pub fn parse(
     nucleotides: &[u8],
     index: &Index,
-) -> Result<(Vec<(usize, Range<usize>)>, Vec<bool>), E> {
+) -> Result<Dictionary, E> {
     let n = nucleotides.len();
     let mut implicit: Vec<bool> = Vec::new();
-    let dictionary: Vec<(usize, Range<usize>)> = {
+    let matches: Vec<(usize, Range<usize>)> = {
         let k = index.k();
         let mut res = index.streaming().matching_statistics(nucleotides);
 
@@ -215,71 +188,74 @@ pub fn parse(
         kept.iter().map(|x| res[*x].clone()).collect()
     };
 
-    let dictionary_bases = dictionary.iter().map(|x| x.0).sum::<usize>();
+    let dictionary_bases = matches.iter().map(|x| x.0).sum::<usize>();
 
     assert_eq!(dictionary_bases, nucleotides.len());
-    assert_eq!(dictionary.len(), implicit.len());
+    assert_eq!(matches.len(), implicit.len());
 
-    Ok((dictionary, implicit))
+    let entries = matches.into_iter().zip(implicit).map(|((len, colex), implicit)| {
+        let colex_rank = u32::try_from(colex.start).map_err(|_| "colex rank does not fit in u32")?;
+        let len = u32::try_from(len).map_err(|_| "dictionary entry longer than 2^32 bases")?;
+        Ok(Entry { colex_rank, len, implicit })
+    }).collect::<Result<Vec<Entry>, &str>>()?;
+    Ok(Dictionary { sequence_len: n, entries })
 }
 
-/// Decodes the nucleotide sequence of length `sequence_length` from its NLZ
-/// dictionary (colex rank, suffix length): a path of the graph
-/// ([GraphWalk::walk_path](crate::graph::GraphWalk::walk_path), with
-/// [SuffixLen::from_stored]).
-///
-/// The dictionary is processed in its own order, from the end of the sequence
-/// to the start, so that the end position of every entry is known.
-/// [Implicit](SuffixLen::Implicit) suffix lengths are recovered by extending
-/// the k-mer as far as the encoder could have extended it at that position and
-/// explicit and plain by taking the suffix length stored inside [SuffixLen].
-///
-/// The k-mers are extended by walking the de Bruijn graph of the `index`
-/// ([IndexWalk::left_extend]): an [Index], or a [WalkIndex] without the LCS
-/// array (the LCS values are then computed from the SBWT).
-///
-/// Fails if the dictionary does not cover exactly `sequence_length` bases.
-pub fn decode_dictionary<I: IndexWalk>(
-    dictionary: Vec<(u32, SuffixLen)>,
-    sequence_length: usize,
-    index: &I,
-) -> Result<Vec<u8>, DecodeError> {
-    let mut sequence: Vec<u8> = vec![0; sequence_length];
-    let mut end = sequence_length;
-    let (sbwt, k) = (index.sbwt(), index.k());
-    // Left extension of the k-mer at `colex_rank` by walking the SBWT.
-    let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| index.left_extend(colex_rank as usize, max_extension_len, implicit).0;
-    for (colex_rank, suffix_len) in dictionary {
-        let (kmer, len) = match suffix_len {
-            SuffixLen::Implicit => {
+impl Dictionary {
+    /// Decodes the sequence.
+    ///
+    /// The entries are processed in their own order, from the end of the
+    /// sequence to the start, so that the end position of every entry is
+    /// known. An [implicit](Entry::implicit) entry's _k_-mer is extended as
+    /// far as the encoder could have extended it at that position; any other
+    /// is extended to its `len` if `len` > _k_, and is the _k_-mer's last
+    /// `len` bases otherwise.
+    ///
+    /// The _k_-mers are extended by walking the de Bruijn graph of the
+    /// `index` ([IndexWalk::left_extend]): an [Index], or a [WalkIndex]
+    /// without the LCS array (the LCS values are then computed from the
+    /// SBWT).
+    ///
+    /// Fails if the entries do not cover exactly `sequence_len` bases.
+    pub fn decode<I: IndexWalk>(
+        &self,
+        index: &I,
+    ) -> Result<Vec<u8>, DecodeError> {
+        let sequence_length = self.sequence_len;
+        let mut sequence: Vec<u8> = vec![0; sequence_length];
+        let mut end = sequence_length;
+        let (sbwt, k) = (index.sbwt(), index.k());
+        // Left extension of the k-mer at `colex_rank` by walking the SBWT.
+        let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| index.left_extend(colex_rank as usize, max_extension_len, implicit).0;
+        for entry in &self.entries {
+            let (kmer, len) = if entry.implicit {
                 // The encoder extends at most end - k - 1 characters.
-                let new_kmer = extend(colex_rank, end.saturating_sub(k + 1), true);
+                let new_kmer = extend(entry.colex_rank, end.saturating_sub(k + 1), true);
                 let len = new_kmer.len();
                 (new_kmer, len)
-            },
-            SuffixLen::Explicit { suffix_len: len } => {
-                let new_kmer = extend(colex_rank, (len - k as u32) as usize, false);
-                assert_eq!(new_kmer.len(), len as usize);
-                (new_kmer, len as usize)
-            },
-            SuffixLen::Plain { suffix_len: len } => {
-                (sbwt.access_kmer(colex_rank as usize), len as usize)
-            },
-        };
-        if len > end {
-            return Err(DecodeError(format!("dictionary covers more than {} bases", sequence_length)))
+            } else if entry.len as usize > k {
+                let new_kmer = extend(entry.colex_rank, entry.len as usize - k, false);
+                assert_eq!(new_kmer.len(), entry.len as usize);
+                (new_kmer, entry.len as usize)
+            } else {
+                (sbwt.access_kmer(entry.colex_rank as usize), entry.len as usize)
+            };
+            if len > end {
+                return Err(DecodeError(format!("dictionary covers more than {} bases", sequence_length)))
+            }
+            sequence[(end - len)..end].copy_from_slice(&kmer[(kmer.len() - len)..]);
+            end -= len;
         }
-        sequence[(end - len)..end].copy_from_slice(&kmer[(kmer.len() - len)..]);
-        end -= len;
-    }
-    if end != 0 {
-        return Err(DecodeError(format!("dictionary covers {} of {} bases", sequence_length - end, sequence_length)))
-    }
+        if end != 0 {
+            return Err(DecodeError(format!("dictionary covers {} of {} bases", sequence_length - end, sequence_length)))
+        }
 
-    Ok(sequence)
+        Ok(sequence)
+    }
 }
 
-/// Error from [decode_dictionary]: the dictionary does not cover the sequence.
+/// Error from [Dictionary::decode]: the dictionary does not cover the
+/// sequence.
 #[derive(Debug)]
 pub struct DecodeError(pub String);
 
@@ -321,30 +297,28 @@ mod tests {
 
             // The encoder's extensions from the matching statistics are those of
             // left_extend_kmer with the sequence as the reference.
-            let (dictionary, implicit) = parse(seq, &index).unwrap();
+            let dictionary = parse(seq, &index).unwrap();
+            assert_eq!(dictionary.sequence_len, seq.len());
             let mut end = seq.len();
-            for ((len, _), &imp) in dictionary.iter().zip(&implicit) {
-                if *len >= k && end > k + 1 {
+            for entry in &dictionary.entries {
+                let len = entry.len as usize;
+                if len >= k && end > k + 1 {
                     let extended = left_extend_kmer(&seq[end - k..end], Some(&seq[..end]), sbwt, end - k - 1);
-                    assert_eq!(extended, (seq[end - len..end].to_vec(), imp));
+                    assert_eq!(extended, (seq[end - len..end].to_vec(), entry.implicit));
                 }
                 end -= len;
             }
 
-            // Both decoders recover the sequence from its encoding.
-            let path = |_| dictionary.iter().zip(&implicit).map(|((len, colex), &imp)| {
-                let len = *len as u32;
-                let suffix_len = if imp {
-                    SuffixLen::Implicit
-                } else if len > k as u32 {
-                    SuffixLen::Explicit { suffix_len: len }
-                } else {
-                    SuffixLen::Plain { suffix_len: len }
-                };
-                (colex.start as u32, suffix_len)
-            }).collect::<Vec<_>>();
-            assert_eq!(&decode_dictionary(path(()), seq.len(), &crate::walk::WalkIndex { sbwt, lcs: None }).unwrap(), seq);
-            assert_eq!(&decode_dictionary(path(()), seq.len(), &index).unwrap(), seq);
+            // Both decoders recover the sequence from its dictionary, also with
+            // the implicit lengths unknown (as the graph stores them).
+            let stored = Dictionary {
+                entries: dictionary.entries.iter().map(|&e| Entry { len: if e.implicit { 0 } else { e.len }, ..e }).collect(),
+                ..dictionary.clone()
+            };
+            for dictionary in [&dictionary, &stored] {
+                assert_eq!(&dictionary.decode(&crate::walk::WalkIndex { sbwt, lcs: None }).unwrap(), seq);
+                assert_eq!(&dictionary.decode(&index).unwrap(), seq);
+            }
         }
         assert!(n_extended > 0, "no k-mer was left extended");
     }

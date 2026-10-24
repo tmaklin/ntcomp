@@ -23,7 +23,6 @@ use crate::graph::decoder::{ArchiveError, DecodedSections, GraphDecoder};
 use crate::graph::snps::{self, SnpEdits};
 use crate::graph::{contig_hash, Choices, ContigHash, Csr, GraphWalk, StoredGraph};
 use crate::index::Index;
-use crate::nlz::{self, SuffixLen};
 
 type E = Box<dyn std::error::Error>;
 
@@ -146,10 +145,8 @@ impl<'a> ArchiveReader<'a> {
         &self,
         color: u32,
     ) -> Result<Vec<u8>, String> {
-        let (sequence_length, dictionary) = self.graph.walk_path(&self.choices, color).map_err(|e| e.to_string())?;
-        let k = self.index.k() as u32;
-        let dictionary = dictionary.into_iter().map(|(colex_rank, len)| (colex_rank, SuffixLen::from_stored(len, k))).collect();
-        nlz::decode_dictionary(dictionary, sequence_length as usize, self.index).map_err(|e| e.to_string())
+        let dictionary = self.graph.walk_path(&self.choices, color).map_err(|e| e.to_string())?;
+        dictionary.decode(self.index).map_err(|e| e.to_string())
     }
 
     /// Puts the SNPs of `color` back into its edited sequence, restores its

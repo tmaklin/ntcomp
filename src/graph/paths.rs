@@ -15,6 +15,7 @@
 //!
 use super::choices::{ChoiceReader, Choices};
 use super::GraphDecodeError;
+use crate::nlz::Dictionary;
 
 /// A graph of nodes with ranked outgoing edges whose colours' paths can be
 /// walked from the source to the sink: random access to any colour (contig)
@@ -51,12 +52,14 @@ pub trait GraphWalk {
         edge: usize,
     ) -> usize;
 
-    /// Walk the path of `color` from the source to the sink.
+    /// Walks the path of `color` from the source to the sink: the
+    /// dictionary of the contig, whose implicit entries' lengths are unknown
+    /// (0).
     fn walk_path(
         &self,
         choices: &Choices,
         color: u32,
-    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError>;
+    ) -> Result<Dictionary, GraphDecodeError>;
 }
 
 /// Picks the edge out of `node`, whose outgoing edges are `start..end`,

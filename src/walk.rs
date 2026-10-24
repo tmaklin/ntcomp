@@ -20,7 +20,7 @@
 //! [Index](crate::index::Index) (the SBWT with its LCS array) and [WalkIndex] (the LCS array
 //! optional, the values otherwise computed from the SBWT with
 //! [lcs_from_sbwt]). Used by the parser ([crate::nlz::parse]), the
-//! decoder ([crate::nlz::decode_dictionary]), the node walks of the stored graph
+//! decoder ([crate::nlz::Dictionary::decode]), the node walks of the stored graph
 //! ([crate::graph::collapsed]) and the edit caller
 //! ([crate::edits::call_edits]).
 //!

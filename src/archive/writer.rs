@@ -162,22 +162,22 @@ impl<'a> ArchiveWriter<'a> {
         };
 
         let index = self.index;
-        type Encoded = (bool, usize, Vec<(usize, Range<usize>)>, Vec<bool>, Vec<EditedSnp>);
+        type Encoded = (bool, nlz::Dictionary, Vec<EditedSnp>);
         let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edits)))| {
             let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
             let (oriented, edits) = edits::apply_edits(&oriented, edits)
                 .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
             // Contexts in the edited contig, for storing shared SNPs once.
             let edited = snps::with_contexts(&oriented, edits);
-            let (dictionary, implicit) = nlz::parse(&oriented, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
-            Ok((reversed, oriented.len(), dictionary, implicit, edited))
+            let dictionary = nlz::parse(&oriented, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
+            Ok((reversed, dictionary, edited))
         }).collect();
 
         let encoded = encoded.into_iter().collect::<Result<Vec<Encoded>, String>>()?;
         self.hashes.par_extend(sequences.par_iter().map(|sequence| contig_hash(sequence)));
         let mut colors = Vec::with_capacity(sequences.len());
-        for (reversed, len, dictionary, implicit, edited) in encoded {
-            colors.push(self.builder.add_path_with_flags(len, &dictionary, &implicit));
+        for (reversed, dictionary, edited) in encoded {
+            colors.push(self.builder.add_dictionary(&dictionary));
             self.reversed.push(reversed);
             self.edited.push(edited);
         }

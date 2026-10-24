@@ -393,6 +393,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
+    use crate::testing::dictionary;
     use crate::graph::{GraphBuilder, GraphWalk};
 
     /// Related colours: copies of a few ancestral paths through a sequence of
@@ -415,7 +416,7 @@ mod tests {
     fn builder(dicts: &[Vec<(usize, Range<usize>)>]) -> GraphBuilder {
         let mut builder = GraphBuilder::new();
         for d in dicts {
-            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+            builder.add_dictionary(&dictionary(d));
         }
         builder
     }

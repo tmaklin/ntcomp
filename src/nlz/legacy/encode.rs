@@ -127,9 +127,10 @@ pub fn compress_block(
 }
 
 pub fn encode_dictionary(
-    dictionary: &[(usize, std::ops::Range<usize>)],
+    dictionary: &crate::nlz::Dictionary,
     sbwt: &SbwtIndex<SubsetMatrix>,
 ) -> Result<Vec<u64>, E> {
+    let dictionary = &dictionary.entries;
     if dictionary.is_empty() {
         return Err(Box::new(EncodeError{}));
     }
@@ -139,15 +140,15 @@ pub fn encode_dictionary(
     let mut first: bool = true;
     let mut u64_encoding: Vec<u64> = Vec::with_capacity(dictionary.len());
     let k = sbwt.k();
-    dictionary.iter().for_each(|matches| {
+    dictionary.iter().for_each(|entry| {
         let mut arr: [u8; 8] = [0; 8];
-        if matches.0 > bitnuc_threshold {
-            arr[0..4].copy_from_slice(&(matches.1.start as u32).to_ne_bytes());
-            arr[4..7].copy_from_slice(&(matches.0 as u32).to_ne_bytes()[0..3]);
+        if entry.len as usize > bitnuc_threshold {
+            arr[0..4].copy_from_slice(&entry.colex_rank.to_ne_bytes());
+            arr[4..7].copy_from_slice(&entry.len.to_ne_bytes()[0..3]);
             arr[7..8].copy_from_slice(&(first as u8).to_ne_bytes());
         } else {
-            let kmer = sbwt.access_kmer(matches.1.start);
-            let seq = kmer[(k - matches.0)..k].to_vec();
+            let kmer = sbwt.access_kmer(entry.colex_rank as usize);
+            let seq = kmer[(k - entry.len as usize)..k].to_vec();
             let len = seq.len() as u8;
             arr[0..7].copy_from_slice(&bitnuc::as_2bit(&seq).unwrap().to_ne_bytes()[0..7]);
             arr[7..8].copy_from_slice(&((first as u8 + 2) | len << 2).to_ne_bytes());

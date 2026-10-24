@@ -47,6 +47,18 @@ pub use index::Index;
 pub(crate) mod testing {
     use crate::index::{BuildOpts, Index};
 
+    /// A dictionary of `(len, colex_rank..)` entries, none implicit.
+    pub(crate) fn dictionary(entries: &[(usize, std::ops::Range<usize>)]) -> crate::nlz::Dictionary {
+        dictionary_with_flags(entries, &vec![false; entries.len()])
+    }
+
+    /// A dictionary of `(len, colex_rank..)` entries, implicit where
+    /// `implicit` says.
+    pub(crate) fn dictionary_with_flags(entries: &[(usize, std::ops::Range<usize>)], implicit: &[bool]) -> crate::nlz::Dictionary {
+        let entries: Vec<crate::nlz::Entry> = entries.iter().zip(implicit).map(|((len, colex), &implicit)| crate::nlz::Entry { colex_rank: colex.start as u32, len: *len as u32, implicit }).collect();
+        crate::nlz::Dictionary { sequence_len: entries.iter().map(|e| e.len as usize).sum(), entries }
+    }
+
     /// A random sequence of `len` bases from `seed`.
     pub(crate) fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
         let mut state = seed;

@@ -52,7 +52,7 @@ pub fn write_file<W: std::io::Write, S: AsRef<[u8]>>(
     write_header(out)?;
     let mut dictionaries = Vec::with_capacity(BLOCK_RECORDS);
     for sequence in sequences {
-        dictionaries.push(super::parse(sequence.as_ref(), index)?.0);
+        dictionaries.push(super::parse(sequence.as_ref(), index)?);
         if dictionaries.len() == BLOCK_RECORDS {
             write_dictionaries(&dictionaries, index.sbwt(), out)?;
             dictionaries.clear();
@@ -66,7 +66,7 @@ pub fn write_file<W: std::io::Write, S: AsRef<[u8]>>(
 
 /// Writes `dictionaries` as one block.
 fn write_dictionaries<W: std::io::Write>(
-    dictionaries: &[Vec<(usize, std::ops::Range<usize>)>],
+    dictionaries: &[super::Dictionary],
     sbwt: &SbwtIndex<SubsetMatrix>,
     out: &mut W,
 ) -> Result<(), E> {

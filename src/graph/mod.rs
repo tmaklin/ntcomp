@@ -68,6 +68,7 @@ pub use choices::Choices;
 pub use csr::Csr;
 pub use paths::GraphWalk;
 use paths::take_edge;
+use crate::nlz::{Dictionary, Entry};
 use crate::walk::WalkIndex;
 use collapsed::ChainCsr;
 
@@ -98,6 +99,18 @@ const SINK_NODE: u32 = 1;
 const SOURCE_COLEX: u32 = u32::MAX - 1;
 /// Colex rank stored in the dummy sink node. Real colex ranks must be smaller.
 const SINK_COLEX: u32 = u32::MAX;
+
+/// The length of an [implicit](Entry::implicit) dictionary entry as stored on
+/// an edge (a real length is never 0).
+const IMPLICIT_SUFFIX_LEN: u32 = 0;
+
+/// The dictionary entry of the node `colex_rank` whose edge stores `len`.
+fn stored_entry(
+    colex_rank: u32,
+    len: u32,
+) -> Entry {
+    Entry { colex_rank, len, implicit: len == IMPLICIT_SUFFIX_LEN }
+}
 
 /// Serialized form of [StoredGraph] (the same bytes as its serde form).
 #[derive(serde::Serialize)]
@@ -201,7 +214,7 @@ impl GraphWalk for StoredGraph {
         &self,
         choices: &Choices,
         color: u32,
-    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
+    ) -> Result<Dictionary, GraphDecodeError> {
         match self {
             StoredGraph::Csr(csr) => csr.walk_path(choices, color),
             StoredGraph::Chains(chains) => chains.walk_path(choices, color),

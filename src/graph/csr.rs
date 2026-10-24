@@ -15,7 +15,8 @@
 //!
 use super::choices::Choices;
 use super::paths::take_edge;
-use super::{GraphDecodeError, GraphWalk, SINK_NODE, SOURCE_NODE};
+use super::{stored_entry, GraphDecodeError, GraphWalk, SINK_NODE, SOURCE_NODE};
+use crate::nlz::{Dictionary, Entry};
 
 /// Graph in compressed sparse row format; this is what gets stored.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -107,32 +108,27 @@ impl<N: Copy> GraphWalk for Csr<N> where u32: From<N> {
 
     /// Walks the path of `color` from the source to the sink.
     ///
-    /// Returns the sequence length stored on the source edge and the NLZ
-    /// dictionary as (colex rank, suffix length) pairs, in the order produced by
-    /// [crate::nlz::parse].
-    ///
-    /// The returned value can be passed to [decode_dictionary](crate::nlz::decode_dictionary) (with
-    /// [SuffixLen::from_stored](crate::nlz::SuffixLen::from_stored)) to recover the nucleotide
-    /// sequence.
+    /// Returns the contig's dictionary (the sequence length stored on the
+    /// source edge, and the entries in the order produced by
+    /// [crate::nlz::parse]); [Dictionary::decode] recovers the sequence.
     ///
     fn walk_path(
         &self,
         choices: &Choices,
         color: u32,
-    ) -> Result<(u32, Vec<(u32, u32)>), GraphDecodeError> {
-        let mut sequence_length = 0_u32;
-        let mut dictionary: Vec<(u32, u32)> = Vec::new();
+    ) -> Result<Dictionary, GraphDecodeError> {
+        let mut sequence_len = 0_usize;
+        let mut entries: Vec<Entry> = Vec::new();
 
         self.walk(choices, color, |node, pos| {
             if node == SOURCE_NODE as usize {
-                sequence_length = self.suffix_lens[pos];
+                sequence_len = self.suffix_lens[pos] as usize;
             } else {
-                let colex_rank: u32 = self.node_weights[node].into();
-                dictionary.push((colex_rank, self.suffix_lens[pos]));
+                entries.push(stored_entry(self.node_weights[node].into(), self.suffix_lens[pos]));
             }
         })?;
 
-        Ok((sequence_length, dictionary))
+        Ok(Dictionary { sequence_len, entries })
     }
 }
 

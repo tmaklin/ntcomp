@@ -347,7 +347,8 @@ mod tests {
     use crate::graph::*;
     use super::super::tests::{builder, dicts, expected, many_paths};
     use super::super::{max_direct_suffix_len, ChainCsr, MIN_DIRECT_SUFFIX_LEN};
-    use crate::nlz::IMPLICIT_SUFFIX_LEN;
+    use crate::nlz::Entry;
+    use crate::testing::{dictionary, dictionary_with_flags};
     use crate::testing::related_index;
 
     use core::ops::Range;
@@ -402,8 +403,8 @@ mod tests {
             }
             let decoded = ChainCsr::from_stored(stored).unwrap();
             assert_eq!(decoded, chains);
-            let (_, path) = decoded.walk_path(&choices, 0).unwrap();
-            assert_eq!(path.iter().map(|x| x.0).collect::<Vec<u32>>(), ranks);
+            let path = decoded.walk_path(&choices, 0).unwrap();
+            assert_eq!(path.entries.iter().map(|e| e.colex_rank).collect::<Vec<u32>>(), ranks);
         }
     }
 
@@ -426,7 +427,7 @@ mod tests {
         ];
         let mut builder = GraphBuilder::new();
         for (d, f) in dicts.iter().zip(&flags) {
-            builder.add_path_with_flags(d.iter().map(|x| x.0).sum(), d, f);
+            builder.add_dictionary(&dictionary_with_flags(d, f));
         }
         let (chains, choices) = builder.to_chains();
 
@@ -435,12 +436,13 @@ mod tests {
         assert_eq!(decoded, chains);
 
         for (color, (d, implicit)) in dicts.iter().zip(&expected_implicit).enumerate() {
-            let (len, path) = decoded.walk_path(&choices, color as u32).unwrap();
-            assert_eq!(len as usize, d.iter().map(|x| x.0).sum::<usize>());
-            let expected: Vec<(u32, u32)> = d.iter().zip(implicit).map(|((s, r), &imp)| {
-                (r.start as u32, if imp { IMPLICIT_SUFFIX_LEN } else { *s as u32 })
+            let path = decoded.walk_path(&choices, color as u32).unwrap();
+            assert_eq!(path.sequence_len, d.iter().map(|x| x.0).sum::<usize>());
+            // Implicit entries come back with their length unknown.
+            let expected: Vec<Entry> = d.iter().zip(implicit).map(|((s, r), &implicit)| {
+                Entry { colex_rank: r.start as u32, len: if implicit { 0 } else { *s as u32 }, implicit }
             }).collect();
-            assert_eq!(path, expected);
+            assert_eq!(path.entries, expected);
         }
     }
 
@@ -453,7 +455,7 @@ mod tests {
         ];
         let mut builder = GraphBuilder::new();
         for d in &dicts {
-            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+            builder.add_dictionary(&dictionary(d));
         }
         let (chains, _) = builder.to_chains();
 
@@ -481,7 +483,7 @@ mod tests {
             let decoded = ChainCsr::from_stored(chains.to_stored()).unwrap();
             assert_eq!(decoded, chains);
             for (color, d) in dicts.iter().enumerate() {
-                assert_eq!(decoded.walk_path(&choices, color as u32).unwrap().1, expected(d));
+                assert_eq!(decoded.walk_path(&choices, color as u32).unwrap(), expected(d));
             }
             // Corrupt targets give an error, not a panic.
             let mut bad = chains.to_stored();
@@ -499,7 +501,7 @@ mod tests {
             let graph: StoredGraph = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(matches!(graph, StoredGraph::Chains(_)), collapse);
             for (color, d) in dicts.iter().enumerate() {
-                let (_, decoded) = graph.walk_path(&choices, color as u32).unwrap();
+                let decoded = graph.walk_path(&choices, color as u32).unwrap();
                 assert_eq!(decoded, expected(d));
             }
         }
@@ -511,8 +513,7 @@ mod tests {
         let (sbwt, lcs) = (index.sbwt(), index.lcs());
         let mut builder = crate::graph::GraphBuilder::new();
         for seq in &seqs {
-            let (dictionary, implicit) = crate::nlz::parse(seq, &index).unwrap();
-            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+            builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
         }
         let (chains, _) = builder.to_chains();
         let from_array = crate::walk::WalkIndex { sbwt, lcs: Some(lcs) };
@@ -540,8 +541,7 @@ mod tests {
         let (sbwt, lcs) = (index.sbwt(), index.lcs());
         let mut builder = crate::graph::GraphBuilder::new();
         for seq in &seqs {
-            let (dictionary, implicit) = crate::nlz::parse(seq, &index).unwrap();
-            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+            builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
         }
         let (chains, _) = builder.to_chains();
         let walk = crate::graph::collapsed::WalkIndex { sbwt, lcs: Some(lcs) };

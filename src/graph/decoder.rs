@@ -220,7 +220,7 @@ mod tests {
     use super::super::encoder::GraphEncoder;
     use super::super::{GraphBuilder, GraphWalk};
     use super::super::snps::Snp;
-    use crate::testing::related_index;
+    use crate::testing::{dictionary, related_index};
 
     fn graph() -> (StoredGraph, Choices, Vec<Vec<(usize, Range<usize>)>>) {
         let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
@@ -229,7 +229,7 @@ mod tests {
         ];
         let mut builder = GraphBuilder::new().collapse_chains(true);
         for d in &dicts {
-            builder.add_path(d.iter().map(|x| x.0).sum(), d);
+            builder.add_dictionary(&dictionary(d));
         }
         let (graph, choices) = builder.finish();
         (graph, choices, dicts)
@@ -265,8 +265,8 @@ mod tests {
         assert_eq!(got_names, Some(names));
         assert_eq!(got_ranges, Some(ranges));
         for (color, d) in dicts.iter().enumerate() {
-            let (len, _) = graph.walk_path(&choices, color as u32).unwrap();
-            assert_eq!(len as usize, d.iter().map(|x| x.0).sum::<usize>());
+            let decoded = graph.walk_path(&choices, color as u32).unwrap();
+            assert_eq!(decoded.sequence_len, d.iter().map(|x| x.0).sum::<usize>());
         }
     }
 
@@ -330,8 +330,7 @@ mod tests {
         let (seqs, index) = related_index(15);
         let mut builder = crate::graph::GraphBuilder::new().collapse_chains(true);
         for seq in &seqs {
-            let (dictionary, implicit) = crate::nlz::parse(seq, &index).unwrap();
-            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
+            builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
         }
         let (stored, choices) = builder.finish();
         let walks: Vec<_> = (0..seqs.len() as u32).map(|c| stored.walk_path(&choices, c).unwrap()).collect();

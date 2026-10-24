@@ -15,14 +15,12 @@
 //! one path per colour. Choosing the strands and editing the contigs before
 //! parsing them is the archive's ([crate::archive::ArchiveWriter]).
 //!
-use core::ops::Range;
-
 use indexmap::IndexSet;
 
 use super::choices::{ChoiceWriter, Choices};
 use super::collapsed::ChainCsr;
-use crate::nlz::IMPLICIT_SUFFIX_LEN;
-use super::{Csr, GraphWalk, StoredGraph, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
+use crate::nlz::Dictionary;
+use super::{Csr, GraphWalk, StoredGraph, IMPLICIT_SUFFIX_LEN, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
 
 /// Builds the graph and remembers the path each colour takes.
 pub struct GraphBuilder {
@@ -33,7 +31,7 @@ pub struct GraphBuilder {
     /// (source node, target node, suffix length); edge id is the position in the set
     edges: IndexSet<(u32, u32, u32)>,
 
-    /// Per edge id: true if the suffix length is implicit, see [SuffixLen](crate::nlz::SuffixLen)
+    /// Per edge id: true if the suffix length is implicit, see [Entry::implicit](crate::nlz::Entry::implicit)
     implicit: Vec<bool>,
 
     /// Per colour: edge ids (indexes into `edges`) in traversal order
@@ -75,9 +73,8 @@ impl GraphBuilder {
 
     fn insert_node(
         &mut self,
-        colex_rank: usize
+        colex_rank: u32,
     ) -> u32 {
-        let colex_rank: u32 = colex_rank.try_into().expect("colex rank does not fit in u32");
         assert!(colex_rank < SOURCE_COLEX, "colex rank collides with dummy node ranks");
         self.nodes.insert_full(colex_rank).0 as u32
     }
@@ -99,42 +96,28 @@ impl GraphBuilder {
         id
     }
 
-    /// Adds the dictionary of the next colour.
-    ///
-    /// `dictionary` is the output of [nlz::parse](crate::nlz::parse). The edge out of
-    /// the source node stores `sequence_length`.
-    pub fn add_path(
+    /// Adds the dictionary of the next colour ([nlz::parse](crate::nlz::parse)).
+    /// The edge out of the source node stores the sequence length, and the
+    /// other edges the lengths of the entries, [IMPLICIT_SUFFIX_LEN] for an
+    /// edge that any colour takes with an [implicit](crate::nlz::Entry::implicit)
+    /// entry.
+    pub fn add_dictionary(
         &mut self,
-        sequence_length: usize,
-        dictionary: &[(usize, Range<usize>)],
+        dictionary: &Dictionary,
     ) -> u32 {
-        self.add_path_with_flags(sequence_length, dictionary, &vec![false; dictionary.len()])
-    }
-
-    /// Same as [GraphBuilder::add_path] but stores the suffix length of the
-    /// entries flagged in `implicit` as [SuffixLen::Implicit](crate::nlz::SuffixLen::Implicit).
-    ///
-    /// `dictionary` and `implicit` are the output of [nlz::parse](crate::nlz::parse).
-    pub fn add_path_with_flags(
-        &mut self,
-        sequence_length: usize,
-        dictionary: &[(usize, Range<usize>)],
-        implicit: &[bool],
-    ) -> u32 {
-        assert_eq!(dictionary.len(), implicit.len());
         let color: u32 = self.paths.len().try_into().unwrap();
-        let mut path = Vec::with_capacity(dictionary.len() + 1);
+        let mut path = Vec::with_capacity(dictionary.entries.len() + 1);
 
         let mut prev = SOURCE_NODE;
-        let mut prev_weight: u32 = sequence_length.try_into().expect("sequence length does not fit in u32");
+        let mut prev_weight: u32 = dictionary.sequence_len.try_into().expect("sequence length does not fit in u32");
         let mut prev_implicit = false;
-        for ((suffix_len, colex), &is_implicit) in dictionary.iter().zip(implicit) {
-            let node = self.insert_node(colex.start);
+        for entry in &dictionary.entries {
+            let node = self.insert_node(entry.colex_rank);
             path.push(self.edge(prev, node, prev_weight, prev_implicit));
             prev = node;
-            prev_weight = (*suffix_len).try_into().unwrap();
+            prev_weight = entry.len;
             assert!(prev_weight != 0, "empty dictionary entry");
-            prev_implicit = is_implicit;
+            prev_implicit = entry.implicit;
         }
         path.push(self.edge(prev, SINK_NODE, prev_weight, prev_implicit));
 
