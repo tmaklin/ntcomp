@@ -23,7 +23,7 @@ use rayon::prelude::*;
 
 use ntcomp::archive::InputFile;
 use ntcomp::fastx;
-use ntcomp::{ArchiveReader, ArchiveWriter};
+use ntcomp::{ArchiveReader, ArchiveWriter, Index};
 
 mod cli;
 
@@ -96,15 +96,14 @@ fn main() {
         }) => {
             init_log(if *verbose { 2 } else { 1 });
 
-            let mut sbwt_build_options = kbo::BuildOpts::default();
-            sbwt_build_options.k = *kmer_size;
-            sbwt_build_options.num_threads = *num_threads;
-            sbwt_build_options.prefix_precalc = *prefix_precalc;
-            sbwt_build_options.dedup_batches = *dedup_batches;
-            sbwt_build_options.mem_gb = *mem_gb;
-            sbwt_build_options.temp_dir = temp_dir.clone();
-            sbwt_build_options.add_revcomp = true;
-            sbwt_build_options.build_select = true;
+            let build_opts = ntcomp::index::BuildOpts {
+                k: *kmer_size,
+                num_threads: *num_threads,
+                prefix_precalc: *prefix_precalc,
+                mem_gb: *mem_gb,
+                dedup_batches: *dedup_batches,
+                temp_dir: temp_dir.clone(),
+            };
 
             let in_files = input_files(seq_files, input_list);
             info!("Building SBWT index from {} files...", in_files.len());
@@ -113,12 +112,12 @@ fn main() {
                 seq_data.append(&mut fastx::read_sequences(file).or_exit());
             }
 
-            let (sbwt, lcs) = kbo::build(&seq_data, sbwt_build_options);
+            let index = Index::build(&seq_data, &build_opts);
 
             let output_prefix = output_prefix.as_ref().unwrap();
             info!("Serializing SBWT index to {}.sbwt ...", output_prefix);
             info!("Serializing LCS array to {}.lcs ...", output_prefix);
-            kbo::index::serialize_sbwt(output_prefix, &sbwt, &lcs);
+            index.save(output_prefix).or_exit();
         },
         Some(cli::Commands::Tigs {
             seq_files,
@@ -196,7 +195,7 @@ fn main() {
             }
             if *index {
                 info!("Serializing the index to {}.sbwt and {}.lcs ...", output_prefix, output_prefix);
-                kbo::index::serialize_sbwt(output_prefix, &result.sbwt, &result.lcs);
+                result.index.save(output_prefix).or_exit();
             }
         },
         Some(cli::Commands::Encode {
@@ -206,11 +205,11 @@ fn main() {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
             info!("Loading SBWT index...");
-            let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+            let index = Index::load(index_prefix.as_ref().unwrap()).or_exit();
 
             info!("Encoding fastX data...");
             let contigs = fastx::read_contigs(query_file).or_exit();
-            ntcomp::nlz::legacy::write_file(contigs.iter().map(|(_, sequence)| sequence), &sbwt, &lcs, &mut stdout).or_exit();
+            ntcomp::nlz::legacy::write_file(contigs.iter().map(|(_, sequence)| sequence), &index, &mut stdout).or_exit();
             stdout.flush().or_exit();
         },
 
@@ -220,12 +219,12 @@ fn main() {
         }) => {
             init_log(2);
             let mut stdout = BufWriter::new(std::io::stdout());
-            let (sbwt, _) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+            let index = Index::load(index_prefix.as_ref().unwrap()).or_exit();
             let mut input = File::open(input_path).map_err(|e| format!("{}: {}", input_path.display(), e)).or_exit();
 
             info!("Decoding encoded data...");
             let mut i = 0;
-            ntcomp::nlz::legacy::read_file(&mut input, &sbwt, |nucleotides| {
+            ntcomp::nlz::legacy::read_file(&mut input, &index, |nucleotides| {
                 i += 1;
                 writeln!(&mut stdout, ">seq.{}", i)?;
                 stdout.write_all(&nucleotides)?;
@@ -259,7 +258,7 @@ fn main() {
                 .build_global()
                 .unwrap();
 
-            let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+            let index = Index::load(index_prefix.as_ref().unwrap()).or_exit();
 
             if *decompress {
                 if query_files.len() != 1 {
@@ -269,7 +268,7 @@ fn main() {
                 let archive_path = query_files[0].to_string_lossy();
                 let in_archive = |e: &dyn std::fmt::Display| format!("archive {}: {}", archive_path, e);
                 let mut input = std::io::BufReader::new(File::open(&query_files[0]).map_err(|e| in_archive(&e)).or_exit());
-                let archive = ArchiveReader::open(&mut input, &sbwt, &lcs).map_err(|e| in_archive(&e)).or_exit();
+                let archive = ArchiveReader::open(&mut input, &index).map_err(|e| in_archive(&e)).or_exit();
 
                 // Contigs to decode: all by default, otherwise the requested ones in the given order.
                 let mut want_colors: Vec<u32> = colors.clone();
@@ -329,7 +328,7 @@ fn main() {
                     .reorient_sampling(*reorient_sampling)
                     .edit_snps(*edit_snps)
                     .edit_snps_max_shared(edit_snps_max_shared.map_or(ntcomp::graph::snps::DEFAULT_MAX_SHARED, |max| max as usize));
-                let mut writer = ArchiveWriter::new(builder, &sbwt, &lcs);
+                let mut writer = ArchiveWriter::new(builder, &index);
 
                 // First pass for SNP editing: choose the strands and call the SNPs of every
                 // contig, `batch_size` input files at a time.
@@ -367,10 +366,10 @@ fn main() {
         }) => {
             init_log(2);
 
-            let (sbwt, lcs) = kbo::index::load_sbwt(index_prefix.as_ref().unwrap());
+            let index = Index::load(index_prefix.as_ref().unwrap()).or_exit();
 
             let mut input = std::io::BufReader::new(File::open(input_path).map_err(|e| format!("{}: {}", input_path.display(), e)).or_exit());
-            let archive = ArchiveReader::open(&mut input, &sbwt, &lcs).or_exit();
+            let archive = ArchiveReader::open(&mut input, &index).or_exit();
             if *color >= archive.n_contigs() as usize {
                 eprintln!("ntcomp: color {} out of range ({} contigs)", color, archive.n_contigs());
                 std::process::exit(1);

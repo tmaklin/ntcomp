@@ -19,12 +19,10 @@ use std::ops::Range;
 
 use rayon::prelude::*;
 
-use sbwt::LcsArray;
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
-
 use crate::graph::decoder::{ArchiveError, GraphDecoder};
 use crate::graph::snps::{self, SnpEdits};
 use crate::graph::{contig_hash, Choices, ContigHash, GraphWalk, StoredGraph};
+use crate::index::Index;
 use crate::nlz::{self, SuffixLen};
 
 type E = Box<dyn std::error::Error>;
@@ -35,8 +33,7 @@ type SnpContexts = HashMap<(u32, u32), [u8; snps::CONTEXT]>;
 
 /// An archive read with the index it was written with.
 pub struct ArchiveReader<'a> {
-    sbwt: &'a SbwtIndexVariant,
-    lcs: &'a LcsArray,
+    index: &'a Index,
     n_contigs: u32,
     graph: StoredGraph,
     choices: Choices,
@@ -57,23 +54,22 @@ pub struct DecodedContig {
 }
 
 impl<'a> ArchiveReader<'a> {
-    /// Reads the archive from `input`; `sbwt` and `lcs` are the index it
-    /// was written with.
+    /// Reads the archive from `input`; `index` is the index it was written
+    /// with.
     pub fn open<R: Read>(
         input: &mut R,
-        sbwt: &'a SbwtIndexVariant,
-        lcs: &'a LcsArray,
+        index: &'a Index,
     ) -> Result<Self, E> {
         let decoder = GraphDecoder::new(input)?;
         let n_contigs = decoder.header().n_queries;
-        let (graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits) = decoder.decode_from_read_with_index(sbwt, Some(lcs))?;
+        let (graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits) = decoder.decode_from_read_with_index(index)?;
         if hashes.as_ref().is_some_and(|h| h.len() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("{} hashes for {} contigs", hashes.map_or(0, |h| h.len()), n_contigs))))
         }
         if contig_names.as_ref().is_some_and(|names| names.len() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("{} contig names for {} contigs", contig_names.map_or(0, |n| n.len()), n_contigs))))
         }
-        Ok(ArchiveReader { sbwt, lcs, n_contigs, graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
+        Ok(ArchiveReader { index, n_contigs, graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
     }
 
     /// Number of contigs (colours).
@@ -150,11 +146,10 @@ impl<'a> ArchiveReader<'a> {
         &self,
         color: u32,
     ) -> Result<Vec<u8>, String> {
-        let SbwtIndexVariant::SubsetMatrix(index) = self.sbwt;
         let (sequence_length, dictionary) = self.graph.walk_path(&self.choices, color).map_err(|e| e.to_string())?;
-        let k = index.k() as u32;
+        let k = self.index.k() as u32;
         let dictionary = dictionary.into_iter().map(|(colex_rank, len)| (colex_rank, SuffixLen::from_stored(len, k))).collect();
-        nlz::decode_dictionary(dictionary, sequence_length as usize, self.sbwt, Some(self.lcs)).map_err(|e| e.to_string())
+        nlz::decode_dictionary(dictionary, sequence_length as usize, self.index).map_err(|e| e.to_string())
     }
 
     /// Puts the SNPs of `color` back into its edited sequence, restores its

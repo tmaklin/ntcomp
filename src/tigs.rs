@@ -56,8 +56,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rayon::prelude::*;
-use crate::walk::{IndexWalk, LcsIndex};
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
+use crate::index::{BuildOpts, Index};
+use crate::walk::IndexWalk;
 use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
 use crate::edits::{self, base_code};
@@ -119,16 +119,13 @@ pub struct TigOpts {
     pub gaps: GapRules,
     /// Sampling width of [StrandChooser] for orienting the tigs.
     pub orient_sampling: u64,
-    /// SBWT construction; `k`, `num_threads`, `mem_gb`, `temp_dir` and
-    /// `prefix_precalc` are used, reverse complements and select support are
-    /// always added.
-    pub build_opts: kbo::BuildOpts,
+    /// Building the indexes (the core and the final one).
+    pub build_opts: BuildOpts,
 }
 
 impl Default for TigOpts {
     fn default() -> Self {
-        let mut build_opts = kbo::BuildOpts::default();
-        build_opts.k = 255;
+        let build_opts = BuildOpts { k: 255, ..Default::default() };
         TigOpts {
             min_assemblies: 5,
             partitions: 16,
@@ -195,11 +192,8 @@ impl GapCounts {
 pub struct Tigs {
     /// The tigs, oriented and longest first.
     pub tigs: Vec<Vec<u8>>,
-    /// SBWT of the tigs (with reverse complements); the same as building it
-    /// from [Tigs::tigs].
-    pub sbwt: SbwtIndexVariant,
-    /// LCS array of [Tigs::sbwt].
-    pub lcs: LcsArray,
+    /// The index of the tigs; the same as building it from [Tigs::tigs].
+    pub index: Index,
     pub stats: TigStats,
 }
 
@@ -325,17 +319,6 @@ fn kmer_runs<T: Sync>(
     runs
 }
 
-/// SBWT with reverse complements and select support.
-fn build_index(
-    seqs: &[Vec<u8>],
-    opts: &kbo::BuildOpts,
-) -> (SbwtIndexVariant, LcsArray) {
-    let mut opts = opts.clone();
-    opts.add_revcomp = true;
-    opts.build_select = true;
-    kbo::build(seqs, opts)
-}
-
 /// Colex rank of every _k_-mer window of `seq` (None if not in the index).
 fn colex_ranks(
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
@@ -353,7 +336,7 @@ fn colex_ranks(
 /// only. `walk` and `index` are the core index.
 fn repairable(
     window: &[u8],
-    walk: &LcsIndex,
+    walk: &Index,
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
     k: usize,
 ) -> bool {
@@ -370,7 +353,7 @@ fn repairable(
 fn input_gaps(
     seqs: &[Vec<u8>],
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
-    walk: &LcsIndex,
+    walk: &Index,
     k: usize,
     rules: &GapRules,
     gaps: &mut Vec<Vec<u8>>,
@@ -418,14 +401,13 @@ fn input_gaps(
 fn simplitigs<T: Sync>(
     inputs: &[T],
     read: &(dyn Fn(&T) -> Vec<Vec<u8>> + Sync),
-    sbwt: &SbwtIndex<SubsetMatrix>,
-    lcs: &LcsArray,
+    walk: &Index,
     runs: &[Vec<u8>],
 ) -> Vec<Vec<u8>> {
+    let sbwt = walk.sbwt();
     let k = sbwt.k();
     let n = sbwt.n_sets();
-    let index = StreamingIndex::new(sbwt, lcs);
-    let walk = LcsIndex { sbwt, lcs };
+    let index = walk.streaming();
 
     // Colex rank of the reverse complement of every k-mer.
     let rc: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
@@ -535,37 +517,33 @@ pub fn build<T: Sync>(
     progress(&format!("core: {} canonical k-mers in at least {} inputs", core.len(), opts.min_assemblies));
     let mut runs = pool.install(|| kmer_runs(inputs, read, k, &mut core));
     drop(core);
-    let (core_sbwt, core_lcs) = build_index(&runs, &opts.build_opts);
+    let core = Index::build(&runs, &opts.build_opts);
     progress("core: SBWT built");
 
     let mut counts = GapCounts::default();
     let gaps: Vec<Vec<u8>> = pool.install(|| {
-        let SbwtIndexVariant::SubsetMatrix(core) = &core_sbwt;
-        let index = StreamingIndex::new(core, &core_lcs);
-        let walk = LcsIndex { sbwt: core, lcs: &core_lcs };
+        let index = core.streaming();
         let per_input: Vec<(Vec<Vec<u8>>, GapCounts)> = inputs.par_iter().map(|input| {
             let (mut gaps, mut counts) = (Vec::new(), GapCounts::default());
-            input_gaps(&read(input), &index, &walk, k, &opts.gaps, &mut gaps, &mut counts);
+            input_gaps(&read(input), &index, &core, k, &opts.gaps, &mut gaps, &mut counts);
             (gaps, counts)
         }).collect();
         per_input.into_iter().flat_map(|(gaps, c)| { counts.add(&c); gaps }).collect()
     });
-    drop(core_sbwt);
-    drop(core_lcs);
+    drop(core);
     stats.gaps = counts;
     progress(&format!("gaps filled (join, one-sided, bubble, tip): {:?}, windows {:?}; repairable bubbles left out: {}", counts.filled, counts.windows, counts.repairable_bubbles));
 
     runs.extend(gaps);
-    let (sbwt, lcs) = build_index(&runs, &opts.build_opts);
+    let index = Index::build(&runs, &opts.build_opts);
     progress("index: SBWT built");
-    let SbwtIndexVariant::SubsetMatrix(index_sbwt) = &sbwt;
-    stats.kmers = index_sbwt.n_kmers() / 2;
-    let mut tigs = pool.install(|| simplitigs(inputs, read, index_sbwt, &lcs, &runs));
+    stats.kmers = index.n_kmers() / 2;
+    let mut tigs = pool.install(|| simplitigs(inputs, read, &index, &runs));
     drop(runs);
     progress(&format!("{} simplitigs", tigs.len()));
     stats.reversed = layout(&mut tigs, opts.orient_sampling);
 
-    Tigs { tigs, sbwt, lcs, stats }
+    Tigs { tigs, index, stats }
 }
 
 // Tig files -------------------------------------------------------------------

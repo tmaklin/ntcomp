@@ -24,7 +24,9 @@ use bincode::{Encode, Decode};
 use bincode::encode_into_std_write;
 use bincode::decode_from_slice;
 
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
+use sbwt::{SbwtIndex, SubsetMatrix};
+
+use crate::index::Index;
 
 use super::left_extend_kmer;
 
@@ -40,25 +42,24 @@ pub const HEADER_BYTES: usize = 50;
 pub const BLOCK_RECORDS: usize = 65536;
 
 /// Writes the plain NLZ file of `sequences` (normalized, see
-/// [crate::fastx::read_contigs]) parsed against `sbwt` with its LCS array
-/// `lcs`: the header, then blocks of [BLOCK_RECORDS] sequences.
+/// [crate::fastx::read_contigs]) parsed against `index`: the header, then
+/// blocks of [BLOCK_RECORDS] sequences.
 pub fn write_file<W: std::io::Write, S: AsRef<[u8]>>(
     sequences: impl IntoIterator<Item = S>,
-    sbwt: &SbwtIndexVariant,
-    lcs: &sbwt::LcsArray,
+    index: &Index,
     out: &mut W,
 ) -> Result<(), E> {
     write_header(out)?;
     let mut dictionaries = Vec::with_capacity(BLOCK_RECORDS);
     for sequence in sequences {
-        dictionaries.push(super::parse(sequence.as_ref(), sbwt, lcs)?.0);
+        dictionaries.push(super::parse(sequence.as_ref(), index)?.0);
         if dictionaries.len() == BLOCK_RECORDS {
-            write_dictionaries(&dictionaries, sbwt, out)?;
+            write_dictionaries(&dictionaries, index.sbwt(), out)?;
             dictionaries.clear();
         }
     }
     if !dictionaries.is_empty() {
-        write_dictionaries(&dictionaries, sbwt, out)?;
+        write_dictionaries(&dictionaries, index.sbwt(), out)?;
     }
     Ok(())
 }
@@ -66,7 +67,7 @@ pub fn write_file<W: std::io::Write, S: AsRef<[u8]>>(
 /// Writes `dictionaries` as one block.
 fn write_dictionaries<W: std::io::Write>(
     dictionaries: &[Vec<(usize, std::ops::Range<usize>)>],
-    sbwt: &SbwtIndexVariant,
+    sbwt: &SbwtIndex<SubsetMatrix>,
     out: &mut W,
 ) -> Result<(), E> {
     let mut u64_encoding: Vec<u64> = Vec::new();
@@ -76,17 +77,17 @@ fn write_dictionaries<W: std::io::Write>(
     write_block_to(&u64_encoding, dictionaries.len(), out)
 }
 
-/// Reads a plain NLZ file written by [write_file] with the index `sbwt`,
-/// calling `visit` with every sequence in order. Reading stops at the first
-/// block that cannot be read (the end of the file).
+/// Reads a plain NLZ file written by [write_file] with `index`, calling
+/// `visit` with every sequence in order. Reading stops at the first block
+/// that cannot be read (the end of the file).
 pub fn read_file<R: std::io::Read>(
     input: &mut R,
-    sbwt: &SbwtIndexVariant,
+    index: &Index,
     mut visit: impl FnMut(Vec<u8>) -> Result<(), E>,
 ) -> Result<(), E> {
     read_header(input)?;
     while let Ok(encoding) = read_block(input) {
-        for sequence in decode_sequence(&encoding, sbwt) {
+        for sequence in decode_sequence(&encoding, index.sbwt()) {
             visit(sequence)?;
         }
     }
@@ -170,66 +171,61 @@ pub fn write_block_to<W: std::io::Write>(
 /// Decodes the sequences of a block ([read_block]).
 pub fn decode_sequence(
     encoding: &[u64],
-    sbwt: &SbwtIndexVariant,
+    sbwt: &SbwtIndex<SubsetMatrix>,
 ) -> Vec<Vec<u8>> {
-    // TODO this needs to check if the sbwt has select support
 
     let mut sequences: Vec<Vec<u8>> = Vec::new();
     let mut sequence: Vec<u8> = Vec::new();
-    match sbwt {
-        SbwtIndexVariant::SubsetMatrix(sbwt) => {
-            let k = sbwt.k();
-            let mut bases: usize = 0;
-            encoding.iter().rev().for_each(|record| {
-                let bytes: Vec<u8> = record.to_ne_bytes()[0..8].to_vec();
-                let mut arr: [u8; 8] = [0; 8];
-                arr[0..8].copy_from_slice(&bytes);
-                let flags = bytes[7];
-                let flag = u8::from_ne_bytes([flags]);
-                let first: bool = (flag & 0b00000001) == 0b00000001;
-                if flag & 0b00000010 == 0b00000000 {
-                    let mut arr1: [u8; 4] = [0; 4];
-                    let mut arr2: [u8; 4] = [0; 4];
-                    let mut arr3: [u8; 1] = [0; 1];
+    let k = sbwt.k();
+    let mut bases: usize = 0;
+    encoding.iter().rev().for_each(|record| {
+        let bytes: Vec<u8> = record.to_ne_bytes()[0..8].to_vec();
+        let mut arr: [u8; 8] = [0; 8];
+        arr[0..8].copy_from_slice(&bytes);
+        let flags = bytes[7];
+        let flag = u8::from_ne_bytes([flags]);
+        let first: bool = (flag & 0b00000001) == 0b00000001;
+        if flag & 0b00000010 == 0b00000000 {
+            let mut arr1: [u8; 4] = [0; 4];
+            let mut arr2: [u8; 4] = [0; 4];
+            let mut arr3: [u8; 1] = [0; 1];
 
-                    arr1.copy_from_slice(&arr[0..4]);
-                    arr2[0..3].copy_from_slice(&arr[4..7]);
-                    arr3.copy_from_slice(&arr[7..8]);
-                    let colex_rank = u32::from_ne_bytes(arr1);
-                    let suffix_len = u32::from_ne_bytes(arr2);
-                    bases += suffix_len as usize;
+            arr1.copy_from_slice(&arr[0..4]);
+            arr2[0..3].copy_from_slice(&arr[4..7]);
+            arr3.copy_from_slice(&arr[7..8]);
+            let colex_rank = u32::from_ne_bytes(arr1);
+            let suffix_len = u32::from_ne_bytes(arr2);
+            bases += suffix_len as usize;
 
-                    let kmer = if suffix_len > k as u32 {
-                        let kmer = sbwt.access_kmer(colex_rank as usize);
-                        let (new_kmer, _) = left_extend_kmer(&kmer, None, sbwt, (suffix_len - k as u32) as usize);
-                        assert_eq!(new_kmer.len(), suffix_len as usize);
-                        new_kmer
-                    } else {
-                        sbwt.access_kmer(colex_rank as usize)
-                    };
+            let kmer = if suffix_len > k as u32 {
+                let kmer = sbwt.access_kmer(colex_rank as usize);
+                let (new_kmer, _) = left_extend_kmer(&kmer, None, sbwt, (suffix_len - k as u32) as usize);
+                assert_eq!(new_kmer.len(), suffix_len as usize);
+                new_kmer
+            } else {
+                sbwt.access_kmer(colex_rank as usize)
+            };
 
-                    sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter());
-                } else {
-                    let length: usize = ((flag & 0b11111100) >> 2) as usize;
+            sequence.extend(kmer[(kmer.len() - (suffix_len as usize))..kmer.len()].iter());
+        } else {
+            let length: usize = ((flag & 0b11111100) >> 2) as usize;
 
-                    let mut arr1: [u8; 8] = [0; 8];
-                    arr1[0..7].copy_from_slice(&bytes[0..7]);
+            let mut arr1: [u8; 8] = [0; 8];
+            arr1[0..7].copy_from_slice(&bytes[0..7]);
 
-                    let bitnucs = u64::from_ne_bytes(arr1);
-                    let mut kmer: Vec<u8> = Vec::new();
-                    let _ = bitnuc::from_2bit(bitnucs, length, &mut kmer);
-                    bases += kmer.len();
-                    sequence.extend(kmer.iter());
-                }
+            let bitnucs = u64::from_ne_bytes(arr1);
+            let mut kmer: Vec<u8> = Vec::new();
+            let _ = bitnuc::from_2bit(bitnucs, length, &mut kmer);
+            bases += kmer.len();
+            sequence.extend(kmer.iter());
+        }
 
-                if first {
-                    bases = 0;
-                    sequences.push(sequence.clone());
-                    sequence.clear();
-                }
-            });
-        },
-    }
+        if first {
+            bases = 0;
+            sequences.push(sequence.clone());
+            sequence.clear();
+        }
+    });
 
     sequences.into_iter().rev().collect()
 }

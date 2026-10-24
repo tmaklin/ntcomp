@@ -22,7 +22,7 @@ use dsi_bitstream::traits::BE;
 use dsi_bitstream::codes::RiceWrite;
 use dsi_bitstream::codes::MinimalBinaryWrite;
 
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
+use sbwt::{SbwtIndex, SubsetMatrix};
 
 use super::BlockHeader;
 use super::encode_block_header;
@@ -128,7 +128,7 @@ pub fn compress_block(
 
 pub fn encode_dictionary(
     dictionary: &[(usize, std::ops::Range<usize>)],
-    sbwt: &SbwtIndexVariant,
+    sbwt: &SbwtIndex<SubsetMatrix>,
 ) -> Result<Vec<u64>, E> {
     if dictionary.is_empty() {
         return Err(Box::new(EncodeError{}));
@@ -138,8 +138,6 @@ pub fn encode_dictionary(
 
     let mut first: bool = true;
     let mut u64_encoding: Vec<u64> = Vec::with_capacity(dictionary.len());
-    match sbwt {
-        SbwtIndexVariant::SubsetMatrix(sbwt) => {
     let k = sbwt.k();
     dictionary.iter().for_each(|matches| {
         let mut arr: [u8; 8] = [0; 8];
@@ -158,8 +156,6 @@ pub fn encode_dictionary(
         u64_encoding.push(u64::from_ne_bytes(arr));
         if first { first = false };
     });
-        },
-    }
 
     u64_encoding.shrink_to_fit();
     Ok(u64_encoding)

@@ -349,7 +349,6 @@ mod tests {
     use super::super::{max_direct_suffix_len, ChainCsr, MIN_DIRECT_SUFFIX_LEN};
     use crate::nlz::IMPLICIT_SUFFIX_LEN;
     use crate::testing::related_index;
-    use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
     use core::ops::Range;
 
@@ -508,15 +507,15 @@ mod tests {
 
     #[test]
     fn lcs_context_suffix_codes_roundtrip() {
-        let (seqs, variant, lcs) = related_index(15);
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let (seqs, index) = related_index(15);
+        let (sbwt, lcs) = (index.sbwt(), index.lcs());
         let mut builder = crate::graph::GraphBuilder::new();
         for seq in &seqs {
-            let (dictionary, implicit) = crate::nlz::parse(seq, &variant, &lcs).unwrap();
+            let (dictionary, implicit) = crate::nlz::parse(seq, &index).unwrap();
             builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
         }
         let (chains, _) = builder.to_chains();
-        let from_array = crate::walk::WalkIndex { sbwt, lcs: Some(&lcs) };
+        let from_array = crate::walk::WalkIndex { sbwt, lcs: Some(lcs) };
         let from_sbwt = crate::walk::WalkIndex { sbwt, lcs: None };
         for cap in [1, 8, 255] {
             let stored = chains.to_stored_with(Some(from_array), cap, Some(15), false);
@@ -537,15 +536,15 @@ mod tests {
     #[test]
     fn nodes_derived_by_walks_roundtrip() {
         use crate::graph::GraphWalk;
-        let (seqs, variant, lcs) = related_index(15);
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+        let (seqs, index) = related_index(15);
+        let (sbwt, lcs) = (index.sbwt(), index.lcs());
         let mut builder = crate::graph::GraphBuilder::new();
         for seq in &seqs {
-            let (dictionary, implicit) = crate::nlz::parse(seq, &variant, &lcs).unwrap();
+            let (dictionary, implicit) = crate::nlz::parse(seq, &index).unwrap();
             builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
         }
         let (chains, _) = builder.to_chains();
-        let walk = crate::graph::collapsed::WalkIndex { sbwt, lcs: Some(&lcs) };
+        let walk = crate::graph::collapsed::WalkIndex { sbwt, lcs: Some(lcs) };
         let plain = chains.to_stored_with(Some(walk), 255, Some(15), false);
         let stored = chains.to_stored_with(Some(walk), 255, Some(15), true);
         assert!(stored.derived && !plain.derived);

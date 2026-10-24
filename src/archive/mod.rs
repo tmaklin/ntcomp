@@ -31,20 +31,20 @@ mod tests {
 
     #[test]
     fn archives_roundtrip_with_random_access() {
-        let (seqs, sbwt, lcs) = related_index(31);
+        let (seqs, index) = related_index(31);
         // Two input files; one contig reverse complemented so the strand is chosen.
         let mut contigs: Vec<(Vec<u8>, Vec<u8>)> = seqs.iter().enumerate().map(|(i, seq)| (format!("contig{} sample", i).into_bytes(), seq.clone())).collect();
         contigs[2].1 = crate::strands::reverse_complement(&contigs[2].1);
         let files: Vec<InputFile> = vec![(b"first".to_vec(), contigs[..1].to_vec()), (b"second".to_vec(), contigs[1..].to_vec())];
 
         let builder = GraphBuilder::new().collapse_chains(true).reorient_contigs(true).edit_snps(true);
-        let mut writer = ArchiveWriter::new(builder, &sbwt, &lcs);
+        let mut writer = ArchiveWriter::new(builder, &index);
         assert_eq!(writer.call_edits(&files), vec![0, 1, 2, 3]);
         assert_eq!(writer.add_files(&files).unwrap(), vec![0, 1, 2, 3]);
         let mut bytes = Vec::new();
         writer.write(&mut bytes).unwrap();
 
-        let reader = ArchiveReader::open(&mut bytes.as_slice(), &sbwt, &lcs).unwrap();
+        let reader = ArchiveReader::open(&mut bytes.as_slice(), &index).unwrap();
         assert_eq!((reader.n_contigs(), reader.n_files()), (4, 2));
         assert_eq!((reader.file_name(0), reader.file_name(3)), (Some(&b"first"[..]), Some(&b"second"[..])));
         assert_eq!(reader.contig_name(1), Some(&b"contig1 sample"[..]));

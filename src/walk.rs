@@ -17,7 +17,7 @@
 //! [IndexWalk] walks the de Bruijn graph of an SBWT index. Its operations are
 //! default methods built on two accessors, the SBWT and the LCS value of a
 //! row, so they are shared by every way of reaching the index:
-//! [LcsIndex] (the SBWT with its LCS array) and [WalkIndex] (the LCS array
+//! [Index](crate::index::Index) (the SBWT with its LCS array) and [WalkIndex] (the LCS array
 //! optional, the values otherwise computed from the SBWT with
 //! [lcs_from_sbwt]). Used by the parser ([crate::nlz::parse]), the
 //! decoder ([crate::nlz::decode_dictionary]), the node walks of the stored graph
@@ -282,23 +282,6 @@ pub trait IndexWalk {
     }
 }
 
-/// The SBWT with its LCS array.
-#[derive(Clone, Copy)]
-pub struct LcsIndex<'a> {
-    pub sbwt: &'a SbwtIndex<SubsetMatrix>,
-    pub lcs: &'a LcsArray,
-}
-
-impl IndexWalk for LcsIndex<'_> {
-    fn sbwt(&self) -> &SbwtIndex<SubsetMatrix> {
-        self.sbwt
-    }
-
-    fn lcs_at(&self, row: usize) -> usize {
-        self.lcs.access(row)
-    }
-}
-
 /// The SBWT with its LCS array if there is one; otherwise the LCS values are
 /// computed from the SBWT ([lcs_from_sbwt], one step per common character).
 /// Storing a graph with derived nodes needs the array (for the matching
@@ -352,13 +335,12 @@ pub fn lcs_from_sbwt(
 mod tests {
     use super::*;
     use crate::testing::related_index;
-    use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
     #[test]
     fn lcs_array_and_lcs_from_sbwt_agree() {
         for k in [15, 31] {
-            let (_, variant, lcs) = related_index(k);
-            let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
+            let (_, index) = related_index(k);
+            let (sbwt, lcs) = (index.sbwt(), index.lcs());
             assert_eq!(lcs.len(), sbwt.n_sets());
             for rank in 0..lcs.len() {
                 assert_eq!(lcs_from_sbwt(sbwt, rank), lcs.access(rank), "k {} rank {}", k, rank);

@@ -742,11 +742,7 @@ mod tests {
         let reference = random_sequence(4000, 7);
         // SNPs are only called after matches longer than random ones.
         let k = 63;
-        let mut opts = kbo::BuildOpts::default();
-        opts.k = k as usize;
-        opts.add_revcomp = true;
-        opts.build_select = true;
-        let (sbwt, lcs) = kbo::build(&[reference.clone()], opts);
+        let index = crate::index::Index::build(&[reference.clone()], &crate::index::BuildOpts { k: k as usize, ..Default::default() });
 
         // Two contigs with the same SNPs and one with its own, more than k apart.
         let with_snps = |positions: &[usize]| {
@@ -760,12 +756,12 @@ mod tests {
 
         for max_shared in [1, 2] {
             let mut builder = GraphBuilder::new().collapse_chains(true).edit_snps(true).edit_snps_max_shared(max_shared);
-            assert!(builder.add_contig(&contigs[0], &sbwt, &lcs).is_err(), "SNPs must be called first");
+            assert!(builder.add_contig(&contigs[0], &index).is_err(), "SNPs must be called first");
             for contig in &contigs {
-                builder.call_edits(contig, &sbwt, &lcs);
+                builder.call_edits(contig, &index);
             }
             for contig in &contigs {
-                builder.add_contig(contig, &sbwt, &lcs).unwrap();
+                builder.add_contig(contig, &index).unwrap();
             }
             let edits = builder.snp_edits().unwrap();
             // The shared SNPs are only edited if two contigs may share a SNP.
@@ -777,7 +773,7 @@ mod tests {
             for color in 0..contigs.len() {
                 let (len, dictionary) = graph.walk_path(&choices, color as u32).unwrap();
                 let dictionary = dictionary.into_iter().map(|(colex, len)| (colex, SuffixLen::from_stored(len, k))).collect();
-                edited_seqs.push(decode_dictionary(dictionary, len as usize, &sbwt, Some(&lcs)).unwrap());
+                edited_seqs.push(decode_dictionary(dictionary, len as usize, &index).unwrap());
             }
             if max_shared > 1 {
                 assert!(edits.n_repeats() > 0, "the second contig repeats the first one's SNPs");

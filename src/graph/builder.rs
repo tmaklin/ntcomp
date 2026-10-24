@@ -21,12 +21,9 @@ use indexmap::IndexSet;
 
 use rayon::prelude::*;
 
-use sbwt::LcsArray;
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
-
 use crate::edits::{self, CalledEdit};
 use crate::strands::{self, StrandChooser};
-use crate::walk::LcsIndex;
+use crate::index::Index;
 
 use super::choices::{ChoiceWriter, Choices};
 use super::collapsed::ChainCsr;
@@ -210,10 +207,9 @@ impl GraphBuilder {
     pub fn call_edits(
         &mut self,
         sequence: &[u8],
-        sbwt: &SbwtIndexVariant,
-        lcs: &LcsArray,
+        index: &Index,
     ) -> u32 {
-        self.call_edits_batch(&[sequence], sbwt, lcs)[0]
+        self.call_edits_batch(&[sequence], index)[0]
     }
 
     /// Same as [GraphBuilder::call_edits] for the next `sequences.len()`
@@ -222,17 +218,14 @@ impl GraphBuilder {
     pub fn call_edits_batch(
         &mut self,
         sequences: &[&[u8]],
-        sbwt: &SbwtIndexVariant,
-        lcs: &LcsArray,
+        index: &Index,
     ) -> Vec<u32> {
         let strands = self.choose_strands(sequences);
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = sbwt;
-        let index = LcsIndex { sbwt, lcs };
         let called: Vec<Vec<CalledEdit>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
             if reversed {
-                edits::call_edits(&strands::reverse_complement(sequence), &index)
+                edits::call_edits(&strands::reverse_complement(sequence), index)
             } else {
-                edits::call_edits(sequence, &index)
+                edits::call_edits(sequence, index)
             }
         }).collect();
         let first: u32 = self.called.len().try_into().unwrap();
@@ -252,15 +245,14 @@ impl GraphBuilder {
     /// strand comes from [GraphBuilder::call_edits], which must have been called
     /// for this contig, and the SNPs that at most
     /// [GraphBuilder::edit_snps_max_shared] contigs have are edited before
-    /// encoding. `sequence` is a normalized nucleotide sequence, and `sbwt`
-    /// and `lcs` are the index passed to [nlz::parse].
+    /// encoding. `sequence` is a normalized nucleotide sequence, and `index`
+    /// is the index passed to [nlz::parse].
     pub fn add_contig(
         &mut self,
         sequence: &[u8],
-        sbwt: &SbwtIndexVariant,
-        lcs: &LcsArray,
+        index: &Index,
     ) -> Result<u32, E> {
-        Ok(self.add_contigs(&[sequence], sbwt, lcs)?[0])
+        Ok(self.add_contigs(&[sequence], index)?[0])
     }
 
     /// Same as [GraphBuilder::add_contig] for the next `sequences.len()`
@@ -269,8 +261,7 @@ impl GraphBuilder {
     pub fn add_contigs(
         &mut self,
         sequences: &[&[u8]],
-        sbwt: &SbwtIndexVariant,
-        lcs: &LcsArray,
+        index: &Index,
     ) -> Result<Vec<u32>, E> {
         let first_color = self.paths.len();
         // Strands and SNPs to edit, in order.
@@ -300,7 +291,7 @@ impl GraphBuilder {
                 .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
             // Contexts in the edited contig, for storing shared SNPs once.
             let edited = snps::with_contexts(&oriented, edits);
-            let (dictionary, implicit) = nlz::parse(&oriented, sbwt, lcs).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
+            let (dictionary, implicit) = nlz::parse(&oriented, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
             Ok((oriented.len(), dictionary, implicit, edited))
         }).collect();
 

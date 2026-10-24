@@ -20,7 +20,8 @@
 //! - [graph]: NLZ-OG, the dictionaries of many sequences as coloured paths in
 //!   a shared graph (the archive format);
 //! - [tigs]: the index tigs, the _k_-mer set of the index;
-//! - [walk]: walking the de Bruijn graph of the index; [edits]: SNPs and
+//! - [index]: the SBWT index with its LCS array ([Index]); [walk]: walking
+//!   its de Bruijn graph; [edits]: SNPs and
 //!   small indels towards the index; [strands]: choosing the strand of each
 //!   contig; [codecs]: the codecs shared by the formats; [fastx]: reading
 //!   and writing FASTA and FASTQ files.
@@ -30,6 +31,7 @@ pub mod codecs;
 pub mod edits;
 pub mod fastx;
 pub mod graph;
+pub mod index;
 pub mod nlz;
 pub mod strands;
 pub mod walk;
@@ -38,12 +40,12 @@ pub mod tigs;
 pub mod graphview;
 
 pub use archive::{ArchiveReader, ArchiveWriter};
+pub use index::Index;
 
 /// Test data shared by the modules' tests.
 #[cfg(test)]
 pub(crate) mod testing {
-    use sbwt::LcsArray;
-    use sbwt::sbwt_index_variant::SbwtIndexVariant;
+    use crate::index::{BuildOpts, Index};
 
     /// A random sequence of `len` bases from `seed`.
     pub(crate) fn random_sequence(len: usize, seed: u64) -> Vec<u8> {
@@ -56,7 +58,7 @@ pub(crate) mod testing {
 
     /// Four related sequences (one with substitutions every 97, 211 and 401
     /// bases), so the de Bruijn graph branches, and their index for `k`.
-    pub(crate) fn related_index(k: usize) -> (Vec<Vec<u8>>, SbwtIndexVariant, LcsArray) {
+    pub(crate) fn related_index(k: usize) -> (Vec<Vec<u8>>, Index) {
         let base = random_sequence(3000, 1);
         let mut seqs = vec![base.clone()];
         for (seed, step) in [(2, 97), (3, 211), (4, 401)] {
@@ -67,12 +69,8 @@ pub(crate) mod testing {
             }
             seqs.push(variant);
         }
-        let mut opts = kbo::BuildOpts::default();
-        opts.k = k;
-        opts.add_revcomp = true;
-        opts.build_select = true;
-        let (variant, lcs) = kbo::build(&seqs, opts);
-        (seqs, variant, lcs)
+        let index = Index::build(&seqs, &BuildOpts { k, ..Default::default() });
+        (seqs, index)
     }
 
 }

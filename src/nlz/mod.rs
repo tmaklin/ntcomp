@@ -24,11 +24,10 @@
 //!
 use std::ops::Range;
 
-use sbwt::LcsArray;
-use sbwt::StreamingIndex;
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
-
-use crate::walk::{IndexWalk, LcsIndex, WalkIndex};
+use crate::index::Index;
+#[cfg(doc)]
+use crate::walk::WalkIndex;
+use crate::walk::IndexWalk;
 
 pub mod legacy;
 
@@ -150,75 +149,70 @@ pub fn left_extend_kmer(
 /// decoder can recover the length by extending the k-mer as far as possible.
 pub fn parse(
     nucleotides: &[u8],
-    sbwt: &SbwtIndexVariant,
-    lcs: &LcsArray,
+    index: &Index,
 ) -> Result<(Vec<(usize, Range<usize>)>, Vec<bool>), E> {
     let n = nucleotides.len();
     let mut implicit: Vec<bool> = Vec::new();
-    let dictionary: Vec<(usize, Range<usize>)> = match sbwt {
-        SbwtIndexVariant::SubsetMatrix(sbwt) => {
-            let k = sbwt.k();
-            let index = StreamingIndex::new(sbwt, lcs);
-            let mut res = index.matching_statistics(nucleotides);
-            let walk = LcsIndex { sbwt, lcs };
+    let dictionary: Vec<(usize, Range<usize>)> = {
+        let k = index.k();
+        let mut res = index.streaming().matching_statistics(nucleotides);
 
-            let mut i = n;
-            let mut kept: Vec<usize> = Vec::new();
-            while i > 0 {
-                if res[i - 1].0 == k && i > k + 1 {
-                    // Left extend as [left_extend_kmer] with the sequence as the
-                    // reference, through the rows of the matching statistics: the
-                    // k-mer ending one base to the left is the predecessor the
-                    // sequence takes, and its group holds all the predecessors.
-                    let max_extension_len = i - k - 1;
-                    let mut row = res[i - 1].1.start;
-                    let mut extension_len = 0;
-                    let mut stopped_in_sbwt = false;
-                    while extension_len < max_extension_len {
-                        let left = i - 2 - extension_len;
-                        if res[left].0 == k {
-                            let predecessor = res[left].1.start;
-                            if !walk.only_in_group(predecessor) {
-                                stopped_in_sbwt = true;
-                                break
-                            }
-                            row = predecessor;
-                            extension_len += 1;
-                        } else {
-                            // The sequence's predecessor is not in the index: the
-                            // extension stops in the SBWT unless the k-mer has exactly
-                            // one (real) predecessor, a different one.
-                            stopped_in_sbwt = !sbwt.inverse_lf_step(row).is_some_and(|predecessor| {
-                                walk.only_in_group(predecessor) && walk.is_real_kmer(predecessor)
-                            });
+        let mut i = n;
+        let mut kept: Vec<usize> = Vec::new();
+        while i > 0 {
+            if res[i - 1].0 == k && i > k + 1 {
+                // Left extend as [left_extend_kmer] with the sequence as the
+                // reference, through the rows of the matching statistics: the
+                // k-mer ending one base to the left is the predecessor the
+                // sequence takes, and its group holds all the predecessors.
+                let max_extension_len = i - k - 1;
+                let mut row = res[i - 1].1.start;
+                let mut extension_len = 0;
+                let mut stopped_in_sbwt = false;
+                while extension_len < max_extension_len {
+                    let left = i - 2 - extension_len;
+                    if res[left].0 == k {
+                        let predecessor = res[left].1.start;
+                        if !index.only_in_group(predecessor) {
+                            stopped_in_sbwt = true;
                             break
                         }
-                    }
-                    let phrase_len = k + extension_len;
-
-                    // Store the whole left extension; the next entry ends where it starts.
-                    res[i - 1].0 = phrase_len;
-                    kept.push(i - 1);
-                    implicit.push(stopped_in_sbwt);
-                    i -= phrase_len - 1;
-                } else {
-                    kept.push(i - 1);
-                    implicit.push(false);
-                    if i > res[i - 1].0 {
-                        i -= res[i - 1].0 - 1;
+                        row = predecessor;
+                        extension_len += 1;
                     } else {
-                        break;
+                        // The sequence's predecessor is not in the index: the
+                        // extension stops in the SBWT unless the k-mer has exactly
+                        // one (real) predecessor, a different one.
+                        stopped_in_sbwt = !index.sbwt().inverse_lf_step(row).is_some_and(|predecessor| {
+                            index.only_in_group(predecessor) && index.is_real_kmer(predecessor)
+                        });
+                        break
                     }
                 }
+                let phrase_len = k + extension_len;
 
-                if i > 0 {
-                    i -= 1;
+                // Store the whole left extension; the next entry ends where it starts.
+                res[i - 1].0 = phrase_len;
+                kept.push(i - 1);
+                implicit.push(stopped_in_sbwt);
+                i -= phrase_len - 1;
+            } else {
+                kept.push(i - 1);
+                implicit.push(false);
+                if i > res[i - 1].0 {
+                    i -= res[i - 1].0 - 1;
                 } else {
                     break;
                 }
             }
-            kept.iter().map(|x| res[*x].clone()).collect()
-        },
+
+            if i > 0 {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        kept.iter().map(|x| res[*x].clone()).collect()
     };
 
     let dictionary_bases = dictionary.iter().map(|x| x.0).sum::<usize>();
@@ -240,50 +234,44 @@ pub fn parse(
 /// the k-mer as far as the encoder could have extended it at that position and
 /// explicit and plain by taking the suffix length stored inside [SuffixLen].
 ///
-/// The k-mers are extended by walking the de Bruijn graph of the SBWT
-/// ([IndexWalk::left_extend](crate::walk::IndexWalk::left_extend)), with
-/// `lcs` if given and with LCS values computed from the SBWT otherwise.
+/// The k-mers are extended by walking the de Bruijn graph of the `index`
+/// ([IndexWalk::left_extend]): an [Index], or a [WalkIndex] without the LCS
+/// array (the LCS values are then computed from the SBWT).
 ///
 /// Fails if the dictionary does not cover exactly `sequence_length` bases.
-pub fn decode_dictionary(
+pub fn decode_dictionary<I: IndexWalk>(
     dictionary: Vec<(u32, SuffixLen)>,
     sequence_length: usize,
-    sbwt: &SbwtIndexVariant,
-    lcs: Option<&LcsArray>,
+    index: &I,
 ) -> Result<Vec<u8>, DecodeError> {
     let mut sequence: Vec<u8> = vec![0; sequence_length];
     let mut end = sequence_length;
-    match sbwt {
-        SbwtIndexVariant::SubsetMatrix(sbwt) => {
-            let k = sbwt.k();
-            // Left extension of the k-mer at `colex_rank` by walking the SBWT.
-            let walk = WalkIndex { sbwt, lcs };
-            let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| walk.left_extend(colex_rank as usize, max_extension_len, implicit).0;
-            for (colex_rank, suffix_len) in dictionary {
-                let (kmer, len) = match suffix_len {
-                    SuffixLen::Implicit => {
-                        // The encoder extends at most end - k - 1 characters.
-                        let new_kmer = extend(colex_rank, end.saturating_sub(k + 1), true);
-                        let len = new_kmer.len();
-                        (new_kmer, len)
-                    },
-                    SuffixLen::Explicit { suffix_len: len } => {
-                        let new_kmer = extend(colex_rank, (len - k as u32) as usize, false);
-                        assert_eq!(new_kmer.len(), len as usize);
-                        (new_kmer, len as usize)
-                    },
-                    SuffixLen::Plain { suffix_len: len } => {
-                        (sbwt.access_kmer(colex_rank as usize), len as usize)
-                    },
-                };
-                if len > end {
-                    return Err(DecodeError(format!("dictionary covers more than {} bases", sequence_length)))
-                }
-                sequence[(end - len)..end].copy_from_slice(&kmer[(kmer.len() - len)..]);
-                end -= len;
-            }
-        },
-    };
+    let (sbwt, k) = (index.sbwt(), index.k());
+    // Left extension of the k-mer at `colex_rank` by walking the SBWT.
+    let extend = |colex_rank: u32, max_extension_len: usize, implicit: bool| index.left_extend(colex_rank as usize, max_extension_len, implicit).0;
+    for (colex_rank, suffix_len) in dictionary {
+        let (kmer, len) = match suffix_len {
+            SuffixLen::Implicit => {
+                // The encoder extends at most end - k - 1 characters.
+                let new_kmer = extend(colex_rank, end.saturating_sub(k + 1), true);
+                let len = new_kmer.len();
+                (new_kmer, len)
+            },
+            SuffixLen::Explicit { suffix_len: len } => {
+                let new_kmer = extend(colex_rank, (len - k as u32) as usize, false);
+                assert_eq!(new_kmer.len(), len as usize);
+                (new_kmer, len as usize)
+            },
+            SuffixLen::Plain { suffix_len: len } => {
+                (sbwt.access_kmer(colex_rank as usize), len as usize)
+            },
+        };
+        if len > end {
+            return Err(DecodeError(format!("dictionary covers more than {} bases", sequence_length)))
+        }
+        sequence[(end - len)..end].copy_from_slice(&kmer[(kmer.len() - len)..]);
+        end -= len;
+    }
     if end != 0 {
         return Err(DecodeError(format!("dictionary covers {} of {} bases", sequence_length - end, sequence_length)))
     }
@@ -311,9 +299,8 @@ mod tests {
     #[test]
     fn left_extensions_with_and_without_lcs_agree() {
         // Related sequences with substitutions, so the de Bruijn graph branches.
-        let (seqs, variant, lcs) = related_index(15);
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
-        let k = sbwt.k();
+        let (seqs, index) = related_index(15);
+        let (sbwt, k) = (index.sbwt(), index.k());
 
         let mut n_extended = 0;
         for seq in &seqs {
@@ -325,7 +312,7 @@ mod tests {
                 // Walking the SBWT from the k-mer's row, with the LCS array or the
                 // LCS values from the SBWT: checked, and by a known length.
                 let row = sbwt.search(kmer).unwrap().start;
-                let (with_array, without) = (LcsIndex { sbwt, lcs: &lcs }, WalkIndex { sbwt, lcs: None });
+                let (with_array, without) = (&index, crate::walk::WalkIndex { sbwt, lcs: None });
                 assert_eq!(with_array.left_extend(row, max, true), searched);
                 assert_eq!(without.left_extend(row, max, true), searched);
                 assert_eq!(with_array.left_extend(row, plain.len() - k, false).0, plain);
@@ -334,7 +321,7 @@ mod tests {
 
             // The encoder's extensions from the matching statistics are those of
             // left_extend_kmer with the sequence as the reference.
-            let (dictionary, implicit) = parse(seq, &variant, &lcs).unwrap();
+            let (dictionary, implicit) = parse(seq, &index).unwrap();
             let mut end = seq.len();
             for ((len, _), &imp) in dictionary.iter().zip(&implicit) {
                 if *len >= k && end > k + 1 {
@@ -356,8 +343,8 @@ mod tests {
                 };
                 (colex.start as u32, suffix_len)
             }).collect::<Vec<_>>();
-            assert_eq!(&decode_dictionary(path(()), seq.len(), &variant, None).unwrap(), seq);
-            assert_eq!(&decode_dictionary(path(()), seq.len(), &variant, Some(&lcs)).unwrap(), seq);
+            assert_eq!(&decode_dictionary(path(()), seq.len(), &crate::walk::WalkIndex { sbwt, lcs: None }).unwrap(), seq);
+            assert_eq!(&decode_dictionary(path(()), seq.len(), &index).unwrap(), seq);
         }
         assert!(n_extended > 0, "no k-mer was left extended");
     }

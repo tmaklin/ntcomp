@@ -23,8 +23,7 @@ use crate::codecs::lzma::{self, LzmaData};
 use super::StoredGraph;
 use crate::walk::WalkIndex;
 
-use sbwt::LcsArray;
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
+use crate::index::Index;
 
 use core::ops::Range;
 
@@ -165,16 +164,14 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     }
 
     /// Same as [GraphDecoder::decode_from_read] for an archive written with
-    /// [GraphEncoder::with_index](super::encoder::GraphEncoder::with_index):
-    /// the _k_-mer size comes from `sbwt`, and the LCS values from `lcs` if
-    /// given, else they are computed from `sbwt` (slower).
+    /// [GraphEncoder::with_index](super::encoder::GraphEncoder::with_index)
+    /// and `index`. (To decode without the LCS array, see
+    /// [GraphDecoder::decode_from_read_with].)
     pub fn decode_from_read_with_index(
         self,
-        sbwt: &SbwtIndexVariant,
-        lcs: Option<&LcsArray>,
+        index: &Index,
     ) -> Result<DecodedSections, E> {
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = sbwt;
-        self.decode_from_read_with(Some(WalkIndex { sbwt, lcs }), Some(sbwt.k().try_into()?))
+        self.decode_from_read_with(Some(index.walk_index()), Some(index.k().try_into()?))
     }
 
     /// Same as [GraphDecoder::decode_from_read]; `index` is needed if the
@@ -326,21 +323,20 @@ mod tests {
     #[test]
     fn archives_written_with_the_index_decode_with_or_without_its_lcs_array() {
         use crate::graph::{StoredGraph, GraphWalk};
-        let (seqs, variant, lcs) = related_index(15);
+        let (seqs, index) = related_index(15);
         let mut builder = crate::graph::GraphBuilder::new().collapse_chains(true);
         for seq in &seqs {
-            builder.add_contig(seq, &variant, &lcs).unwrap();
+            builder.add_contig(seq, &index).unwrap();
         }
         let (stored, choices) = builder.finish();
         let walks: Vec<_> = (0..seqs.len() as u32).map(|c| stored.walk_path(&choices, c).unwrap()).collect();
         let mut with_lcs = Vec::new();
-        crate::graph::encoder::GraphEncoder::new(stored, choices).with_index(&variant, &lcs).encode_to_write(&mut with_lcs).unwrap();
+        crate::graph::encoder::GraphEncoder::new(stored, choices).with_index(&index).encode_to_write(&mut with_lcs).unwrap();
 
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = &variant;
-        for array in [Some(&lcs), None] {
-            let index = crate::walk::WalkIndex { sbwt, lcs: array };
+        for array in [Some(index.lcs()), None] {
+            let walk = crate::walk::WalkIndex { sbwt: index.sbwt(), lcs: array };
             let mut input = with_lcs.as_slice();
-            let (graph, choices, ..) = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(index), Some(15)).unwrap();
+            let (graph, choices, ..) = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(walk), Some(15)).unwrap();
             for (color, walk) in walks.iter().enumerate() {
                 assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
             }

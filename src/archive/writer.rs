@@ -18,10 +18,8 @@ use std::ops::Range;
 
 use rayon::prelude::*;
 
-use sbwt::LcsArray;
-use sbwt::sbwt_index_variant::SbwtIndexVariant;
-
 use crate::fastx::Contig;
+use crate::index::Index;
 use crate::graph::encoder::GraphEncoder;
 use crate::graph::{contig_hash, ContigHash, GraphBuilder};
 
@@ -38,8 +36,7 @@ pub type InputFile = (Vec<u8>, Vec<Contig>);
 /// before they are added ([ArchiveWriter::add_files]) in the same order.
 pub struct ArchiveWriter<'a> {
     builder: GraphBuilder,
-    sbwt: &'a SbwtIndexVariant,
-    lcs: &'a LcsArray,
+    index: &'a Index,
     hashes: Vec<ContigHash>,
     contig_names: Vec<Vec<u8>>,
     file_ranges: Vec<(Vec<u8>, Range<u32>)>,
@@ -47,13 +44,12 @@ pub struct ArchiveWriter<'a> {
 
 impl<'a> ArchiveWriter<'a> {
     /// A writer that adds the contigs to `builder` (with its options) and
-    /// encodes them against the index `sbwt` with its LCS array `lcs`.
+    /// encodes them against `index`.
     pub fn new(
         builder: GraphBuilder,
-        sbwt: &'a SbwtIndexVariant,
-        lcs: &'a LcsArray,
+        index: &'a Index,
     ) -> Self {
-        ArchiveWriter { builder, sbwt, lcs, hashes: Vec::new(), contig_names: Vec::new(), file_ranges: Vec::new() }
+        ArchiveWriter { builder, index, hashes: Vec::new(), contig_names: Vec::new(), file_ranges: Vec::new() }
     }
 
     /// First pass of editing: chooses the strands and calls the edits of the
@@ -63,7 +59,7 @@ impl<'a> ArchiveWriter<'a> {
         files: &[InputFile],
     ) -> Vec<u32> {
         let sequences: Vec<&[u8]> = files.iter().flat_map(|(_, contigs)| contigs).map(|(_, sequence)| sequence.as_slice()).collect();
-        self.builder.call_edits_batch(&sequences, self.sbwt, self.lcs)
+        self.builder.call_edits_batch(&sequences, self.index)
     }
 
     /// Adds the contigs of `files`. Returns the colours they got.
@@ -73,7 +69,7 @@ impl<'a> ArchiveWriter<'a> {
     ) -> Result<Vec<u32>, E> {
         let sequences: Vec<&[u8]> = files.iter().flat_map(|(_, contigs)| contigs).map(|(_, sequence)| sequence.as_slice()).collect();
         self.hashes.par_extend(sequences.par_iter().map(|sequence| contig_hash(sequence)));
-        let added = self.builder.add_contigs(&sequences, self.sbwt, self.lcs)?;
+        let added = self.builder.add_contigs(&sequences, self.index)?;
         let mut color = self.contig_names.len() as u32;
         debug_assert_eq!(added.first().map_or(color, |&c| c), color);
         for (file_name, contigs) in files {
@@ -104,7 +100,7 @@ impl<'a> ArchiveWriter<'a> {
             .with_contig_names(self.contig_names)
             .with_file_ranges(self.file_ranges)
             .with_reversed(reversed)
-            .with_index(self.sbwt, self.lcs);
+            .with_index(self.index);
         if let Some(snp_edits) = snp_edits {
             encoder = encoder.with_snp_edits(snp_edits);
         }

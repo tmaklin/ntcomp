@@ -28,9 +28,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use sbwt::StreamingIndex;
 
-use crate::walk::{IndexWalk, LcsIndex, Pattern};
+use crate::index::Index;
+use crate::walk::{IndexWalk, Pattern};
 
 /// Bases on both sides of an edit that identify it across contigs.
 pub const FLANK: usize = 32;
@@ -93,6 +93,10 @@ fn key(
     hasher.finish()
 }
 
+/// Largest probability of a random match that edits are called after, see
+/// [call_edits] (the default of kbo's variant caller).
+const MAX_ERROR_PROB: f64 = 0.0000001;
+
 /// Most edits in one stretch of the contig not in the index, see
 /// [call_edits].
 const MAX_EDITS: usize = 5;
@@ -120,7 +124,7 @@ enum TriedChange {
 /// starting from the match `pattern`: at most [MAX_EDITS], substitutions only
 /// or also indels. None if the walk does not get through.
 fn repair(
-    index: &LcsIndex,
+    index: &Index,
     sequence: &[u8],
     mut pattern: Pattern,
     mut pos: usize,
@@ -192,7 +196,7 @@ fn repair(
 /// by walking its de Bruijn graph; sorted by position.
 ///
 /// Where the contig's match in the index (its matching statistics), at least
-/// as long as a random match is unlikely to be ([random_match_threshold](kbo::derandomize::random_match_threshold)),
+/// as long as a random match is unlikely to be ([Index::random_match_threshold] for [MAX_ERROR_PROB]),
 /// cannot be extended by the next base at p, every other base b is tried:
 /// the match followed by b and then by the contig's bases, one step right in
 /// the index at a time. If that walk takes the next _k_ − 1 bases, every
@@ -207,15 +211,15 @@ fn repair(
 /// again, and a base not in the index there is repaired from that walk.
 pub fn call_edits(
     sequence: &[u8],
-    index: &LcsIndex,
+    index: &Index,
 ) -> Vec<CalledEdit> {
     let k = index.k();
     let n = sequence.len();
     if n <= k {
         return Vec::new()
     }
-    let min_match = kbo::derandomize::random_match_threshold(k, index.sbwt.n_kmers(), 4, kbo::CallOpts::default().max_error_prob);
-    let ms = StreamingIndex::new(index.sbwt, index.lcs).matching_statistics(sequence);
+    let min_match = index.random_match_threshold(MAX_ERROR_PROB);
+    let ms = index.streaming().matching_statistics(sequence);
 
     let mut edits: Vec<Edit> = Vec::new();
     // The edited contig's match ending at i - 1, if a walk after an edit
@@ -313,20 +317,14 @@ pub fn apply_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::BuildOpts;
     use crate::testing::random_sequence;
-    use sbwt::sbwt_index_variant::SbwtIndexVariant;
 
     #[test]
     fn edits_are_called_by_walking_the_index() {
         let reference = random_sequence(4000, 11);
         let k = 63;
-        let mut opts = kbo::BuildOpts::default();
-        opts.k = k;
-        opts.add_revcomp = true;
-        opts.build_select = true;
-        let (sbwt, lcs) = kbo::build(&[reference.clone()], opts);
-        let SbwtIndexVariant::SubsetMatrix(sbwt) = &sbwt;
-        let index = LcsIndex { sbwt, lcs: &lcs };
+        let index = Index::build(&[reference.clone()], &BuildOpts { k, ..Default::default() });
 
         // An isolated SNP, three within k of each other, one too close to the
         // end to be followed by k - 1 bases, an extra base in the contig (a
