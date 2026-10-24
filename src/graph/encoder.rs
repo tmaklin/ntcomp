@@ -120,7 +120,8 @@ impl<'a> GraphEncoder<'a> {
         self
     }
 
-    /// Add the strands of the contigs, see [GraphBuilder::reversed](super::GraphBuilder::reversed).
+    /// Add the strands of the contigs: true if a contig is stored reverse
+    /// complemented (see [ArchiveWriter](crate::archive::ArchiveWriter)).
     pub fn with_reversed(
         mut self,
         reversed: Vec<bool>,
@@ -143,7 +144,7 @@ impl<'a> GraphEncoder<'a> {
         self
     }
 
-    /// Add the edited SNPs, see [GraphBuilder::snp_edits](super::GraphBuilder::snp_edits).
+    /// Add the edited SNPs (see [ArchiveWriter](crate::archive::ArchiveWriter)).
     pub fn with_snp_edits(
         mut self,
         snp_edits: SnpEdits,

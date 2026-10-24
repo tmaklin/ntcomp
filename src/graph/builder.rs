@@ -11,23 +11,18 @@
 // the MIT license, <LICENSE-MIT> or <http://opensource.org/licenses/MIT>,
 // at your option.
 //
-//! Building the graph from the contigs' NLZ dictionaries.
+//! Building the graph from the contigs' NLZ dictionaries ([nlz::parse](crate::nlz::parse)),
+//! one path per colour. Choosing the strands and editing the contigs before
+//! parsing them is the archive's ([crate::archive::ArchiveWriter]).
 //!
 use core::ops::Range;
 
 use indexmap::IndexSet;
 
-use rayon::prelude::*;
-
-use crate::edits::{self, Edit};
-use crate::strands::{self, StrandChooser};
-use crate::index::Index;
-
 use super::choices::{ChoiceWriter, Choices};
 use super::collapsed::ChainCsr;
-use super::snps::{self, SnpEdits};
-use crate::nlz::{self, IMPLICIT_SUFFIX_LEN};
-use super::{Csr, GraphWalk, StoredGraph, E, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
+use crate::nlz::IMPLICIT_SUFFIX_LEN;
+use super::{Csr, GraphWalk, StoredGraph, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
 
 /// Builds the graph and remembers the path each colour takes.
 pub struct GraphBuilder {
@@ -46,28 +41,6 @@ pub struct GraphBuilder {
 
     /// Store linear chains as single edges in [GraphBuilder::finish]
     collapse_chains: bool,
-
-    /// Choose the strand of every contig added with [GraphBuilder::add_contig]
-    reorient_contigs: bool,
-
-    /// One in this many _k_-mers is sampled for choosing the strands, see [strands]
-    reorient_sampling: u64,
-
-    /// Created when the first contig is added with reorienting on
-    strand_chooser: Option<StrandChooser>,
-
-    /// Per colour: true if the contig is stored reverse complemented
-    reversed: Vec<bool>,
-
-    /// Edit SNPs towards the index in [GraphBuilder::add_contig]
-    edit_snps: bool,
-
-    /// Per colour from [GraphBuilder::call_edits]: the chosen strand and the
-    /// SNPs on it, until the contig is added
-    called: Vec<(bool, Vec<Edit>)>,
-
-    /// Per colour: the edited SNPs
-    edited: Vec<Vec<snps::EditedSnp>>,
 }
 
 impl Default for GraphBuilder {
@@ -88,13 +61,6 @@ impl GraphBuilder {
             implicit: Vec::new(),
             paths: Vec::new(),
             collapse_chains: false,
-            reorient_contigs: false,
-            reorient_sampling: strands::DEFAULT_SAMPLING,
-            strand_chooser: None,
-            reversed: Vec::new(),
-            edit_snps: false,
-            called: Vec::new(),
-            edited: Vec::new(),
         }
     }
 
@@ -105,171 +71,6 @@ impl GraphBuilder {
     ) -> Self {
         self.collapse_chains = collapse;
         self
-    }
-
-    /// Store every contig added with [GraphBuilder::add_contig] on the strand
-    /// that shares the most with the contigs before it, see [strands].
-    pub fn reorient_contigs(
-        mut self,
-        reorient: bool,
-    ) -> Self {
-        self.reorient_contigs = reorient;
-        self
-    }
-
-    /// Sample one in `one_in` _k_-mers for choosing the strands
-    /// ([strands::DEFAULT_SAMPLING] by default); panics if `one_in` is 0.
-    pub fn reorient_sampling(
-        mut self,
-        one_in: u64,
-    ) -> Self {
-        assert!(one_in > 0, "sampling width must be at least 1");
-        self.reorient_sampling = one_in;
-        self
-    }
-
-    /// Edit SNPs towards the index before encoding, see [snps].
-    ///
-    /// Needs two passes over the contigs: [GraphBuilder::call_edits] for every
-    /// contig first, then [GraphBuilder::add_contig] for every contig in the
-    /// same order. The edited SNPs, [GraphBuilder::snp_edits], have to be put
-    /// back after decoding.
-    pub fn edit_snps(
-        mut self,
-        edit: bool,
-    ) -> Self {
-        self.edit_snps = edit;
-        self
-    }
-
-    /// Per colour: true if the contig is stored reverse complemented.
-    ///
-    /// Only contigs added with [GraphBuilder::add_contig] with
-    /// [GraphBuilder::reorient_contigs] on can be reversed. Their decoded
-    /// sequences have to be reverse complemented to get the input back.
-    pub fn reversed(&self) -> &[bool] {
-        &self.reversed
-    }
-
-    /// Edited SNPs of every colour, None if no SNP was edited.
-    ///
-    /// They are put back into the decoded contig with [SnpEdits::revert]
-    /// before reverse complementing it.
-    pub fn snp_edits(&self) -> Option<SnpEdits> {
-        if self.edited.iter().all(|snps| snps.is_empty()) {
-            return None
-        }
-        Some(SnpEdits::with_repeats(&self.edited))
-    }
-
-    /// Chooses the strands of `sequences`, in order, if
-    /// [GraphBuilder::reorient_contigs] is on. The _k_-mers are sampled in
-    /// parallel.
-    fn choose_strands(
-        &mut self,
-        sequences: &[&[u8]],
-    ) -> Vec<bool> {
-        if !self.reorient_contigs {
-            return vec![false; sequences.len()]
-        }
-        let sampling = self.reorient_sampling;
-        let chooser = self.strand_chooser.get_or_insert_with(|| StrandChooser::new(sampling));
-        let sketches: Vec<_> = sequences.par_iter().map(|sequence| chooser.sketch(sequence)).collect();
-        sketches.into_iter().map(|sketch| chooser.choose_sketched(sketch)).collect()
-    }
-
-    /// First pass of [GraphBuilder::edit_snps]: chooses the strand of the
-    /// next contig and calls its SNPs on that strand. Returns the colour the
-    /// contig will get from [GraphBuilder::add_contig].
-    ///
-    /// Arguments as in [GraphBuilder::add_contig].
-    pub fn call_edits(
-        &mut self,
-        sequence: &[u8],
-        index: &Index,
-    ) -> u32 {
-        self.call_edits_batch(&[sequence], index)[0]
-    }
-
-    /// Same as [GraphBuilder::call_edits] for the next `sequences.len()`
-    /// contigs, in order. The SNPs are called in parallel; the result is the
-    /// same as calling [GraphBuilder::call_edits] for each.
-    pub fn call_edits_batch(
-        &mut self,
-        sequences: &[&[u8]],
-        index: &Index,
-    ) -> Vec<u32> {
-        let strands = self.choose_strands(sequences);
-        let called: Vec<Vec<Edit>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
-            if reversed {
-                edits::call_edits(&strands::reverse_complement(sequence), index)
-            } else {
-                edits::call_edits(sequence, index)
-            }
-        }).collect();
-        let first: u32 = self.called.len().try_into().unwrap();
-        self.called.extend(strands.into_iter().zip(called));
-        (first..(first + sequences.len() as u32)).collect()
-    }
-
-    /// Encodes the next contig and adds its path.
-    ///
-    /// With [GraphBuilder::reorient_contigs] on, chooses the strand of the contig
-    /// first and encodes that strand. With [GraphBuilder::edit_snps] on, the
-    /// strand comes from [GraphBuilder::call_edits], which must have been called
-    /// for this contig, and its SNPs and small indels are edited before
-    /// encoding. `sequence` is a normalized nucleotide sequence, and `index`
-    /// is the index passed to [nlz::parse].
-    pub fn add_contig(
-        &mut self,
-        sequence: &[u8],
-        index: &Index,
-    ) -> Result<u32, E> {
-        Ok(self.add_contigs(&[sequence], index)?[0])
-    }
-
-    /// Same as [GraphBuilder::add_contig] for the next `sequences.len()`
-    /// contigs, in order. The contigs are encoded in parallel; the graph is
-    /// the same as from adding them one at a time.
-    pub fn add_contigs(
-        &mut self,
-        sequences: &[&[u8]],
-        index: &Index,
-    ) -> Result<Vec<u32>, E> {
-        let first_color = self.paths.len();
-        // Strands and SNPs to edit, in order.
-        let prepared: Vec<(bool, Vec<Edit>)> = if self.edit_snps {
-            // The strands were chosen in the first pass.
-            self.strand_chooser = None;
-            if self.called.len() < first_color + sequences.len() {
-                return Err(format!("SNPs of colour {} were not called before adding it", self.called.len().max(first_color)).into())
-            }
-            self.called[first_color..(first_color + sequences.len())].iter_mut().map(|(reversed, called)| (*reversed, std::mem::take(called))).collect()
-        } else {
-            self.choose_strands(sequences).into_iter().map(|reversed| (reversed, Vec::new())).collect()
-        };
-
-        let strands: Vec<bool> = prepared.iter().map(|(reversed, _)| *reversed).collect();
-        type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>, Vec<snps::EditedSnp>);
-        let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edited)))| {
-            let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
-            let (oriented, edits) = edits::apply_edits(&oriented, edited)
-                .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
-            // Contexts in the edited contig, for storing shared SNPs once.
-            let edited = snps::with_contexts(&oriented, edits);
-            let (dictionary, implicit) = nlz::parse(&oriented, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
-            Ok((oriented.len(), dictionary, implicit, edited))
-        }).collect();
-
-        let mut colors = Vec::with_capacity(sequences.len());
-        for (encoded, reversed) in encoded.into_iter().zip(strands) {
-            let (len, dictionary, implicit, edited) = encoded?;
-            let color = self.add_path_with_flags(len, &dictionary, &implicit);
-            self.reversed[color as usize] = reversed;
-            self.edited[color as usize] = edited;
-            colors.push(color);
-        }
-        Ok(colors)
     }
 
     fn insert_node(
@@ -300,7 +101,7 @@ impl GraphBuilder {
 
     /// Adds the dictionary of the next colour.
     ///
-    /// `dictionary` is the output of [nlz::parse]. The edge out of
+    /// `dictionary` is the output of [nlz::parse](crate::nlz::parse). The edge out of
     /// the source node stores `sequence_length`.
     pub fn add_path(
         &mut self,
@@ -313,7 +114,7 @@ impl GraphBuilder {
     /// Same as [GraphBuilder::add_path] but stores the suffix length of the
     /// entries flagged in `implicit` as [SuffixLen::Implicit](crate::nlz::SuffixLen::Implicit).
     ///
-    /// `dictionary` and `implicit` are the output of [nlz::parse].
+    /// `dictionary` and `implicit` are the output of [nlz::parse](crate::nlz::parse).
     pub fn add_path_with_flags(
         &mut self,
         sequence_length: usize,
@@ -338,8 +139,6 @@ impl GraphBuilder {
         path.push(self.edge(prev, SINK_NODE, prev_weight, prev_implicit));
 
         self.paths.push(path);
-        self.reversed.push(false);
-        self.edited.push(Vec::new());
         color
     }
 

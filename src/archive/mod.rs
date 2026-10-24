@@ -21,12 +21,11 @@ pub mod reader;
 pub mod writer;
 
 pub use reader::{ArchiveReader, ContigDecoder, DecodedContig};
-pub use writer::{ArchiveWriter, InputFile};
+pub use writer::{ArchiveOpts, ArchiveWriter, InputFile};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::GraphBuilder;
     use crate::testing::related_index;
 
     #[test]
@@ -37,8 +36,8 @@ mod tests {
         contigs[2].1 = crate::strands::reverse_complement(&contigs[2].1);
         let files: Vec<InputFile> = vec![(b"first".to_vec(), contigs[..1].to_vec()), (b"second".to_vec(), contigs[1..].to_vec())];
 
-        let builder = GraphBuilder::new().collapse_chains(true).reorient_contigs(true).edit_snps(true);
-        let mut writer = ArchiveWriter::new(builder, &index);
+        let opts = ArchiveOpts { collapse_chains: true, reorient: true, edit: true, ..Default::default() };
+        let mut writer = ArchiveWriter::new(opts, &index);
         assert_eq!(writer.call_edits(&files), vec![0, 1, 2, 3]);
         assert_eq!(writer.add_files(&files).unwrap(), vec![0, 1, 2, 3]);
         let mut bytes = Vec::new();

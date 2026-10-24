@@ -21,7 +21,7 @@ use indicatif::ProgressStyle;
 use log::info;
 use rayon::prelude::*;
 
-use ntcomp::archive::InputFile;
+use ntcomp::archive::{ArchiveOpts, InputFile};
 use ntcomp::fastx;
 use ntcomp::{ArchiveReader, ArchiveWriter, Index};
 
@@ -321,12 +321,13 @@ fn main() {
                 let progress = ProgressBar::new(n_queries as u64);
                 progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}").unwrap());
 
-                let builder = ntcomp::graph::GraphBuilder::new()
-                    .collapse_chains(*collapse_chains)
-                    .reorient_contigs(*reorient)
-                    .reorient_sampling(*reorient_sampling)
-                    .edit_snps(*edit_snps);
-                let mut writer = ArchiveWriter::new(builder, &index);
+                let opts = ArchiveOpts {
+                    collapse_chains: *collapse_chains,
+                    reorient: *reorient,
+                    reorient_sampling: *reorient_sampling,
+                    edit: *edit_snps,
+                };
+                let mut writer = ArchiveWriter::new(opts, &index);
 
                 // First pass for SNP editing: choose the strands and call the SNPs of every
                 // contig, `batch_size` input files at a time.

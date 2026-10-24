@@ -326,7 +326,8 @@ mod tests {
         let (seqs, index) = related_index(15);
         let mut builder = crate::graph::GraphBuilder::new().collapse_chains(true);
         for seq in &seqs {
-            builder.add_contig(seq, &index).unwrap();
+            let (dictionary, implicit) = crate::nlz::parse(seq, &index).unwrap();
+            builder.add_path_with_flags(seq.len(), &dictionary, &implicit);
         }
         let (stored, choices) = builder.finish();
         let walks: Vec<_> = (0..seqs.len() as u32).map(|c| stored.walk_path(&choices, c).unwrap()).collect();

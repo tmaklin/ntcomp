@@ -168,7 +168,7 @@ pub enum Commands {
         #[arg(long = "reorient", default_value_t = false, help = "Store every contig on the strand that shares the most with the contigs before it.")]
         reorient: bool,
 
-        #[arg(long = "reorient-sampling", default_value_t = 32, help = "Sample one in this many 31-mers for choosing the strands.")]
+        #[arg(long = "reorient-sampling", default_value_t = 32, value_parser = clap::value_parser!(u64).range(1..), help = "Sample one in this many 31-mers for choosing the strands.")]
         reorient_sampling: u64,
 
         // // Edit SNPs towards the index
