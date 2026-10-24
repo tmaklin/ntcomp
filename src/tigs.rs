@@ -340,7 +340,7 @@ fn repairable(
     index: &StreamingIndex<SbwtIndex<SubsetMatrix>, LcsArray>,
     k: usize,
 ) -> bool {
-    let edits: Vec<edits::Edit> = edits::call_edits(window, walk).into_iter().map(|called| called.edit).collect();
+    let edits = edits::call_edits(window, walk);
     if edits.is_empty() {
         return false
     }

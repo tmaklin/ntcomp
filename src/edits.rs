@@ -25,10 +25,6 @@
 //! ([crate::graph::snps]); the tig builder leaves out gaps that editing
 //! repairs ([crate::tigs]).
 //!
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
-
 use crate::index::Index;
 use crate::walk::{IndexWalk, Pattern};
 
@@ -54,14 +50,6 @@ pub struct Edit {
     pub change: Change,
 }
 
-/// A called edit (in the contig's coordinates) and the hash that identifies
-/// it across contigs ([FLANK] contig bases on both sides and the change).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CalledEdit {
-    pub edit: Edit,
-    pub key: u64,
-}
-
 pub(crate) fn base_code(
     base: u8,
 ) -> Option<u8> {
@@ -72,25 +60,6 @@ pub(crate) fn base_code(
         b'T' => Some(3),
         _ => None,
     }
-}
-
-/// Hash of the edit with [FLANK] bases of `sequence` on both sides (before
-/// its position and after the bases it changes or removes).
-fn key(
-    sequence: &[u8],
-    edit: &Edit,
-) -> u64 {
-    let pos = edit.pos as usize;
-    let after = match &edit.change {
-        Change::Sub { .. } => pos + 1,
-        Change::Del { bases } => pos + bases.len(),
-        Change::Ins { .. } => pos,
-    };
-    let mut hasher = DefaultHasher::new();
-    sequence[pos.saturating_sub(FLANK)..pos].hash(&mut hasher);
-    edit.change.hash(&mut hasher);
-    sequence[after..(after + FLANK).min(sequence.len())].hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Largest probability of a random match that edits are called after, see
@@ -212,7 +181,7 @@ fn repair(
 pub fn call_edits(
     sequence: &[u8],
     index: &Index,
-) -> Vec<CalledEdit> {
+) -> Vec<Edit> {
     let k = index.k();
     let n = sequence.len();
     if n <= k {
@@ -269,7 +238,7 @@ pub fn call_edits(
             None => i += 1,
         }
     }
-    edits.into_iter().map(|edit| CalledEdit { key: key(sequence, &edit), edit }).collect()
+    edits
 }
 
 /// `sequence` with `edits` (in its coordinates, increasing and not
@@ -345,7 +314,7 @@ mod tests {
         contig.insert(3301, other(3301, 2));
         contig.remove(2900);
         contig.insert(2500, extra);
-        let called: Vec<Edit> = call_edits(&contig, &index).into_iter().map(|called| called.edit).collect();
+        let called: Vec<Edit> = call_edits(&contig, &index);
         let subs: Vec<Edit> = called.iter().filter(|e| matches!(e.change, Change::Sub { .. })).cloned().collect();
         assert_eq!(subs[..4], expected[..]);
         // The indels: the extra base and the missing one, and two edits for the

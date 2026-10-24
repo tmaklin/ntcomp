@@ -243,7 +243,6 @@ fn main() {
             reorient,
             reorient_sampling,
             edit_snps,
-            edit_snps_max_shared,
             num_threads,
             batch_size,
             colors,
@@ -326,8 +325,7 @@ fn main() {
                     .collapse_chains(*collapse_chains)
                     .reorient_contigs(*reorient)
                     .reorient_sampling(*reorient_sampling)
-                    .edit_snps(*edit_snps)
-                    .edit_snps_max_shared(edit_snps_max_shared.map_or(ntcomp::graph::snps::DEFAULT_MAX_SHARED, |max| max as usize));
+                    .edit_snps(*edit_snps);
                 let mut writer = ArchiveWriter::new(builder, &index);
 
                 // First pass for SNP editing: choose the strands and call the SNPs of every

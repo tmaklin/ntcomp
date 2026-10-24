@@ -61,10 +61,6 @@ use std::hash::{Hash, Hasher};
 use crate::edits::{base_code, Change, Edit, FLANK};
 use crate::codecs::arith::{code_bit, code_tree, Coder, Decoder, Encoder, GammaModel, C0};
 
-/// Default for the largest number of contigs that may share a SNP for it to
-/// be edited: no limit, every SNP is edited.
-pub const DEFAULT_MAX_SHARED: usize = usize::MAX;
-
 /// Length of the context that locates a repeated SNP: [FLANK] bases on both
 /// sides of the index's base.
 pub const CONTEXT: usize = 2 * FLANK + 1;
@@ -754,35 +750,30 @@ mod tests {
         };
         let contigs = [with_snps(&[500, 1500, 2500]), with_snps(&[500, 1500, 2500]), with_snps(&[1000, 3000])];
 
-        for max_shared in [1, 2] {
-            let mut builder = GraphBuilder::new().collapse_chains(true).edit_snps(true).edit_snps_max_shared(max_shared);
-            assert!(builder.add_contig(&contigs[0], &index).is_err(), "SNPs must be called first");
-            for contig in &contigs {
-                builder.call_edits(contig, &index);
-            }
-            for contig in &contigs {
-                builder.add_contig(contig, &index).unwrap();
-            }
-            let edits = builder.snp_edits().unwrap();
-            // The shared SNPs are only edited if two contigs may share a SNP.
-            assert_eq!(edits.n_snps(), if max_shared == 1 { 2 } else { 8 });
-            let (graph, choices) = builder.finish();
-            // Decode every edited contig first: repeated SNPs need the contexts of
-            // earlier contigs.
-            let mut edited_seqs: Vec<Vec<u8>> = Vec::new();
-            for color in 0..contigs.len() {
-                let (len, dictionary) = graph.walk_path(&choices, color as u32).unwrap();
-                let dictionary = dictionary.into_iter().map(|(colex, len)| (colex, SuffixLen::from_stored(len, k))).collect();
-                edited_seqs.push(decode_dictionary(dictionary, len as usize, &index).unwrap());
-            }
-            if max_shared > 1 {
-                assert!(edits.n_repeats() > 0, "the second contig repeats the first one's SNPs");
-            }
-            for (color, contig) in contigs.iter().enumerate() {
-                let mut decoded = edited_seqs[color].clone();
-                edits.revert(color as u32, &mut decoded, &|f, pos| context_at(&edited_seqs[f as usize], pos as usize)).unwrap();
-                assert_eq!(&decoded, contig, "colour {}", color);
-            }
+        let mut builder = GraphBuilder::new().collapse_chains(true).edit_snps(true);
+        assert!(builder.add_contig(&contigs[0], &index).is_err(), "SNPs must be called first");
+        for contig in &contigs {
+            builder.call_edits(contig, &index);
+        }
+        for contig in &contigs {
+            builder.add_contig(contig, &index).unwrap();
+        }
+        let edits = builder.snp_edits().unwrap();
+        assert_eq!(edits.n_snps(), 8);
+        let (graph, choices) = builder.finish();
+        // Decode every edited contig first: repeated SNPs need the contexts of
+        // earlier contigs.
+        let mut edited_seqs: Vec<Vec<u8>> = Vec::new();
+        for color in 0..contigs.len() {
+            let (len, dictionary) = graph.walk_path(&choices, color as u32).unwrap();
+            let dictionary = dictionary.into_iter().map(|(colex, len)| (colex, SuffixLen::from_stored(len, k))).collect();
+            edited_seqs.push(decode_dictionary(dictionary, len as usize, &index).unwrap());
+        }
+        assert!(edits.n_repeats() > 0, "the second contig repeats the first one's SNPs");
+        for (color, contig) in contigs.iter().enumerate() {
+            let mut decoded = edited_seqs[color].clone();
+            edits.revert(color as u32, &mut decoded, &|f, pos| context_at(&edited_seqs[f as usize], pos as usize)).unwrap();
+            assert_eq!(&decoded, contig, "colour {}", color);
         }
     }
 }

@@ -15,13 +15,11 @@
 //!
 use core::ops::Range;
 
-use std::collections::HashMap;
-
 use indexmap::IndexSet;
 
 use rayon::prelude::*;
 
-use crate::edits::{self, CalledEdit};
+use crate::edits::{self, Edit};
 use crate::strands::{self, StrandChooser};
 use crate::index::Index;
 
@@ -64,15 +62,9 @@ pub struct GraphBuilder {
     /// Edit SNPs towards the index in [GraphBuilder::add_contig]
     edit_snps: bool,
 
-    /// Edit SNPs shared by at most this many contigs, see [snps]
-    snp_max_shared: usize,
-
     /// Per colour from [GraphBuilder::call_edits]: the chosen strand and the
     /// SNPs on it, until the contig is added
-    called: Vec<(bool, Vec<CalledEdit>)>,
-
-    /// Number of contigs with each SNP (by [CalledEdit::key])
-    snp_counts: HashMap<u64, usize>,
+    called: Vec<(bool, Vec<Edit>)>,
 
     /// Per colour: the edited SNPs
     edited: Vec<Vec<snps::EditedSnp>>,
@@ -101,9 +93,7 @@ impl GraphBuilder {
             strand_chooser: None,
             reversed: Vec::new(),
             edit_snps: false,
-            snp_max_shared: snps::DEFAULT_MAX_SHARED,
             called: Vec::new(),
-            snp_counts: HashMap::new(),
             edited: Vec::new(),
         }
     }
@@ -149,17 +139,6 @@ impl GraphBuilder {
         edit: bool,
     ) -> Self {
         self.edit_snps = edit;
-        self
-    }
-
-    /// Edit only the SNPs that at most `max_shared` contigs have
-    /// ([snps::DEFAULT_MAX_SHARED] by default); panics if `max_shared` is 0.
-    pub fn edit_snps_max_shared(
-        mut self,
-        max_shared: usize,
-    ) -> Self {
-        assert!(max_shared > 0, "at least one contig must be able to have a SNP");
-        self.snp_max_shared = max_shared;
         self
     }
 
@@ -221,7 +200,7 @@ impl GraphBuilder {
         index: &Index,
     ) -> Vec<u32> {
         let strands = self.choose_strands(sequences);
-        let called: Vec<Vec<CalledEdit>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
+        let called: Vec<Vec<Edit>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
             if reversed {
                 edits::call_edits(&strands::reverse_complement(sequence), index)
             } else {
@@ -229,12 +208,7 @@ impl GraphBuilder {
             }
         }).collect();
         let first: u32 = self.called.len().try_into().unwrap();
-        for (snps, reversed) in called.into_iter().zip(strands) {
-            for snp in &snps {
-                *self.snp_counts.entry(snp.key).or_default() += 1;
-            }
-            self.called.push((reversed, snps));
-        }
+        self.called.extend(strands.into_iter().zip(called));
         (first..(first + sequences.len() as u32)).collect()
     }
 
@@ -243,8 +217,7 @@ impl GraphBuilder {
     /// With [GraphBuilder::reorient_contigs] on, chooses the strand of the contig
     /// first and encodes that strand. With [GraphBuilder::edit_snps] on, the
     /// strand comes from [GraphBuilder::call_edits], which must have been called
-    /// for this contig, and the SNPs that at most
-    /// [GraphBuilder::edit_snps_max_shared] contigs have are edited before
+    /// for this contig, and its SNPs and small indels are edited before
     /// encoding. `sequence` is a normalized nucleotide sequence, and `index`
     /// is the index passed to [nlz::parse].
     pub fn add_contig(
@@ -265,19 +238,13 @@ impl GraphBuilder {
     ) -> Result<Vec<u32>, E> {
         let first_color = self.paths.len();
         // Strands and SNPs to edit, in order.
-        let prepared: Vec<(bool, Vec<CalledEdit>)> = if self.edit_snps {
+        let prepared: Vec<(bool, Vec<Edit>)> = if self.edit_snps {
             // The strands were chosen in the first pass.
             self.strand_chooser = None;
             if self.called.len() < first_color + sequences.len() {
                 return Err(format!("SNPs of colour {} were not called before adding it", self.called.len().max(first_color)).into())
             }
-            let (counts, max_shared) = (&self.snp_counts, self.snp_max_shared);
-            self.called[first_color..(first_color + sequences.len())].iter_mut().map(|(reversed, called)| {
-                let edited = std::mem::take(called).into_iter()
-                    .filter(|snp| counts[&snp.key] <= max_shared)
-                    .collect();
-                (*reversed, edited)
-            }).collect()
+            self.called[first_color..(first_color + sequences.len())].iter_mut().map(|(reversed, called)| (*reversed, std::mem::take(called))).collect()
         } else {
             self.choose_strands(sequences).into_iter().map(|reversed| (reversed, Vec::new())).collect()
         };
@@ -286,8 +253,7 @@ impl GraphBuilder {
         type Encoded = (usize, Vec<(usize, Range<usize>)>, Vec<bool>, Vec<snps::EditedSnp>);
         let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edited)))| {
             let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
-            let edits = edited.into_iter().map(|called| called.edit).collect();
-            let (oriented, edits) = edits::apply_edits(&oriented, edits)
+            let (oriented, edits) = edits::apply_edits(&oriented, edited)
                 .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
             // Contexts in the edited contig, for storing shared SNPs once.
             let edited = snps::with_contexts(&oriented, edits);
