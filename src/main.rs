@@ -204,19 +204,6 @@ fn graph_encode<W: Write>(
 
     let mut writer = ArchiveWriter::new(args.archive_opts(), index);
 
-    // First pass for SNP editing: choose the strands and call the SNPs of every
-    // contig, `batch_size` input files at a time.
-    if args.edit_snps {
-        let progress = ProgressBar::new(n_queries as u64);
-        progress.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} calling SNPs").unwrap());
-        for batch in query_files.chunks(batch_size) {
-            let called = writer.call_edits(&read_input_files(batch));
-            info!("Called SNPs of colors {}..={}", called.first().map_or(0, |c| *c), called.last().map_or(0, |c| *c));
-            progress.inc(batch.len() as u64);
-        }
-        progress.finish();
-    }
-
     for batch in query_files.chunks(batch_size) {
         let added = writer.add_files(&read_input_files(batch)).or_exit();
         for &added in &added {

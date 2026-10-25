@@ -191,7 +191,7 @@ pub struct GraphArgs {
     pub reorient_sampling: u64,
 
     // // Edit SNPs towards the index
-    #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs and small indels against the index before encoding (reads the input twice).")]
+    #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs and small indels against the index before encoding.")]
     pub edit_snps: bool,
 
 

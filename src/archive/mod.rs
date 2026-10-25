@@ -38,7 +38,6 @@ mod tests {
 
         let opts = ArchiveOpts { collapse_chains: true, reorient: true, edit: true, ..Default::default() };
         let mut writer = ArchiveWriter::new(opts, &index);
-        assert_eq!(writer.call_edits(&files), vec![0, 1, 2, 3]);
         assert_eq!(writer.add_files(&files).unwrap(), vec![0, 1, 2, 3]);
         let mut bytes = Vec::new();
         writer.write(&mut bytes).unwrap();
