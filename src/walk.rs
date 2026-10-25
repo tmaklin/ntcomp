@@ -240,6 +240,55 @@ pub trait IndexWalk {
         Some(phrase[..k].to_vec())
     }
 
+    /// The row of the phrase start of [IndexWalk::phrase_start] (the
+    /// _k_-mer its bases are), without materializing the bases.
+    fn phrase_start_row(
+        &self,
+        colex: u32,
+        len: u32,
+    ) -> Option<usize> {
+        let k = self.k();
+        if (len != 0 && (len as usize) < k) || colex as usize >= self.sbwt().n_sets() {
+            return None
+        }
+        let sbwt = self.sbwt();
+        let mut cur = colex as usize;
+        if len != 0 {
+            // The phrase's extension steps are unique predecessors.
+            for _ in 0..(len as usize - k) {
+                match sbwt.inverse_lf_step(cur) {
+                    Some(predecessor) => cur = predecessor,
+                    None => break,
+                }
+            }
+            return Some(cur)
+        }
+        // Implicit: extend while the predecessor is unique, keeping the rows.
+        let mut rows = vec![cur];
+        while let Some(predecessor) = sbwt.inverse_lf_step(cur) {
+            if !self.only_in_group(predecessor) {
+                break
+            }
+            cur = predecessor;
+            rows.push(cur);
+        }
+        if self.is_real_kmer(cur) {
+            return Some(cur)
+        }
+        // The walk went into dummy k-mers: back off to the last real one,
+        // as [IndexWalk::left_extend] does (the first $ is `dollar` steps
+        // from `colex`).
+        let mut t = rows.len() - 1;
+        let mut row = Some(cur);
+        let dollar = loop {
+            match row.and_then(|r| sbwt.inlabel(r).map(|_| r)) {
+                Some(r) => { row = sbwt.inverse_lf_step(r); t += 1; },
+                None => break t,
+            }
+        };
+        Some(rows[dollar - k])
+    }
+
     /// One step right: the interval of `pattern` followed by `c`, dropping the
     /// pattern's first character first if it is _k_ long. None if that is not
     /// in the index.
@@ -335,6 +384,28 @@ pub fn lcs_from_sbwt(
 mod tests {
     use super::*;
     use crate::testing::related_index;
+
+    #[test]
+    fn phrase_start_rows_are_the_rows_of_the_phrase_starts() {
+        for k in [15, 31] {
+            let (_, index) = related_index(k);
+            let sbwt = index.sbwt();
+            let mut n = 0;
+            for row in 0..sbwt.n_sets() {
+                for len in [0, k as u32, k as u32 + 1, k as u32 + 7] {
+                    // Only phrases of real k-mers (an explicit walk into a
+                    // dummy k-mer asserts; entries never have one).
+                    if !index.is_real_kmer(row) { continue }
+                    let Some(start) = index.phrase_start_row(row as u32, len) else { continue };
+                    if len > 0 && !index.is_real_kmer(start) { continue }
+                    let bases = index.phrase_start(row as u32, len).unwrap();
+                    assert_eq!(Some(start), sbwt.search(&bases).map(|r| r.start), "k {} row {} len {}", k, row, len);
+                    n += 1;
+                }
+            }
+            assert!(n > 1000);
+        }
+    }
 
     #[test]
     fn lcs_array_and_lcs_from_sbwt_agree() {

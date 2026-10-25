@@ -161,18 +161,19 @@ impl WalkModels {
 }
 
 /// Codes (or decodes, `rows` None) the branches of the walk of _k_ left steps
-/// from the _k_-mer `start`; when encoding, `rows[p]` is the colex rank of
-/// the _k_-mer ending at p of the 2_k_ bases of the derived node followed by
-/// `start`. Returns the rank of the node reached, None for an invalid walk.
+/// from the _k_-mer at row `start`; when encoding, `rows[p]` is the colex
+/// rank of the _k_-mer ending at p of the 2_k_ bases of the derived node
+/// followed by the _k_-mer at `start`. Returns the rank of the node reached,
+/// None for an invalid walk.
 fn code_walk<C: Coder>(
     c: &mut C,
     m: &mut WalkModels,
     index: &WalkIndex,
-    start: &[u8],
+    start: usize,
     rows: Option<&[usize]>,
 ) -> Option<u32> {
     let k = index.sbwt.k();
-    let mut cur = index.sbwt.search(start)?.start;
+    let mut cur = start;
     for step in 0..k {
         let group = index.predecessors(cur)?;
         let in_degree = group.end - group.start;
@@ -370,14 +371,15 @@ pub(super) struct NodeReader<'a, 'b> {
 }
 
 impl<'a> NodeReader<'a, '_> {
-    /// The walk index and the phrase start of the predecessor `pred` with its
-    /// suffix length, if a walk can start there; see [NodeWriter::start].
+    /// The walk index and the row of the phrase start of the predecessor
+    /// `pred` with its suffix length, if a walk can start there; see
+    /// [NodeWriter::start].
     fn start<'w>(
         walk: &'w Option<WalkIndex<'a>>,
         pred: Option<(u32, u32)>,
-    ) -> Option<(&'w WalkIndex<'a>, Vec<u8>, u32)> {
+    ) -> Option<(&'w WalkIndex<'a>, usize, u32)> {
         let (index, (a, len)) = (walk.as_ref()?, pred?);
-        index.phrase_start(a, len).map(|start| (index, start, len))
+        index.phrase_start_row(a, len).map(|start| (index, start, len))
     }
 
     /// Decodes a node whose predecessor is `pred`.
@@ -389,7 +391,7 @@ impl<'a> NodeReader<'a, '_> {
         if let Some((index, start, len)) = Self::start(&self.walk, pred) {
             let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
             if code_bit(&mut self.walks, flag, 0) == 1 {
-                return code_walk(&mut self.walks, &mut self.models, index, &start, None)
+                return code_walk(&mut self.walks, &mut self.models, index, start, None)
             }
         }
         self.ranks.read_truncated_binary(self.bound)
@@ -405,7 +407,7 @@ impl<'a> NodeReader<'a, '_> {
     ) -> Option<(u32, Option<u32>)> {
         if let Some((index, start, len)) = Self::start(&self.walk, pred) {
             if code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], 0) == 1 {
-                let rank = code_walk(&mut self.walks, &mut self.models, index, &start, None)?;
+                let rank = code_walk(&mut self.walks, &mut self.models, index, start, None)?;
                 if let Some(&junction) = junction_of.get(&rank) {
                     return Some((junction, None))
                 }
