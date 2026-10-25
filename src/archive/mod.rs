@@ -68,4 +68,41 @@ mod tests {
         assert!(reader.find_contig("contig9").is_err());
         assert!(reader.decoder(&[4]).is_err());
     }
+
+    #[test]
+    fn runs_of_n_are_cut_out_and_put_back() {
+        let (seqs, index) = related_index(31);
+        // Runs at the start, in the middle (one long, one a single N, two
+        // close together), at the end, and a contig of only N.
+        let with_runs = |seq: &[u8], runs: &[(usize, usize)]| {
+            let mut out = seq.to_vec();
+            for &(pos, len) in runs.iter().rev() {
+                out.splice(pos..pos, std::iter::repeat_n(b'N', len));
+            }
+            out
+        };
+        let contigs: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"a".to_vec(), with_runs(&seqs[0], &[(0, 5), (700, 250), (1500, 1), (1510, 3)])),
+            (b"b".to_vec(), with_runs(&seqs[1], &[(900, 250), (seqs[1].len(), 10)])),
+            (b"c".to_vec(), seqs[2].clone()),
+            (b"d".to_vec(), b"NNNN".to_vec()),
+        ];
+        let files: Vec<InputFile> = vec![(b"file".to_vec(), contigs.clone())];
+        let mut writer = ArchiveWriter::new(ArchiveOpts::default(), &index);
+        writer.add_files(&files).unwrap();
+        let mut bytes = Vec::new();
+        let summary = writer.write(&mut bytes).unwrap();
+        assert!(summary.contains("(7 runs)"), "{}", summary);
+
+        let reader = ArchiveReader::open(&mut bytes.as_slice(), &index).unwrap();
+        let colors: Vec<u32> = (0..4).collect();
+        for decoded in reader.decoder(&colors).unwrap().decode(&colors).unwrap() {
+            let decoded = decoded.unwrap();
+            assert_eq!(decoded.sequence, contigs[decoded.color as usize].1, "colour {}", decoded.color);
+            assert_eq!(decoded.hash_match, Some(true));
+        }
+
+        // Without the cut, a parse fails instead of looping.
+        assert!(crate::nlz::parse(&contigs[0].1, &index).is_err());
+    }
 }

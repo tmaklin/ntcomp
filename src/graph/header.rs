@@ -20,8 +20,8 @@
 //! ([FINGERPRINT_BYTES] bytes each; all four zero for an archive written
 //! without an index, see [IndexId]), the number
 //! of contigs (u32), then the sizes (u64) of the sections in their order in
-//! the file: file ranges, contig names, graph, hashes, strands, SNPs and
-//! choices.
+//! the file: file ranges, contig names, graph, hashes, strands, SNPs, runs
+//! of `N` and choices.
 //!
 use std::io::{Read, Write};
 
@@ -33,11 +33,11 @@ type E = Box<dyn std::error::Error>;
 pub const MAGIC: &[u8; 4] = b"NLOG";
 
 /// The format version this crate writes and reads (1: one fingerprint of
-/// the index, its SBWT's).
-pub const VERSION: u16 = 2;
+/// the index, its SBWT's; 2: no section of runs of `N`).
+pub const VERSION: u16 = 3;
 
 /// Bytes of the header.
-pub const FILE_HEADER_BYTES: usize = 4 + 2 + 4 + 8 + 2 * FINGERPRINT_BYTES + 4 + 7 * 8;
+pub const FILE_HEADER_BYTES: usize = 4 + 2 + 4 + 8 + 2 * FINGERPRINT_BYTES + 4 + 8 * 8;
 
 /// Header of an archive written by [GraphEncoder](super::encoder::GraphEncoder).
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +62,9 @@ pub struct FileHeader {
     /// Size of the section with the edited SNPs.
     pub snp_bytes: u64,
 
+    /// Size of the section with the runs of `N`.
+    pub n_run_bytes: u64,
+
     pub choice_bytes: u64,
 }
 
@@ -78,8 +81,8 @@ impl std::error::Error for HeaderError {}
 
 impl FileHeader {
     /// The section sizes in their order in the file.
-    fn section_bytes(&self) -> [u64; 7] {
-        [self.file_range_bytes, self.contig_name_bytes, self.graph_bytes, self.hash_bytes, self.strand_bytes, self.snp_bytes, self.choice_bytes]
+    fn section_bytes(&self) -> [u64; 8] {
+        [self.file_range_bytes, self.contig_name_bytes, self.graph_bytes, self.hash_bytes, self.strand_bytes, self.snp_bytes, self.n_run_bytes, self.choice_bytes]
     }
 
     /// Total size of the sections, None if it overflows.
@@ -138,12 +141,12 @@ impl FileHeader {
         let lcs_fingerprint: [u8; FINGERPRINT_BYTES] = take(FINGERPRINT_BYTES).try_into()?;
         let index = (k != 0).then_some(IndexId { k, n_kmers, sbwt_fingerprint, lcs_fingerprint });
         let n_contigs = u32::from_le_bytes(take(4).try_into()?);
-        let mut sizes = [0_u64; 7];
+        let mut sizes = [0_u64; 8];
         for size in sizes.iter_mut() {
             *size = u64::from_le_bytes(take(8).try_into()?);
         }
-        let [file_range_bytes, contig_name_bytes, graph_bytes, hash_bytes, strand_bytes, snp_bytes, choice_bytes] = sizes;
-        let header = FileHeader { index, n_contigs, file_range_bytes, contig_name_bytes, graph_bytes, hash_bytes, strand_bytes, snp_bytes, choice_bytes };
+        let [file_range_bytes, contig_name_bytes, graph_bytes, hash_bytes, strand_bytes, snp_bytes, n_run_bytes, choice_bytes] = sizes;
+        let header = FileHeader { index, n_contigs, file_range_bytes, contig_name_bytes, graph_bytes, hash_bytes, strand_bytes, snp_bytes, n_run_bytes, choice_bytes };
         if header.total_section_bytes().is_none() {
             return Err(Box::new(HeaderError("corrupt archive header: the section sizes overflow".to_string())))
         }
@@ -196,7 +199,7 @@ mod tests {
         FileHeader {
             index: Some(IndexId { k: 31, n_kmers: 1234, sbwt_fingerprint: [1, 2, 3, 4, 5, 6, 7, 8], lcs_fingerprint: [9, 10, 11, 12, 13, 14, 15, 16] }),
             n_contigs: 5,
-            file_range_bytes: 1, contig_name_bytes: 2, graph_bytes: 3, hash_bytes: 4, strand_bytes: 5, snp_bytes: 6, choice_bytes: 7,
+            file_range_bytes: 1, contig_name_bytes: 2, graph_bytes: 3, hash_bytes: 4, strand_bytes: 5, snp_bytes: 6, n_run_bytes: 7, choice_bytes: 8,
         }
     }
 

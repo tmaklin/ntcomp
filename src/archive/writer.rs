@@ -25,6 +25,7 @@ use crate::graph::snps::{self, EditedSnp, SnpEdits};
 use crate::graph::{contig_hash, ContigHash, GraphBuilder};
 use crate::index::Index;
 use crate::nlz;
+use crate::nruns::{self, NRun, NRuns};
 use crate::strands::{self, StrandChooser};
 
 type E = Box<dyn std::error::Error>;
@@ -57,9 +58,12 @@ impl Default for ArchiveOpts {
 /// next colour; the archive keeps its hash, its name and its file.
 ///
 /// A contig is stored on the strand chosen for it ([ArchiveOpts::reorient]),
-/// with its edits applied ([ArchiveOpts::edit]), as the path of its NLZ
-/// dictionary ([nlz::parse]) in the graph ([GraphBuilder]); the strands and
-/// the edits are stored for putting the contig back after decoding.
+/// without its runs of `N` ([nruns]), with its edits applied
+/// ([ArchiveOpts::edit]), as the path of its NLZ dictionary ([nlz::parse])
+/// in the graph ([GraphBuilder]); the strands, the runs and the edits are
+/// stored for putting the contig back after decoding. The pieces between
+/// the runs are edited and parsed as separate sequences, so that nothing
+/// spans a cut.
 pub struct ArchiveWriter<'a> {
     opts: ArchiveOpts,
     index: &'a Index,
@@ -70,6 +74,8 @@ pub struct ArchiveWriter<'a> {
     reversed: Vec<bool>,
     /// Per colour: the edits applied, with their contexts.
     edited: Vec<Vec<EditedSnp>>,
+    /// Per colour: the runs of `N` cut out.
+    n_runs: Vec<Vec<NRun>>,
     hashes: Vec<ContigHash>,
     contig_names: Vec<Vec<u8>>,
     file_ranges: Vec<(Vec<u8>, Range<u32>)>,
@@ -89,6 +95,7 @@ impl<'a> ArchiveWriter<'a> {
             strand_chooser: None,
             reversed: Vec::new(),
             edited: Vec::new(),
+            n_runs: Vec::new(),
             hashes: Vec::new(),
             contig_names: Vec::new(),
             file_ranges: Vec::new(),
@@ -126,27 +133,46 @@ impl<'a> ArchiveWriter<'a> {
         let strands = self.choose_strands(&sequences);
 
         let (index, edit) = (self.index, self.opts.edit);
-        type Encoded = (bool, nlz::Dictionary, Vec<EditedSnp>);
+        type Encoded = (bool, nlz::Dictionary, Vec<EditedSnp>, Vec<NRun>);
         let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(strands.into_par_iter()).enumerate().map(|(i, (sequence, reversed))| {
+            let color = first_color + i;
             let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
-            let ms = index.matching_statistics(&oriented);
-            let edits = if edit { edits::call_edits_with(&oriented, &ms, index) } else { Vec::new() };
-            let (edited, edits) = edits::apply_edits(&oriented, edits)
-                .ok_or_else(|| format!("contig {}: the edits do not match it", first_color + i))?;
-            let ms = edits::matching_statistics_after_edits(ms, &edited, &edits, index);
+            let (cut, runs) = nruns::cut(&oriented).ok_or_else(|| format!("contig {}: a run of N is too long", color))?;
+            // Each piece between the runs is edited and parsed on its own;
+            // the edited pieces, their edits and their dictionaries are
+            // joined (the dictionary from the end: the last piece first).
+            let mut edited: Vec<u8> = Vec::with_capacity(cut.len());
+            let mut all_edits: Vec<edits::Edit> = Vec::new();
+            let mut pieces: Vec<nlz::Dictionary> = Vec::new();
+            for segment in nruns::segments(cut.len(), &runs) {
+                let piece = &cut[segment];
+                let ms = index.matching_statistics(piece);
+                let edits = if edit { edits::call_edits_with(piece, &ms, index) } else { Vec::new() };
+                let (edited_piece, edits) = edits::apply_edits(piece, edits)
+                    .ok_or_else(|| format!("contig {}: the edits do not match it", color))?;
+                let ms = edits::matching_statistics_after_edits(ms, &edited_piece, &edits, index);
+                pieces.push(nlz::parse_with(&edited_piece, ms, index).map_err(|e| format!("contig {}: {}", color, e))?);
+                let offset = u32::try_from(edited.len()).map_err(|_| format!("contig {}: longer than 2^32 bases", color))?;
+                all_edits.extend(edits.into_iter().map(|e| edits::Edit { pos: e.pos + offset, ..e }));
+                edited.extend_from_slice(&edited_piece);
+            }
+            let dictionary = nlz::Dictionary {
+                sequence_len: edited.len(),
+                entries: pieces.into_iter().rev().flat_map(|d| d.entries).collect(),
+            };
             // Contexts in the edited contig, for storing shared SNPs once.
-            let edited_snps = snps::with_contexts(&edited, edits);
-            let dictionary = nlz::parse_with(&edited, ms, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
-            Ok((reversed, dictionary, edited_snps))
+            let edited_snps = snps::with_contexts(&edited, all_edits);
+            Ok((reversed, dictionary, edited_snps, runs))
         }).collect();
 
         let encoded = encoded.into_iter().collect::<Result<Vec<Encoded>, String>>()?;
         self.hashes.par_extend(sequences.par_iter().map(|sequence| contig_hash(sequence)));
         let mut colors = Vec::with_capacity(sequences.len());
-        for (reversed, dictionary, edited) in encoded {
+        for (reversed, dictionary, edited, runs) in encoded {
             colors.push(self.builder.add_dictionary(&dictionary));
             self.reversed.push(reversed);
             self.edited.push(edited);
+            self.n_runs.push(runs);
         }
 
         let mut color = self.contig_names.len() as u32;
@@ -173,12 +199,21 @@ impl<'a> ArchiveWriter<'a> {
         Some(SnpEdits::with_repeats(&self.edited))
     }
 
+    /// The runs of `N` of every colour as stored, None if no contig has any.
+    fn n_runs(&self) -> Option<NRuns> {
+        if self.n_runs.iter().all(|runs| runs.is_empty()) {
+            return None
+        }
+        Some(NRuns { runs: self.n_runs.clone() })
+    }
+
     /// Writes the archive to `out`. Returns a summary of the section sizes.
     pub fn write<W: Write>(
         self,
         out: &mut W,
     ) -> Result<String, E> {
         let snp_edits = self.snp_edits();
+        let n_runs = self.n_runs();
         let (graph, choices) = self.builder.finish();
         let mut encoder = GraphEncoder::new(graph, choices)
             .with_hashes(self.hashes)
@@ -188,6 +223,9 @@ impl<'a> ArchiveWriter<'a> {
             .with_index(self.index);
         if let Some(snp_edits) = snp_edits {
             encoder = encoder.with_snp_edits(snp_edits);
+        }
+        if let Some(n_runs) = n_runs {
+            encoder = encoder.with_n_runs(n_runs);
         }
         encoder.encode_to_write(out)
     }

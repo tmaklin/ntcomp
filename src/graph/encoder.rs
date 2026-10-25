@@ -18,6 +18,7 @@ use super::header::{FileHeader, FILE_HEADER_BYTES};
 use super::ChainCsr;
 use super::choices::Choices;
 use super::snps::SnpEdits;
+use crate::nruns::NRuns;
 use crate::codecs::bits::BitWriter;
 use crate::codecs::lzma;
 
@@ -54,6 +55,9 @@ pub struct GraphEncoder<'a> {
     /// Edited SNPs
     snp_edits: Option<SnpEdits>,
 
+    /// Runs of `N` cut out of the contigs
+    n_runs: Option<NRuns>,
+
     /// The index with its LCS array: the suffix lengths are coded per LCS
     /// context and graph nodes are derived by walks in it, see
     /// [collapsed](super::collapsed).
@@ -89,6 +93,7 @@ impl<'a> GraphEncoder<'a> {
             file_ranges: None,
             reversed: None,
             snp_edits: None,
+            n_runs: None,
             index: None,
             id: None,
         }
@@ -153,6 +158,28 @@ impl<'a> GraphEncoder<'a> {
     ) -> Self {
         self.snp_edits = Some(snp_edits);
         self
+    }
+
+    /// Add the runs of `N` cut out of the contigs (see
+    /// [ArchiveWriter](crate::archive::ArchiveWriter)).
+    pub fn with_n_runs(
+        mut self,
+        n_runs: NRuns,
+    ) -> Self {
+        self.n_runs = Some(n_runs);
+        self
+    }
+
+    /// The runs of `N` of every colour ([NRuns::to_bytes]); not written (0
+    /// bytes) if absent.
+    fn encode_n_runs(
+        &self,
+    ) -> Result<Vec<u8>, E> {
+        match &self.n_runs {
+            Some(runs) if runs.n_colors() != self.choices.streams.len() => Err(format!("N runs of {} colours for {} colours", runs.n_colors(), self.choices.streams.len()).into()),
+            Some(runs) => Ok(runs.to_bytes()),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Edited SNPs, one stream per colour; not written (0 bytes) if absent.
@@ -229,6 +256,7 @@ impl<'a> GraphEncoder<'a> {
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;
+        let n_run_bytes = self.encode_n_runs()?;
         let graph_bytes = self.graph.to_bytes(self.index, self.id.map(|id| id.k))?;
         let choice_bytes = self.choices.to_stored(&self.graph)?;
 
@@ -241,6 +269,7 @@ impl<'a> GraphEncoder<'a> {
             hash_bytes: hash_bytes.len() as u64,
             strand_bytes: strand_bytes.len() as u64,
             snp_bytes: snp_bytes.len() as u64,
+            n_run_bytes: n_run_bytes.len() as u64,
             choice_bytes: choice_bytes.len() as u64,
         };
         header.write_to(writer)?;
@@ -251,16 +280,18 @@ impl<'a> GraphEncoder<'a> {
         writer.write_all(&hash_bytes)?;
         writer.write_all(&strand_bytes)?;
         writer.write_all(&snp_bytes)?;
+        writer.write_all(&n_run_bytes)?;
         writer.write_all(&choice_bytes)?;
 
         let total = FILE_HEADER_BYTES + file_range_bytes.len() + contig_name_bytes.len() + graph_bytes.len()
-            + hash_bytes.len() + strand_bytes.len() + snp_bytes.len() + choice_bytes.len();
+            + hash_bytes.len() + strand_bytes.len() + snp_bytes.len() + n_run_bytes.len() + choice_bytes.len();
         let n_reversed = self.reversed.as_ref().map_or(0, |r| r.iter().filter(|&&r| r).count());
         let n_snps = self.snp_edits.as_ref().map_or(0, |s| s.n_snps());
+        let n_n_runs = self.n_runs.as_ref().map_or(0, |r| r.n_runs());
         Ok(format!(
-            "Graph: {}, {} bytes; choices: {} choices, {} bytes; contig names {} bytes, hashes {} bytes, strands {} bytes ({} reversed), SNPs {} bytes ({} edited), file ranges {} bytes; total {} bytes",
+            "Graph: {}, {} bytes; choices: {} choices, {} bytes; contig names {} bytes, hashes {} bytes, strands {} bytes ({} reversed), SNPs {} bytes ({} edited), N runs {} bytes ({} runs), file ranges {} bytes; total {} bytes",
             self.graph.summary(), graph_bytes.len(), self.choices.n_choices(), choice_bytes.len(),
-            contig_name_bytes.len(), hash_bytes.len(), strand_bytes.len(), n_reversed, snp_bytes.len(), n_snps, file_range_bytes.len(), total,
+            contig_name_bytes.len(), hash_bytes.len(), strand_bytes.len(), n_reversed, snp_bytes.len(), n_snps, n_run_bytes.len(), n_n_runs, file_range_bytes.len(), total,
         ))
     }
 }

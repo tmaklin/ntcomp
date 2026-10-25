@@ -121,7 +121,8 @@ pub fn left_extend_kmer(
 }
 
 /// The NLZ parse of a nucleotide sequence against an SBWT index: its
-/// [Dictionary], from the end of the sequence to the start.
+/// [Dictionary], from the end of the sequence to the start. Fails on a base
+/// the index does not have (an `N`).
 pub fn parse(
     nucleotides: &[u8],
     index: &Index,
@@ -145,6 +146,11 @@ pub fn parse_with(
         let mut i = n;
         let mut kept: Vec<usize> = Vec::new();
         while i > 0 {
+            if res[i - 1].len == 0 {
+                // A base the index does not have (N): the archive cuts the
+                // runs of N out first ([crate::nruns]).
+                return Err(format!("base {} ({}) is not in the index", i - 1, nucleotides[i - 1] as char).into())
+            }
             if res[i - 1].len as usize == k && i > k + 1 {
                 // Left extend as [left_extend_kmer] with the sequence as the
                 // reference, through the rows of the matching statistics: the

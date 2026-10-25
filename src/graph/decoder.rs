@@ -19,6 +19,7 @@ use super::header::FileHeader;
 use crate::codecs::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
+use crate::nruns::NRuns;
 use crate::codecs::lzma::{self, LzmaData};
 use super::ChainCsr;
 use crate::walk::WalkIndex;
@@ -132,6 +133,8 @@ pub struct DecodedSections {
     /// Per contig: whether it is stored reverse complemented.
     pub reversed: Option<Vec<bool>>,
     pub snp_edits: Option<SnpEdits>,
+    /// The runs of `N` cut out of the contigs.
+    pub n_runs: Option<NRuns>,
 }
 
 /// Decodes the output from [GraphEncoder](super::encoder::GraphEncoder).
@@ -230,12 +233,16 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if snp_edits.as_ref().is_some_and(|edits| edits.n_colors() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("SNP section does not have {} colours", n_contigs))))
         }
+        let n_runs = match header.n_run_bytes {
+            0 => None,
+            n_bytes => Some(NRuns::from_bytes(&read_bytes(reader, n_bytes)?, n_contigs as usize)?),
+        };
         if header.choice_bytes == 0 {
             return Err(Box::new(ArchiveError("the choice section is missing".to_string())))
         }
         let choices = Choices::from_stored(&read_bytes(reader, header.choice_bytes)?, &graph, n_contigs as usize)?;
 
-        Ok(DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
+        Ok(DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits, n_runs })
     }
 }
 
@@ -274,17 +281,20 @@ mod tests {
         let hashes = vec![super::super::contig_hash(b"one"), super::super::contig_hash(b"two")];
         let ranges = vec![(b"file".to_vec(), 0..2)];
         let snps = SnpEdits::new(&[vec![], vec![Snp { pos: 3, base: b'A', index_base: b'G' }]]);
+        let runs = NRuns { runs: vec![vec![crate::nruns::NRun { pos: 2, len: 250 }], vec![]] };
         let bytes = encode(GraphEncoder::new(graph, choices)
             .with_contig_names(names.clone())
             .with_hashes(hashes.clone())
             .with_file_ranges(ranges.clone())
             .with_reversed(vec![false, true])
-            .with_snp_edits(snps.clone()));
+            .with_snp_edits(snps.clone())
+            .with_n_runs(runs.clone()));
 
         let mut input = bytes.as_slice();
         let decoder = GraphDecoder::new(&mut input).unwrap();
         assert_eq!(decoder.header().n_contigs, 2);
-        let DecodedSections { graph, choices, hashes: got_hashes, contig_names: got_names, file_ranges: got_ranges, reversed: got_reversed, snp_edits: got_snps } = decoder.decode_from_read().unwrap();
+        let DecodedSections { graph, choices, hashes: got_hashes, contig_names: got_names, file_ranges: got_ranges, reversed: got_reversed, snp_edits: got_snps, n_runs: got_runs } = decoder.decode_from_read().unwrap();
+        assert_eq!(got_runs, Some(runs));
         assert_eq!(got_reversed, Some(vec![false, true]));
         assert_eq!(got_snps, Some(snps));
         assert_eq!(got_hashes, Some(hashes));
@@ -410,8 +420,8 @@ mod tests {
         let (graph, choices, _) = graph();
         let mut bytes = Vec::new();
         GraphEncoder::new(graph, choices).encode_to_write(&mut bytes).unwrap();
-        // The graph section (third size) claims 2^40 bytes.
-        let at = FILE_HEADER_BYTES - 5 * 8;
+        // The graph section (third of eight sizes) claims 2^40 bytes.
+        let at = FILE_HEADER_BYTES - 6 * 8;
         bytes[at..at + 8].copy_from_slice(&(1_u64 << 40).to_le_bytes());
         let err = GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read().err().unwrap();
         assert!(err.to_string().contains("truncated"), "{}", err);

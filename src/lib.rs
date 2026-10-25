@@ -23,8 +23,9 @@
 //! - [index]: the SBWT index with its LCS array ([Index]); [walk]: walking
 //!   its de Bruijn graph; [edits]: SNPs and
 //!   small indels towards the index; [strands]: choosing the strand of each
-//!   contig; [codecs]: the codecs shared by the formats; [fastx]: reading
-//!   and writing FASTA and FASTQ files.
+//!   contig; [nruns]: the runs of `N` cut out of the contigs; [codecs]:
+//!   the codecs shared by the formats; [fastx]: reading and writing FASTA
+//!   and FASTQ files.
 //!
 pub mod archive;
 pub mod codecs;
@@ -33,6 +34,7 @@ pub mod fastx;
 pub mod graph;
 pub mod index;
 pub mod nlz;
+pub mod nruns;
 pub mod strands;
 pub mod walk;
 pub mod tigs;

@@ -24,6 +24,7 @@ use crate::graph::snps::{self, SnpEdits};
 use crate::graph::{contig_hash, Choices, ChainCsr, ContigHash, Csr, GraphWalk};
 use crate::index::Index;
 use crate::nlz::PhraseCache;
+use crate::nruns::{self, NRuns};
 
 type E = Box<dyn std::error::Error>;
 
@@ -44,6 +45,7 @@ pub struct ArchiveReader<'a> {
     file_ranges: Option<Vec<(Vec<u8>, Range<u32>)>>,
     reversed: Option<Vec<bool>>,
     snp_edits: Option<SnpEdits>,
+    n_runs: Option<NRuns>,
 }
 
 /// A decoded contig.
@@ -64,11 +66,11 @@ impl<'a> ArchiveReader<'a> {
     ) -> Result<Self, E> {
         let decoder = GraphDecoder::new(input)?;
         let n_contigs = decoder.header().n_contigs;
-        let DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits } = decoder.decode_from_read_with_index(index)?;
+        let DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits, n_runs } = decoder.decode_from_read_with_index(index)?;
         if contig_names.as_ref().is_some_and(|names| names.len() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("{} contig names for {} contigs", contig_names.map_or(0, |n| n.len()), n_contigs))))
         }
-        Ok(ArchiveReader { index, cache: PhraseCache::default(), n_contigs, graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
+        Ok(ArchiveReader { index, cache: PhraseCache::default(), n_contigs, graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits, n_runs })
     }
 
     /// Number of contigs (colours).
@@ -149,8 +151,8 @@ impl<'a> ArchiveReader<'a> {
         dictionary.decode_cached(self.index, &self.cache).map_err(|e| e.to_string())
     }
 
-    /// Puts the SNPs of `color` back into its edited sequence, restores its
-    /// strand and checks its hash.
+    /// Puts the SNPs of `color` back into its edited sequence, then its runs
+    /// of `N`, restores its strand and checks its hash.
     fn finish_color(
         &self,
         color: u32,
@@ -161,6 +163,9 @@ impl<'a> ArchiveReader<'a> {
         // Edited SNPs are put back on the stored strand.
         if let Some(snp_edits) = &self.snp_edits {
             snp_edits.revert(color, &mut sequence, &|f, pos| contexts.get(&(f, pos)).copied()).map_err(|e| e.to_string())?;
+        }
+        if let Some(runs) = self.n_runs.as_ref().map(|r| &r.runs[idx]).filter(|r| !r.is_empty()) {
+            sequence = nruns::restore(&sequence, runs).ok_or_else(|| format!("the runs of N of colour {} do not fit it", color))?;
         }
         // Contigs stored on the other strand are reverse complemented back.
         let sequence = if self.reversed.as_ref().is_some_and(|r| r[idx]) {
