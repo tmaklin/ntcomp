@@ -165,11 +165,26 @@ impl FileHeader {
         &self,
         index: IndexId,
     ) -> Result<(), E> {
-        match self.index {
-            Some(stored) if stored != index => Err(Box::new(HeaderError(format!(
-                "the archive was written with a different index ({}) than the one given ({})", stored, index)))),
-            _ => Ok(()),
+        self.check_index_parts(index.k, index.n_kmers, index.sbwt_fingerprint, Some(index.lcs_fingerprint))
+    }
+
+    /// Same as [FileHeader::check_index] for an index given as its parts,
+    /// the LCS fingerprint only if its LCS array is loaded.
+    pub fn check_index_parts(
+        &self,
+        k: u32,
+        n_kmers: u64,
+        sbwt_fingerprint: [u8; FINGERPRINT_BYTES],
+        lcs_fingerprint: Option<[u8; FINGERPRINT_BYTES]>,
+    ) -> Result<(), E> {
+        let Some(stored) = self.index else { return Ok(()) };
+        let given = IndexId { k, n_kmers, sbwt_fingerprint, lcs_fingerprint: lcs_fingerprint.unwrap_or(stored.lcs_fingerprint) };
+        if given != stored {
+            let lcs = if lcs_fingerprint.is_some() { "" } else { " (LCS array not loaded)" };
+            return Err(Box::new(HeaderError(format!(
+                "the archive was written with a different index ({}) than the one given ({}{})", stored, given, lcs))))
         }
+        Ok(())
     }
 }
 
@@ -227,5 +242,8 @@ mod tests {
         assert!(h.check_index(IndexId { sbwt_fingerprint: [0; FINGERPRINT_BYTES], ..id }).is_err());
         assert!(h.check_index(IndexId { lcs_fingerprint: [0; FINGERPRINT_BYTES], ..id }).is_err());
         assert!(FileHeader { index: None, ..h }.check_index(id).is_ok());
+        // Without the LCS array, only the rest is checked.
+        assert!(h.check_index_parts(id.k, id.n_kmers, id.sbwt_fingerprint, None).is_ok());
+        assert!(h.check_index_parts(id.k, id.n_kmers, [0; FINGERPRINT_BYTES], None).is_err());
     }
 }

@@ -166,7 +166,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
     pub fn decode_from_read(
         self,
     ) -> Result<DecodedSections, E> {
-        self.decode_from_read_with(None)
+        self.decode_sections(None)
     }
 
     /// Same as [GraphDecoder::decode_from_read] for an archive written with
@@ -179,15 +179,28 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         index: &Index,
     ) -> Result<DecodedSections, E> {
         self.file_header.check_index(index.id())?;
-        self.decode_from_read_with(Some(index.walk_index()))
+        self.decode_sections(Some(index.walk_index()))
     }
 
-    /// Same as [GraphDecoder::decode_from_read]; `index` is needed if the
-    /// archive was written with one (LCS contexts and graph nodes derived by
-    /// walks; its LCS array is optional). The caller checks that it is the
-    /// index the header names (see [GraphDecoder::decode_from_read_with_index]);
-    /// _k_ comes from the header.
+    /// Same as [GraphDecoder::decode_from_read_with_index] for the index as a
+    /// [WalkIndex], whose LCS array is optional (the values are then
+    /// computed from the SBWT, slower). The SBWT, and the LCS array if
+    /// given, are checked against the header first; their fingerprints are
+    /// computed here (an [Index] keeps its own).
     pub fn decode_from_read_with(
+        self,
+        index: WalkIndex,
+    ) -> Result<DecodedSections, E> {
+        let sbwt = index.sbwt;
+        self.file_header.check_index_parts(
+            sbwt.k().try_into()?, sbwt.n_kmers() as u64,
+            crate::index::sbwt_fingerprint(sbwt), index.lcs.map(crate::index::lcs_fingerprint))?;
+        self.decode_sections(Some(index))
+    }
+
+    /// Reads and decodes every section with `index` (needed if the archive
+    /// was written with one); _k_ comes from the header.
+    fn decode_sections(
         self,
         index: Option<WalkIndex>,
     ) -> Result<DecodedSections, E> {
@@ -353,7 +366,7 @@ mod tests {
         for array in [Some(index.lcs()), None] {
             let walk = crate::walk::WalkIndex { sbwt: index.sbwt(), lcs: array };
             let mut input = with_lcs.as_slice();
-            let DecodedSections { graph, choices, .. } = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(walk)).unwrap();
+            let DecodedSections { graph, choices, .. } = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(walk).unwrap();
             for (color, walk) in walks.iter().enumerate() {
                 assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
             }
@@ -383,6 +396,13 @@ mod tests {
         assert_ne!(other.id().sbwt_fingerprint, index.id().sbwt_fingerprint);
         let err = GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read_with_index(&other).err().unwrap();
         assert!(err.to_string().contains("different index"), "{}", err);
+        // Also as a WalkIndex, with or without the LCS array.
+        for lcs in [Some(other.lcs()), None] {
+            let walk = crate::walk::WalkIndex { sbwt: other.sbwt(), lcs };
+            assert!(GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read_with(walk).is_err());
+        }
+        let walk = crate::walk::WalkIndex { sbwt: index.sbwt(), lcs: None };
+        assert!(GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read_with(walk).is_ok());
     }
 
     #[test]
