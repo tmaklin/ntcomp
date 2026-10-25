@@ -134,6 +134,18 @@ impl CopyModel {
     fn bucket(&self, k: usize) -> usize { self.len_bucket(k) + 7 * (self.m.hist & 0xFFFF).count_ones().min(3) as usize }
 }
 
+/// Asks the processor to load the cache line at `p`; a hint, with no effect
+/// on the results.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly)); }
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0); }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 /// Positions after the latest occurrences of each hashed `minlen`-mer,
 /// `slots` per bucket, newest first.
 struct HTab { minlen: usize, slots: usize, bits: u32, data: Vec<u32> }
@@ -220,6 +232,38 @@ impl Model {
             apm, apm2,
             f: 0, r: 0,
             slots: [0; ORDERS.len()], inputs: [[0; N_IN]; 3], msel: [[0; N_MIX]; 3], psub: [[0; N_MIX]; 3], finputs: [[0; N_MIX + 1]; 3], pmix: [0; 3], apm_at: [0; 3], apm2_at: [0; 3], sel: 0, preds: [None; N_MODELS],
+        }
+    }
+
+    /// Prefetches the table slots of the position after the next one, about
+    /// one base of coding ahead: its four possible contexts (one per next
+    /// base; adjacent in the direct tables, the small ones stay in the cache)
+    /// and the copy models' four possible match table buckets per strand.
+    fn prefetch_ahead(&self) {
+        for (oi, &o) in ORDERS.iter().enumerate() {
+            let base = (self.f << 2) & ((1u64 << (2 * o)) - 1);
+            if oi < self.n_direct {
+                if o < 8 { continue }
+                let t = &self.direct[oi];
+                let idx = base as usize * 4;
+                prefetch(t.as_ptr().wrapping_add(idx));
+                prefetch(t.as_ptr().wrapping_add(idx + 15));
+            } else {
+                for c in 0..4 {
+                    let i = ((hash64(base | c, o) >> (64 - self.hash_bits)) as usize) * 4;
+                    match &self.packed {
+                        Some(packed) => prefetch(packed[oi - self.n_direct].as_ptr().wrapping_add(i)),
+                        None => prefetch(self.hashed[oi - self.n_direct].as_ptr().wrapping_add(i)),
+                    }
+                }
+            }
+        }
+        for t in &self.tabs {
+            let mask = (1u64 << (2 * t.minlen)) - 1;
+            for c in 0..4u64 {
+                prefetch(t.data.as_ptr().wrapping_add(t.bucket(((self.f << 2) | c) & mask)));
+                prefetch(t.data.as_ptr().wrapping_add(t.bucket(((self.r >> 2) | ((3 - c) << 62)) >> (2 * (32 - t.minlen)))));
+            }
         }
     }
 
@@ -371,6 +415,7 @@ impl Model {
         }
         self.f = (self.f << 2) | sym as u64;
         self.r = (self.r >> 2) | ((3 - sym as u64) << 62);
+        self.prefetch_ahead();
         for j in 0..N_MODELS {
             if let Some(e) = self.preds[j] {
                 let cm = &mut self.models[j];
