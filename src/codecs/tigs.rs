@@ -116,6 +116,30 @@ const MAX_ROUNDS: usize = 4;
 /// corrupt before allocating for them.
 const MAX_BASES_PER_BYTE: u64 = 256;
 
+/// Checks the counts of a file of `file_len` bytes: `n` bases in tigs of at
+/// least `k` bases, `counts` of them per part (long, unanchored, then each
+/// round), each count fitting its u32, and at most [MAX_BASES_PER_BYTE]
+/// bases per byte. [decode] refuses a file that fails it, so [encode] does
+/// not write one.
+fn check_counts(
+    k: usize,
+    n: u64,
+    counts: &[u64],
+    file_len: u64,
+) -> Result<(), E> {
+    let n_tigs = counts.iter().try_fold(0_u64, |a, &b| a.checked_add(b)).ok_or("tig counts overflow")?;
+    if counts.iter().any(|&c| c > u32::MAX as u64) {
+        return Err("more than 2^32 - 1 tigs in a part of a tigs file".into())
+    }
+    if k < 2 || n_tigs.saturating_mul(k as u64) > n {
+        return Err("tig counts do not fit the number of bases".into())
+    }
+    if n > MAX_BASES_PER_BYTE.saturating_mul(file_len) {
+        return Err(format!("more than {} bases per byte of a tigs file", MAX_BASES_PER_BYTE).into())
+    }
+    Ok(())
+}
+
 fn hash64(x: u64, n: usize) -> u64 { (x ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15) }
 
 #[derive(Clone, Copy)]
@@ -693,6 +717,8 @@ pub fn encode<W: Write>(
     for t in &plan.rest { text.extend_from_slice(t); slots.push(Slot { anchor: None, len: t.len(), known: true }); }
     code_bases(&mut enc, &mut model, &mut text, &mut slots, true)?;
     let body = enc.finish();
+    let counts: Vec<u64> = [plan.long.len(), plan.rest.len()].into_iter().chain(plan.rounds.iter().map(|r| r.len())).map(|c| c as u64).collect();
+    check_counts(k, n as u64, &counts, (24 + 4 * plan.rounds.len() + body.len()) as u64)?;
     out.write_all(MAGIC)?;
     out.write_all(&(k as u16).to_le_bytes())?;
     out.write_all(&[OPT_END_FLAGS | OPT_RC_ANCHORS | OPT_PACKED_TABLES, plan.rounds.len() as u8])?;
@@ -720,12 +746,9 @@ pub fn decode<R: Read>(
     let (n_long, n_rest) = (u32_at(16)?, u32_at(20)?);
     let round_n: Vec<usize> = (0..n_rounds).map(|r| u32_at(24 + 4 * r)).collect::<Result<_, _>>()?;
     // The counts come from the file: check them before sizing anything by
-    // them. Every tig has at least k bases, and no tig set compresses to
-    // nearly MAX_BASES_PER_BYTE bases per byte (the index tigs: ~30).
-    let n_tigs = round_n.iter().try_fold(n_long as u64 + n_rest as u64, |a, &b| a.checked_add(b as u64)).ok_or("corrupt tigs file")?;
-    if k < 2 || n_tigs.saturating_mul(k as u64) > n as u64 || n as u64 > MAX_BASES_PER_BYTE * data.len() as u64 {
-        return Err("corrupt tigs file: the counts do not fit its size".into())
-    }
+    // them (the index tigs hold ~30 bases per byte).
+    let counts: Vec<u64> = [n_long, n_rest].iter().chain(&round_n).map(|&c| c as u64).collect();
+    check_counts(k, n as u64, &counts, data.len() as u64).map_err(|e| format!("corrupt tigs file: {}", e))?;
     let mut model = Model::new(k, n, packed);
     let mut dec = Decoder::new(&data[24 + 4 * n_rounds..]);
     let mut ll = Vec::new();
@@ -834,5 +857,10 @@ mod tests {
             corrupt[at..at + value.len()].copy_from_slice(&value);
             assert!(decode(&corrupt[..]).is_err());
         }
+        // The shared limits the encoder also enforces.
+        assert!(check_counts(31, 1000, &[10, 5], 100).is_ok());
+        assert!(check_counts(31, 1000, &[40], 100).is_err());
+        assert!(check_counts(31, 1 << 40, &[1, u32::MAX as u64 + 1], 1 << 40).is_err());
+        assert!(check_counts(31, 25_601, &[1], 100).is_err());
     }
 }
