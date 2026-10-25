@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn stored_chains_roundtrip() {
         let dicts = dicts();
-        let (chains, _) = builder(&dicts).to_chains();
+        let (chains, _) = builder(&dicts).finish();
         assert_eq!(chains.junction_weights[..2], [SOURCE_COLEX, SINK_COLEX]);
 
         let stored = chains.to_stored();
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn colex_ranks_use_the_bits_they_need() {
         // Largest rank 95: bound 96, so ranks below 32 take 6 bits and the others 7.
-        let (chains, _) = builder(&dicts()).to_chains();
+        let (chains, _) = builder(&dicts()).finish();
         let stored = chains.to_stored();
         assert_eq!(stored.colex_bound, 96);
         assert_eq!(stored.n_junctions as usize, chains.junction_weights.len());
@@ -427,7 +427,7 @@ mod tests {
         // Ranks of 0 only (no bits), a power-of-two bound, and ranks just below the dummy ranks.
         for (ranks, bound) in [(vec![0, 0], 1), (vec![5, 63, 0], 64), (vec![1, SOURCE_COLEX - 1, 7], SOURCE_COLEX)] {
             let d: Vec<Vec<(usize, Range<usize>)>> = vec![ranks.iter().map(|&r| (3, r as usize..r as usize + 1)).collect()];
-            let (chains, choices) = builder(&d).to_chains();
+            let (chains, choices) = builder(&d).finish();
             let stored = chains.to_stored();
             assert_eq!(stored.colex_bound, bound);
             if bound == 1 {
@@ -461,7 +461,7 @@ mod tests {
         for (d, f) in dicts.iter().zip(&flags) {
             builder.add_dictionary(&dictionary_with_flags(d, f));
         }
-        let (chains, choices) = builder.to_chains();
+        let (chains, choices) = builder.finish();
 
         let bytes = postcard::to_allocvec(&chains).unwrap();
         let decoded: ChainCsr = postcard::from_bytes(&bytes).unwrap();
@@ -489,7 +489,7 @@ mod tests {
         for d in &dicts {
             builder.add_dictionary(&dictionary(d));
         }
-        let (chains, _) = builder.to_chains();
+        let (chains, _) = builder.finish();
 
         // For k <= 255 the coding is the same as without k.
         for k in [Some(31), Some(255)] {
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn targets_roundtrip() {
         for dicts in [dicts(), many_paths()] {
-            let (chains, choices) = builder(&dicts).to_chains();
+            let (chains, choices) = builder(&dicts).finish();
             let decoded = ChainCsr::from_stored(chains.to_stored()).unwrap();
             assert_eq!(decoded, chains);
             for (color, d) in dicts.iter().enumerate() {
@@ -527,16 +527,17 @@ mod tests {
     #[test]
     fn stored_graph_roundtrip() {
         let dicts = dicts();
-        for collapse in [false, true] {
-            let (graph, choices) = builder(&dicts).collapse_chains(collapse).finish();
-            let bytes = postcard::to_allocvec(&graph).unwrap();
-            let graph: StoredGraph = postcard::from_bytes(&bytes).unwrap();
-            assert_eq!(matches!(graph, StoredGraph::Chains(_)), collapse);
-            for (color, d) in dicts.iter().enumerate() {
-                let decoded = graph.walk_path(&choices, color as u32).unwrap();
-                assert_eq!(decoded, expected(d));
-            }
+        let (graph, choices) = builder(&dicts).finish();
+        let mut bytes = graph.to_bytes(None, None).unwrap();
+        let decoded = ChainCsr::from_bytes(&bytes, None, None).unwrap();
+        assert_eq!(decoded, graph);
+        for (color, d) in dicts.iter().enumerate() {
+            assert_eq!(decoded.walk_path(&choices, color as u32).unwrap(), expected(d));
         }
+        // The plain layout's tag and an empty section are errors.
+        bytes[0] = 0;
+        assert!(ChainCsr::from_bytes(&bytes, None, None).is_err());
+        assert!(ChainCsr::from_bytes(&[], None, None).is_err());
     }
 
     #[test]
@@ -547,7 +548,7 @@ mod tests {
         for seq in &seqs {
             builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
         }
-        let (chains, _) = builder.to_chains();
+        let (chains, _) = builder.finish();
         let from_array = crate::walk::WalkIndex { sbwt, lcs: Some(lcs) };
         let from_sbwt = crate::walk::WalkIndex { sbwt, lcs: None };
         for cap in [1, 8, 255] {
@@ -575,7 +576,7 @@ mod tests {
         for seq in &seqs {
             builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
         }
-        let (chains, _) = builder.to_chains();
+        let (chains, _) = builder.finish();
         let walk = crate::graph::collapsed::WalkIndex { sbwt, lcs: Some(lcs) };
         let plain = chains.to_stored_with(Some(walk), 255, Some(15), false);
         let stored = chains.to_stored_with(Some(walk), 255, Some(15), true);

@@ -53,7 +53,7 @@ use crate::codecs::arith::{code_tree, update, Coder, Decoder, Encoder, C0};
 use crate::codecs::mix::{Apm, ApmRate, Tables, SMAX};
 
 use super::{ChoiceStream, ChoiceWriter, Choices};
-use crate::graph::{GraphWalk, StoredGraph, SINK_NODE, SOURCE_NODE};
+use crate::graph::{GraphWalk, SINK_NODE, SOURCE_NODE};
 
 /// Reference colours per colour.
 const N_REFS: usize = 8;
@@ -90,29 +90,23 @@ const SCORE_ONE: u32 = 256;
 const APM_RATE: i64 = 1311;
 
 /// Codes the choices of every colour with the model.
-pub fn encode(
-    graph: &StoredGraph,
+pub fn encode<G: GraphWalk>(
+    graph: &G,
     choices: &Choices,
 ) -> Result<Vec<u8>, String> {
     let mut encoder = Encoder::new();
-    match graph {
-        StoredGraph::Csr(g) => code_all(&mut encoder, g, choices.streams.len(), Some(choices))?,
-        StoredGraph::Chains(g) => code_all(&mut encoder, g, choices.streams.len(), Some(choices))?,
-    };
+    code_all(&mut encoder, graph, choices.streams.len(), Some(choices))?;
     Ok(encoder.finish())
 }
 
 /// Decodes the choices of `n_colors` colours from `bytes`, see [encode].
-pub fn decode(
-    graph: &StoredGraph,
+pub fn decode<G: GraphWalk>(
+    graph: &G,
     n_colors: usize,
     bytes: &[u8],
 ) -> Result<Choices, String> {
     let mut decoder = Decoder::new(bytes);
-    let streams = match graph {
-        StoredGraph::Csr(g) => code_all(&mut decoder, g, n_colors, None)?,
-        StoredGraph::Chains(g) => code_all(&mut decoder, g, n_colors, None)?,
-    };
+    let streams = code_all(&mut decoder, graph, n_colors, None)?;
     if decoder.overrun() {
         return Err("choice stream truncated".to_string())
     }
@@ -421,7 +415,7 @@ mod tests {
         builder
     }
 
-    fn roundtrip(graph: &StoredGraph, choices: &Choices) -> usize {
+    fn roundtrip<G: GraphWalk>(graph: &G, choices: &Choices) -> usize {
         let bytes = encode(graph, choices).unwrap();
         let decoded = decode(graph, choices.streams.len(), &bytes).unwrap();
         assert_eq!(&decoded, choices);
@@ -431,15 +425,14 @@ mod tests {
     #[test]
     fn roundtrip_both_layouts() {
         let dicts = dicts();
-        let (csr, csr_choices) = builder(&dicts).to_csr();
-        let (chains, choices) = builder(&dicts).to_chains();
+        let (chains, choices) = builder(&dicts).finish();
+        let csr = chains.to_csr();
         let (start, end) = csr.row(SOURCE_NODE as usize);
         assert!(end - start > MAX_LISTED as usize);
-        let (csr, chains) = (StoredGraph::Csr(csr), StoredGraph::Chains(chains));
 
         let n_bits = 8 * choices.streams.iter().map(|s| s.bits.len()).sum::<usize>();
         let coded = roundtrip(&chains, &choices);
-        assert_eq!(roundtrip(&csr, &csr_choices), coded);
+        assert_eq!(roundtrip(&csr, &choices), coded);
         // Related colours make the same choices.
         assert!(coded * 8 * 2 < n_bits, "{} bytes for {} bits", coded, n_bits);
 

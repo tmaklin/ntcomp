@@ -32,12 +32,10 @@ type E = Box<dyn std::error::Error>;
 /// An input file: its name and its contigs.
 pub type InputFile = (Vec<u8>, Vec<Contig>);
 
-/// Options of an archive.
+/// Options of an archive. The defaults are the best archives: reorienting
+/// and editing on, as in `ntcomp graph`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArchiveOpts {
-    /// Store linear chains of the graph as single edges, see
-    /// [collapsed](crate::graph::collapsed).
-    pub collapse_chains: bool,
     /// Store every contig on the strand that shares the most with the
     /// contigs before it, see [strands].
     pub reorient: bool,
@@ -51,7 +49,7 @@ pub struct ArchiveOpts {
 
 impl Default for ArchiveOpts {
     fn default() -> Self {
-        ArchiveOpts { collapse_chains: false, reorient: false, reorient_sampling: strands::DEFAULT_SAMPLING, edit: false }
+        ArchiveOpts { reorient: true, reorient_sampling: strands::DEFAULT_SAMPLING, edit: true }
     }
 }
 
@@ -85,7 +83,7 @@ impl<'a> ArchiveWriter<'a> {
         index: &'a Index,
     ) -> Self {
         assert!(opts.reorient_sampling > 0, "sampling width must be at least 1");
-        let builder = GraphBuilder::new().collapse_chains(opts.collapse_chains);
+        let builder = GraphBuilder::new();
         ArchiveWriter {
             opts, index, builder,
             strand_chooser: None,
@@ -221,7 +219,7 @@ mod tests {
             .into_iter().enumerate().map(|(i, contig)| (format!("contig{}", i).into_bytes(), contig)).collect();
         let files: Vec<InputFile> = vec![(b"input".to_vec(), contigs.clone())];
 
-        let opts = ArchiveOpts { collapse_chains: true, edit: true, ..Default::default() };
+        let opts = ArchiveOpts { reorient: false, ..Default::default() };
         let mut writer = ArchiveWriter::new(opts, &index);
         assert_eq!(writer.add_files(&files).unwrap(), vec![0, 1, 2]);
         let edits = writer.snp_edits().unwrap();

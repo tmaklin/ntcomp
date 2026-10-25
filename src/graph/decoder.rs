@@ -20,7 +20,7 @@ use crate::codecs::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
 use crate::codecs::lzma::{self, LzmaData};
-use super::StoredGraph;
+use super::ChainCsr;
 use crate::walk::WalkIndex;
 
 use crate::index::Index;
@@ -118,7 +118,7 @@ fn read_reversed<R: Read>(
 /// The sections of an archive ([GraphDecoder::decode_from_read]); the
 /// optional ones are None if the archive does not have them.
 pub struct DecodedSections {
-    pub graph: StoredGraph,
+    pub graph: ChainCsr,
     pub choices: Choices,
     /// Hash of every contig.
     pub hashes: Option<Vec<super::ContigHash>>,
@@ -198,7 +198,7 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
-        let graph = StoredGraph::from_bytes(&read_bytes(reader, header.graph_bytes)?, index, k)?;
+        let graph = ChainCsr::from_bytes(&read_bytes(reader, header.graph_bytes)?, index, k)?;
         let hashes = read_section(reader, header.hash_bytes as u64)?;
         let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;
@@ -222,12 +222,12 @@ mod tests {
     use super::super::snps::Snp;
     use crate::testing::{dictionary, related_index};
 
-    fn graph() -> (StoredGraph, Choices, Vec<Vec<(usize, Range<usize>)>>) {
+    fn graph() -> (ChainCsr, Choices, Vec<Vec<(usize, Range<usize>)>>) {
         let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
             vec![(5, 10..11), (1, 50..51), (2, 60..61), (5, 10..11), (3, 20..21)],
             vec![(5, 10..11), (3, 20..21), (2, 40..41)],
         ];
-        let mut builder = GraphBuilder::new().collapse_chains(true);
+        let mut builder = GraphBuilder::new();
         for d in &dicts {
             builder.add_dictionary(&dictionary(d));
         }
@@ -326,9 +326,9 @@ mod tests {
 
     #[test]
     fn archives_written_with_the_index_decode_with_or_without_its_lcs_array() {
-        use crate::graph::{StoredGraph, GraphWalk};
+        use crate::graph::GraphWalk;
         let (seqs, index) = related_index(15);
-        let mut builder = crate::graph::GraphBuilder::new().collapse_chains(true);
+        let mut builder = crate::graph::GraphBuilder::new();
         for seq in &seqs {
             builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
         }
@@ -344,7 +344,6 @@ mod tests {
             for (color, walk) in walks.iter().enumerate() {
                 assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
             }
-            assert!(matches!(graph, StoredGraph::Chains(_)));
         }
         let mut input = with_lcs.as_slice();
         assert!(crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read().is_err());

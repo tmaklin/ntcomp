@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 use crate::graph::decoder::{ArchiveError, DecodedSections, GraphDecoder};
 use crate::graph::snps::{self, SnpEdits};
-use crate::graph::{contig_hash, Choices, ContigHash, Csr, GraphWalk, StoredGraph};
+use crate::graph::{contig_hash, Choices, ChainCsr, ContigHash, Csr, GraphWalk};
 use crate::index::Index;
 use crate::nlz::PhraseCache;
 
@@ -37,7 +37,7 @@ pub struct ArchiveReader<'a> {
     /// The phrases decoded so far.
     cache: PhraseCache,
     n_contigs: u32,
-    graph: StoredGraph,
+    graph: ChainCsr,
     choices: Choices,
     hashes: Option<Vec<ContigHash>>,
     contig_names: Option<Vec<Vec<u8>>>,
@@ -181,7 +181,7 @@ impl<'a> ArchiveReader<'a> {
     pub fn into_colored_graph(
         self,
     ) -> Result<(Csr<u32>, Vec<Vec<u32>>), E> {
-        let csr = self.graph.into_csr();
+        let csr = self.graph.to_csr();
         let colorsets = csr.colorsets(&self.choices, self.n_contigs)?;
         Ok((csr, colorsets))
     }

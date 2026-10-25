@@ -36,7 +36,7 @@ mod tests {
         contigs[2].1 = crate::strands::reverse_complement(&contigs[2].1);
         let files: Vec<InputFile> = vec![(b"first".to_vec(), contigs[..1].to_vec()), (b"second".to_vec(), contigs[1..].to_vec())];
 
-        let opts = ArchiveOpts { collapse_chains: true, reorient: true, edit: true, ..Default::default() };
+        let opts = ArchiveOpts::default();
         let mut writer = ArchiveWriter::new(opts, &index);
         assert_eq!(writer.add_files(&files).unwrap(), vec![0, 1, 2, 3]);
         let mut bytes = Vec::new();

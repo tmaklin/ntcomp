@@ -18,9 +18,8 @@
 use indexmap::IndexSet;
 
 use super::choices::{ChoiceWriter, Choices};
-use super::collapsed::ChainCsr;
 use crate::nlz::Dictionary;
-use super::{Csr, GraphWalk, StoredGraph, IMPLICIT_SUFFIX_LEN, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
+use super::{ChainCsr, Csr, GraphWalk, IMPLICIT_SUFFIX_LEN, SINK_COLEX, SINK_NODE, SOURCE_COLEX, SOURCE_NODE};
 
 /// Builds the graph and remembers the path each colour takes.
 pub struct GraphBuilder {
@@ -36,9 +35,6 @@ pub struct GraphBuilder {
 
     /// Per colour: edge ids (indexes into `edges`) in traversal order
     paths: Vec<Vec<usize>>,
-
-    /// Store linear chains as single edges in [GraphBuilder::finish]
-    collapse_chains: bool,
 }
 
 impl Default for GraphBuilder {
@@ -58,17 +54,7 @@ impl GraphBuilder {
             edges: IndexSet::new(),
             implicit: Vec::new(),
             paths: Vec::new(),
-            collapse_chains: false,
         }
-    }
-
-    /// Collapse linear chains into single edges in [GraphBuilder::finish].
-    pub fn collapse_chains(
-        mut self,
-        collapse: bool,
-    ) -> Self {
-        self.collapse_chains = collapse;
-        self
     }
 
     fn insert_node(
@@ -125,31 +111,13 @@ impl GraphBuilder {
         color
     }
 
-    /// Converts into the stored representation (graph + choice stream),
-    /// collapsing linear chains if [GraphBuilder::collapse_chains] was set.
-    pub fn finish(self) -> (StoredGraph, Choices) {
-        if self.collapse_chains {
-            let (chains, choices) = self.to_chains();
-            (StoredGraph::Chains(chains), choices)
-        } else {
-            let (csr, choices) = self.to_csr();
-            (StoredGraph::Csr(csr), choices)
-        }
-    }
-
-    /// Converts into the stored representation (graph + choice stream).
-    pub fn to_csr(self) -> (Csr<u32>, Choices) {
-        let (csr, csr_pos) = self.build_csr();
-        let choices = self.choices(&csr, &csr_pos);
-        (csr, choices)
-    }
-
-    /// Converts into the stored representation with linear chains collapsed.
+    /// Converts into the stored representation: the graph with linear chains
+    /// collapsed, and the choice streams.
     ///
     /// Only junctions have more than one outgoing edge and their chains keep
-    /// the CSR order of their first edges, so the choice stream is the same as
-    /// for [GraphBuilder::to_csr].
-    pub fn to_chains(self) -> (ChainCsr, Choices) {
+    /// the CSR order of their first edges, so the choice streams are the same
+    /// for the uncollapsed graph ([ChainCsr::to_csr]).
+    pub fn finish(self) -> (ChainCsr, Choices) {
         let (csr, csr_pos) = self.build_csr();
         let choices = self.choices(&csr, &csr_pos);
         (ChainCsr::from_csr(&csr), choices)

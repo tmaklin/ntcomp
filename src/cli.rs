@@ -180,15 +180,11 @@ pub struct GraphArgs {
     pub fasta_columns: usize,
 
     // Encoding options: all on by default (the best archives).
-    // // Collapse linear chains
-    #[arg(long = "no-collapse-chains", action = ArgAction::SetFalse, help = "Store every node separately (the plain CSR layout) instead of linear chains of nodes as single edges.")]
-    pub collapse_chains: bool,
-
     // // Choose contig strands
     #[arg(long = "no-reorient", action = ArgAction::SetFalse, help = "Store every contig on its input strand instead of the strand that shares the most with the contigs before it.")]
     pub reorient: bool,
 
-    #[arg(long = "reorient-sampling", default_value_t = 32, value_parser = clap::value_parser!(u64).range(1..), help = "Sample one in this many 31-mers for choosing the strands.")]
+    #[arg(long = "reorient-sampling", default_value_t = ntcomp::strands::DEFAULT_SAMPLING, value_parser = clap::value_parser!(u64).range(1..), help = "Sample one in this many 31-mers for choosing the strands.")]
     pub reorient_sampling: u64,
 
     // // Edit SNPs towards the index
@@ -326,7 +322,6 @@ impl GraphArgs {
     /// The options for writing the archive.
     pub fn archive_opts(&self) -> ntcomp::archive::ArchiveOpts {
         ntcomp::archive::ArchiveOpts {
-            collapse_chains: self.collapse_chains,
             reorient: self.reorient,
             reorient_sampling: self.reorient_sampling,
             edit: self.edit_snps,

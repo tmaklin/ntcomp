@@ -18,8 +18,9 @@ use super::paths::take_edge;
 use super::{stored_entry, GraphDecodeError, GraphWalk, SINK_NODE, SOURCE_NODE};
 use crate::nlz::{Dictionary, Entry};
 
-/// Graph in compressed sparse row format; this is what gets stored.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+/// Graph in compressed sparse row format, uncollapsed: what the builder
+/// collapses into [ChainCsr](super::ChainCsr), and what the chains expand to.
+#[derive(Debug)]
 pub struct Csr<N> {
     pub node_weights: Vec<N>,
     pub row_ptrs: Vec<u32>,

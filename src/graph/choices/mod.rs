@@ -35,7 +35,7 @@
 use crate::codecs::bits::{BitReader, BitWriter};
 pub mod model;
 
-use super::StoredGraph;
+use super::ChainCsr;
 
 /// Choice streams of every colour.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl Choices {
     /// Codes the streams of the colours walking `graph`, see [model].
     pub fn to_stored(
         &self,
-        graph: &StoredGraph,
+        graph: &ChainCsr,
     ) -> Result<Vec<u8>, String> {
         model::encode(graph, self).map_err(|e| format!("choice streams: {}", e))
     }
@@ -55,7 +55,7 @@ impl Choices {
     /// Decodes the streams of `n_colors` colours walking `graph`, see [Choices::to_stored].
     pub fn from_stored(
         stored: &[u8],
-        graph: &StoredGraph,
+        graph: &ChainCsr,
         n_colors: usize,
     ) -> Result<Self, String> {
         model::decode(graph, n_colors, stored).map_err(|e| format!("choice streams: {}", e))

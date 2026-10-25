@@ -15,7 +15,7 @@
 //!
 //! Can be read back with [GraphDecoder](super::decoder::GraphDecoder).
 use super::header::{FileHeader, FILE_HEADER_BYTES};
-use super::StoredGraph;
+use super::ChainCsr;
 use super::choices::Choices;
 use super::snps::SnpEdits;
 use crate::codecs::bits::BitWriter;
@@ -34,7 +34,7 @@ type E = Box<dyn std::error::Error>;
 /// Encodes the output from [GraphBuilder](super::GraphBuilder).
 pub struct GraphEncoder<'a> {
     /// Stored graph
-    graph: StoredGraph,
+    graph: ChainCsr,
 
     /// Choice stream
     choices: Choices,
@@ -77,7 +77,7 @@ fn optional_section<T: serde::Serialize>(
 
 impl<'a> GraphEncoder<'a> {
     pub fn new(
-        graph: StoredGraph,
+        graph: ChainCsr,
         choices: Choices,
     ) -> Self {
         GraphEncoder {

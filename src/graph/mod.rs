@@ -37,8 +37,8 @@
 //!
 //! ## Collapsed chains
 //!
-//! Optionally, linear chains of nodes are stored as single edges between
-//! junctions, see [collapsed]. Linear chains are paths on the graph composed
+//! Linear chains of nodes are stored as single edges between junctions
+//! ([ChainCsr]), see [collapsed]. Linear chains are paths on the graph composed
 //! entirely of inner nodes, meaning nodes that have exactly one incoming and
 //! exactly one outgoing edge. All other nodes are junction nodes.
 //!
@@ -46,8 +46,8 @@
 //!
 //! - [builder]: builds the graph from the contigs ([GraphBuilder]), with
 //!   strand choice and edits;
-//! - [csr]: the plain layout ([Csr]); [collapsed]: the chain layout and its
-//!   stored sections;
+//! - [csr]: the uncollapsed graph ([Csr]), built first and expanded for
+//!   viewing; [collapsed]: the stored chain layout and its sections;
 //! - [paths]: walking a colour's path with its choices ([GraphWalk]);
 //! - [choices]: the choice streams and the model that codes them;
 //! - [snps]: the archive's SNP section;
@@ -65,12 +65,12 @@ pub mod snps;
 
 pub use builder::GraphBuilder;
 pub use choices::Choices;
+pub use collapsed::ChainCsr;
 pub use csr::Csr;
 pub use paths::GraphWalk;
 use paths::take_edge;
-use crate::nlz::{Dictionary, Entry};
+use crate::nlz::Entry;
 use crate::walk::WalkIndex;
-use collapsed::ChainCsr;
 
 type E = Box<dyn std::error::Error>;
 
@@ -112,47 +112,29 @@ fn stored_entry(
     Entry { colex_rank, len, implicit: len == IMPLICIT_SUFFIX_LEN }
 }
 
-/// Serialized form of [StoredGraph] (the same bytes as its serde form).
-#[derive(serde::Serialize)]
-enum StoredGraphRef<'a> {
-    Csr(&'a Csr<u32>),
-    Chains(collapsed::StoredChains),
-}
+/// Leading byte of the stored graph: the chain layout (the variant tag that
+/// separated it from the plain layout, which is no longer written or read).
+const CHAINS_TAG: u8 = 1;
 
-/// Deserialized form of [StoredGraph] before the chains are decoded.
-#[derive(serde::Deserialize)]
-enum StoredGraphOwned {
-    Csr(Csr<u32>),
-    Chains(collapsed::StoredChains),
-}
-
-/// Stored graph, either as is or with linear chains collapsed.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub enum StoredGraph {
-    Csr(Csr<u32>),
-    Chains(ChainCsr),
-}
-
-impl StoredGraph {
+impl ChainCsr {
     /// Serializes the graph. With the `index` (and its LCS array), the
-    /// suffix lengths of collapsed chains are coded per LCS context and their
-    /// nodes are derived by walks in the index where possible, see
-    /// [collapsed]; reading them back then needs the index. `k` is the
-    /// _k_-mer size of the index (None if unknown), which sets the direct
-    /// suffix length symbols, see [collapsed::max_direct_suffix_len].
+    /// suffix lengths are coded per LCS context and the nodes are derived by
+    /// walks in the index where possible, see [collapsed]; reading them back
+    /// then needs the index. `k` is the _k_-mer size of the index (None if
+    /// unknown), which sets the direct suffix length symbols, see
+    /// [collapsed::max_direct_suffix_len].
     pub fn to_bytes(
         &self,
         index: Option<WalkIndex>,
         k: Option<u32>,
     ) -> Result<Vec<u8>, postcard::Error> {
-        let repr = match self {
-            StoredGraph::Csr(csr) => StoredGraphRef::Csr(csr),
-            StoredGraph::Chains(chains) => StoredGraphRef::Chains(chains.to_stored_with(index, collapsed::max_direct_suffix_len(k), k, index.is_some())),
-        };
-        postcard::to_allocvec(&repr)
+        let stored = self.to_stored_with(index, collapsed::max_direct_suffix_len(k), k, index.is_some());
+        let mut bytes = vec![CHAINS_TAG];
+        bytes.extend(postcard::to_allocvec(&stored)?);
+        Ok(bytes)
     }
 
-    /// Reads a graph written by [StoredGraph::to_bytes]; `index` is needed if
+    /// Reads a graph written by [ChainCsr::to_bytes]; `index` is needed if
     /// it was written with the index (its LCS array is optional: the values
     /// are otherwise computed from the SBWT, slower), and `k` must be the
     /// _k_-mer size it was written with (None works for _k_ ≤ 255).
@@ -161,64 +143,18 @@ impl StoredGraph {
         index: Option<WalkIndex>,
         k: Option<u32>,
     ) -> Result<Self, E> {
-        Ok(match postcard::from_bytes(bytes)? {
-            StoredGraphOwned::Csr(csr) => StoredGraph::Csr(csr),
-            StoredGraphOwned::Chains(stored) => StoredGraph::Chains(ChainCsr::from_stored_with(stored, index, k)?),
-        })
-    }
-
-    /// Uncollapsed graph.
-    pub fn into_csr(self) -> Csr<u32> {
-        match self {
-            StoredGraph::Csr(csr) => csr,
-            StoredGraph::Chains(chains) => chains.to_csr(),
+        match bytes.split_first() {
+            Some((&CHAINS_TAG, rest)) => Ok(ChainCsr::from_stored_with(postcard::from_bytes(rest)?, index, k)?),
+            Some((0, _)) => Err(Box::new(GraphDecodeError("the plain graph layout is no longer supported".to_string()))),
+            _ => Err(Box::new(GraphDecodeError("unknown graph layout".to_string()))),
         }
     }
 
     /// One-line description for logging.
     pub fn summary(&self) -> String {
-        match self {
-            StoredGraph::Csr(csr) => format!(
-                "{} nodes, {} edges",
-                csr.node_weights.len(), csr.column_indices.len()),
-            StoredGraph::Chains(chains) => format!(
-                "{} junctions, {} chains, {} inner nodes, {} edges",
-                chains.junction_weights.len(), chains.n_chains(), chains.inner_weights.len(), chains.suffix_lens.len()),
-        }
-    }
-}
-
-impl GraphWalk for StoredGraph {
-    fn n_nodes(&self) -> usize {
-        match self { StoredGraph::Csr(g) => g.n_nodes(), StoredGraph::Chains(g) => g.n_nodes() }
-    }
-
-    fn n_edges(&self) -> usize {
-        match self { StoredGraph::Csr(g) => g.n_edges(), StoredGraph::Chains(g) => g.n_edges() }
-    }
-
-    fn row(&self, node: usize) -> (usize, usize) {
-        match self { StoredGraph::Csr(g) => g.row(node), StoredGraph::Chains(g) => g.row(node) }
-    }
-
-    fn target(&self, edge: usize) -> usize {
-        match self { StoredGraph::Csr(g) => g.target(edge), StoredGraph::Chains(g) => g.target(edge) }
-    }
-
-    fn max_steps(&self, edge: usize) -> usize {
-        match self { StoredGraph::Csr(g) => g.max_steps(edge), StoredGraph::Chains(g) => g.max_steps(edge) }
-    }
-
-    /// Walks the path of `color` from the source to the sink, see [GraphWalk::walk_path].
-    fn walk_path(
-        &self,
-        choices: &Choices,
-        color: u32,
-    ) -> Result<Dictionary, GraphDecodeError> {
-        match self {
-            StoredGraph::Csr(csr) => csr.walk_path(choices, color),
-            StoredGraph::Chains(chains) => chains.walk_path(choices, color),
-        }
+        format!(
+            "{} junctions, {} chains, {} inner nodes, {} edges",
+            self.junction_weights.len(), self.n_chains(), self.inner_weights.len(), self.suffix_lens.len())
     }
 }
 

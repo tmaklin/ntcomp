@@ -366,12 +366,11 @@ mod tests {
     #[test]
     fn chain_walk_recovers_paths() {
         let dicts = dicts();
-        let (chains, choices) = builder(&dicts).to_chains();
-        let (csr, plain_choices) = builder(&dicts).to_csr();
+        let (chains, choices) = builder(&dicts).finish();
+        let csr = chains.to_csr();
 
         assert!(chains.n_chains() < csr.column_indices.len());
         assert_eq!(chains.suffix_lens.len(), csr.suffix_lens.len());
-        assert_eq!(choices.n_choices(), plain_choices.n_choices());
 
         let bytes = postcard::to_allocvec(&chains).unwrap();
         let chains: ChainCsr = postcard::from_bytes(&bytes).unwrap();
@@ -386,21 +385,13 @@ mod tests {
     #[test]
     fn expanded_chains_decode_with_the_same_choices() {
         let dicts = dicts();
-        let (chains, choices) = builder(&dicts).to_chains();
+        let (chains, choices) = builder(&dicts).finish();
         let expanded = chains.to_csr();
 
         for (color, d) in dicts.iter().enumerate() {
             let decoded = expanded.walk_path(&choices, color as u32).unwrap();
             assert_eq!(decoded, expected(d));
         }
-    }
-
-    #[test]
-    fn both_layouts_have_the_same_choices() {
-        let dicts = dicts();
-        let (_, chain_choices) = builder(&dicts).to_chains();
-        let (_, plain_choices) = builder(&dicts).to_csr();
-        assert_eq!(chain_choices.streams, plain_choices.streams);
     }
 
     #[test]
@@ -423,17 +414,15 @@ mod tests {
             }
         }
 
-        let (csr, choices) = builder(&dicts).to_csr();
-        let (chains, chain_choices) = builder(&dicts).to_chains();
-        for (csr, choices) in [(csr, choices), (chains.to_csr(), chain_choices)] {
-            let colorsets = csr.colorsets(&choices, dicts.len() as u32).unwrap();
-            assert_eq!(colorsets.len(), expected_sets.len());
-            for node in 0..csr.node_weights.len() {
-                let (start, end) = csr.row(node);
-                for pos in start..end {
-                    let key = (csr.node_weights[node], csr.node_weights[csr.column_indices[pos] as usize], csr.suffix_lens[pos]);
-                    assert_eq!(colorsets[pos], expected_sets[&key]);
-                }
+        let (chains, choices) = builder(&dicts).finish();
+        let csr = chains.to_csr();
+        let colorsets = csr.colorsets(&choices, dicts.len() as u32).unwrap();
+        assert_eq!(colorsets.len(), expected_sets.len());
+        for node in 0..csr.node_weights.len() {
+            let (start, end) = csr.row(node);
+            for pos in start..end {
+                let key = (csr.node_weights[node], csr.node_weights[csr.column_indices[pos] as usize], csr.suffix_lens[pos]);
+                assert_eq!(colorsets[pos], expected_sets[&key]);
             }
         }
     }
