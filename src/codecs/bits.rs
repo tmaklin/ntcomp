@@ -53,17 +53,6 @@ impl BitWriter {
         }
     }
 
-    /// Writes `value > 0` with the Elias gamma code.
-    pub fn write_gamma(
-        &mut self,
-        value: u64,
-    ) {
-        assert!(value > 0, "Elias gamma code needs a positive value");
-        let n = 63 - value.leading_zeros();
-        self.write_bits(0, n);
-        self.write_bits(value, n + 1);
-    }
-
     /// Writes `value < n_symbols` with the truncated binary code for `n_symbols`.
     pub fn write_truncated_binary(
         &mut self,
@@ -113,19 +102,6 @@ impl<'a> BitReader<'a> {
         Some(value)
     }
 
-    pub fn read_gamma(
-        &mut self,
-    ) -> Option<u64> {
-        let mut n = 0;
-        while self.read_bits(1)? == 0 {
-            n += 1;
-            if n > 63 {
-                return None
-            }
-        }
-        Some((1 << n) | self.read_bits(n)?)
-    }
-
     /// Number of bits read so far.
     pub fn bits_read(&self) -> usize {
         self.bit
@@ -151,13 +127,9 @@ mod tests {
 
     #[test]
     fn codes_roundtrip() {
-        let gammas: Vec<u64> = (1..300).chain([1 << 20, u32::MAX as u64, u64::MAX]).collect();
         let truncated: Vec<(u32, u32)> = (1..70).flat_map(|n| (0..n).map(move |v| (v, n))).collect();
 
         let mut writer = BitWriter::new();
-        for &x in &gammas {
-            writer.write_gamma(x);
-        }
         for &(v, n) in &truncated {
             writer.write_truncated_binary(v, n);
         }
@@ -165,9 +137,6 @@ mod tests {
         let bytes = writer.finish();
 
         let mut reader = BitReader::new(&bytes);
-        for &x in &gammas {
-            assert_eq!(reader.read_gamma(), Some(x));
-        }
         for &(v, n) in &truncated {
             assert_eq!(reader.read_truncated_binary(n), Some(v));
         }
@@ -178,10 +147,9 @@ mod tests {
     #[test]
     fn small_values_are_short() {
         let mut writer = BitWriter::new();
-        writer.write_gamma(1); // 1
-        writer.write_gamma(2); // 010
         writer.write_truncated_binary(1, 2); // 1
         writer.write_truncated_binary(2, 3); // 11
-        assert_eq!(writer.finish(), vec![0b1010_1110]);
+        writer.write_truncated_binary(0, 3); // 0
+        assert_eq!(writer.finish(), vec![0b1110_0000]);
     }
 }

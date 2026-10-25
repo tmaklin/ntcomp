@@ -19,7 +19,7 @@
 //!   coder.
 //! - [mix]: the stretch and squash tables of logistic mixing, computed in
 //!   integer arithmetic; used by the context-mixing models.
-//! - [bits]: plain bit-level codes (fixed width, Elias gamma, truncated
+//! - [bits]: plain bit-level codes (fixed width and truncated
 //!   binary); used for the colex ranks and the choice streams.
 //! - [lzma]: raw LZMA streams for archive sections (contig names, file
 //!   ranges).
