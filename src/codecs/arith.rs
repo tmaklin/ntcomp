@@ -118,9 +118,17 @@ impl<'a> Decoder<'a> {
 
 /// Either side of the coder: codes `bit` (ignored when decoding) with
 /// probability `p1` (16-bit) of a 1 and returns the bit.
-pub trait Coder { fn code(&mut self, bit: u32, p1: u32) -> u32; }
+pub trait Coder {
+    fn code(&mut self, bit: u32, p1: u32) -> u32;
+    /// Whether a decoder has read past its input (never for an encoder), see
+    /// [Decoder::overrun]; loops over stored counts stop on it.
+    fn overrun(&self) -> bool { false }
+}
 impl Coder for Encoder { fn code(&mut self, bit: u32, p1: u32) -> u32 { self.bit(bit, p1); bit } }
-impl Coder for Decoder<'_> { fn code(&mut self, _bit: u32, p1: u32) -> u32 { self.bit(p1) } }
+impl Coder for Decoder<'_> {
+    fn code(&mut self, _bit: u32, p1: u32) -> u32 { self.bit(p1) }
+    fn overrun(&self) -> bool { Decoder::overrun(self) }
+}
 
 /// Codes a bit with an adaptive model and updates it.
 #[inline]

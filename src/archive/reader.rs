@@ -63,11 +63,8 @@ impl<'a> ArchiveReader<'a> {
         index: &'a Index,
     ) -> Result<Self, E> {
         let decoder = GraphDecoder::new(input)?;
-        let n_contigs = decoder.header().n_queries;
+        let n_contigs = decoder.header().n_contigs;
         let DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits } = decoder.decode_from_read_with_index(index)?;
-        if hashes.as_ref().is_some_and(|h| h.len() != n_contigs as usize) {
-            return Err(Box::new(ArchiveError(format!("{} hashes for {} contigs", hashes.map_or(0, |h| h.len()), n_contigs))))
-        }
         if contig_names.as_ref().is_some_and(|names| names.len() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("{} contig names for {} contigs", contig_names.map_or(0, |n| n.len()), n_contigs))))
         }

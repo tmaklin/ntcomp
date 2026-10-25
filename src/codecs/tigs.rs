@@ -112,6 +112,10 @@ const LR_SHIFT: u32 = 13;
 /// Anchoring rounds at most.
 const MAX_ROUNDS: usize = 4;
 
+/// The most bases a file may hold per byte; [decode] rejects larger counts as
+/// corrupt before allocating for them.
+const MAX_BASES_PER_BYTE: u64 = 256;
+
 fn hash64(x: u64, n: usize) -> u64 { (x ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15) }
 
 #[derive(Clone, Copy)]
@@ -499,7 +503,7 @@ fn code_base<C: Coder>(c: &mut C, p: [u32; 3], ex: u8, sym: u8) -> u8 {
 
 /// Codes `n` lengths, longest first: the first as 32 raw bits, then the
 /// differences from the previous one. Decoding appends them to `lens`.
-fn code_lengths<C: Coder>(c: &mut C, lens: &mut Vec<usize>, n: usize) {
+fn code_lengths<C: Coder>(c: &mut C, lens: &mut Vec<usize>, n: usize) -> Result<(), E> {
     let mut tree = vec![C0; 128];
     let mut prev = 0usize;
     for j in 0..n {
@@ -509,11 +513,12 @@ fn code_lengths<C: Coder>(c: &mut C, lens: &mut Vec<usize>, n: usize) {
             v as usize
         } else {
             let d = if lens.len() > j { (prev - lens[j]) as u64 } else { 0 };
-            prev - code_gamma(c, &mut tree, d) as usize
+            prev.checked_sub(code_gamma(c, &mut tree, d) as usize).ok_or("corrupt tigs file: tig lengths")?
         };
         if lens.len() <= j { lens.push(v); }
         prev = v;
     }
+    Ok(())
 }
 
 // Layout -------------------------------------------------------------------------
@@ -667,9 +672,9 @@ pub fn encode<W: Write>(
     let mut model = Model::new(k, n, true);
     let mut enc = Encoder::new();
     let mut ll: Vec<usize> = plan.long.iter().map(|t| t.len()).collect();
-    code_lengths(&mut enc, &mut ll, plan.long.len());
+    code_lengths(&mut enc, &mut ll, plan.long.len())?;
     let mut rl: Vec<usize> = plan.rest.iter().map(|t| t.len()).collect();
-    code_lengths(&mut enc, &mut rl, plan.rest.len());
+    code_lengths(&mut enc, &mut rl, plan.rest.len())?;
     let mut tpos = vec![C0; 128];
     let mut tstrand = C0;
     for round in &plan.rounds {
@@ -714,12 +719,19 @@ pub fn decode<R: Read>(
     let u32_at = |o: usize| -> Result<usize, E> { Ok(u32::from_le_bytes(data.get(o..o + 4).ok_or("truncated tigs file")?.try_into()?) as usize) };
     let (n_long, n_rest) = (u32_at(16)?, u32_at(20)?);
     let round_n: Vec<usize> = (0..n_rounds).map(|r| u32_at(24 + 4 * r)).collect::<Result<_, _>>()?;
+    // The counts come from the file: check them before sizing anything by
+    // them. Every tig has at least k bases, and no tig set compresses to
+    // nearly MAX_BASES_PER_BYTE bases per byte (the index tigs: ~30).
+    let n_tigs = round_n.iter().try_fold(n_long as u64 + n_rest as u64, |a, &b| a.checked_add(b as u64)).ok_or("corrupt tigs file")?;
+    if k < 2 || n_tigs.saturating_mul(k as u64) > n as u64 || n as u64 > MAX_BASES_PER_BYTE * data.len() as u64 {
+        return Err("corrupt tigs file: the counts do not fit its size".into())
+    }
     let mut model = Model::new(k, n, packed);
     let mut dec = Decoder::new(&data[24 + 4 * n_rounds..]);
     let mut ll = Vec::new();
-    code_lengths(&mut dec, &mut ll, n_long);
+    code_lengths(&mut dec, &mut ll, n_long)?;
     let mut rl = Vec::new();
-    code_lengths(&mut dec, &mut rl, n_rest);
+    code_lengths(&mut dec, &mut rl, n_rest)?;
     let mut tpos = vec![C0; 128];
     let mut tstrand = C0;
     let mut slots: Vec<Slot> = ll.iter().map(|&l| Slot { anchor: None, len: l, known: true }).collect();
@@ -810,5 +822,17 @@ mod tests {
         assert!(encode(&[b"ACGN".to_vec()], 3, Vec::new()).is_err());
         assert!(encode(&[b"AC".to_vec()], 3, Vec::new()).is_err());
         assert!(decode(&b"TAC4"[..]).is_err());
+    }
+
+    #[test]
+    fn rejects_corrupt_counts() {
+        let bytes = encode(&[b"ACGTTGCAAC".to_vec(), b"GGATCCTA".to_vec()], 3, Vec::new()).unwrap();
+        assert_eq!(decode(&bytes[..]).unwrap().len(), 2);
+        // Total bases (u64 at 8) and number of long tigs (u32 at 16).
+        for (at, value) in [(8, u64::MAX.to_le_bytes().to_vec()), (8, (1_u64 << 40).to_le_bytes().to_vec()), (16, u32::MAX.to_le_bytes().to_vec())] {
+            let mut corrupt = bytes.clone();
+            corrupt[at..at + value.len()].copy_from_slice(&value);
+            assert!(decode(&corrupt[..]).is_err());
+        }
     }
 }

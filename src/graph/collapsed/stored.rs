@@ -245,8 +245,12 @@ impl ChainCsr {
             return Err(GraphDecodeError("stored chains: missing source or sink".to_string()))
         }
         let colex_bound = stored.colex_bound;
-        if colex_bound == 0 || colex_bound > SOURCE_COLEX {
+        if colex_bound == 0 || colex_bound > SOURCE_COLEX || index.is_some_and(|index| colex_bound as usize > index.sbwt.n_sets()) {
             return Err(truncated("colex rank bound"))
+        }
+        // Every node is a distinct colex rank, besides the source and the sink.
+        if n_junctions > colex_bound as usize + 2 {
+            return Err(truncated("number of junctions"))
         }
 
         let mut coded = Decoder::new(&stored.topology);

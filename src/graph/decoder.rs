@@ -15,7 +15,7 @@
 //!
 //! Reads the output from [GraphEncoder](super::encoder::GraphEncoder).
 //!
-use super::header::{decode_file_header, FileHeader, FILE_HEADER_BYTES};
+use super::header::FileHeader;
 use crate::codecs::bits::BitReader;
 use super::choices::Choices;
 use super::snps::SnpEdits;
@@ -43,13 +43,17 @@ impl std::fmt::Display for ArchiveError {
 
 impl std::error::Error for ArchiveError {}
 
-/// Reads `n_bytes` from `input`.
+/// Reads `n_bytes` from `input`. The buffer grows with the bytes read, so a
+/// corrupt size fails at the end of the input instead of allocating it.
 fn read_bytes<R: Read>(
     input: &mut R,
     n_bytes: u64,
 ) -> Result<Vec<u8>, E> {
-    let mut bytes = vec![0_u8; n_bytes.try_into()?];
-    input.read_exact(&mut bytes)?;
+    let mut bytes = Vec::new();
+    input.take(n_bytes).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != n_bytes {
+        return Err(Box::new(ArchiveError(format!("a section of {} bytes is truncated to {}", n_bytes, bytes.len()))))
+    }
     Ok(bytes)
 }
 
@@ -137,13 +141,11 @@ pub struct GraphDecoder<'a, R: Read> {
 }
 
 impl<'a, R: Read> GraphDecoder<'a, R> {
-    /// Reads the file header from `reader`.
+    /// Reads the file header from `reader`, see [FileHeader::read_from].
     pub fn new(
         reader: &'a mut R,
     ) -> Result<Self, E> {
-        let mut header_bytes = [0_u8; FILE_HEADER_BYTES];
-        reader.read_exact(&mut header_bytes)?;
-        let file_header = decode_file_header(&header_bytes)?;
+        let file_header = FileHeader::read_from(reader)?;
 
         Ok(GraphDecoder {
             reader,
@@ -159,56 +161,66 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
 
     /// Reads and decodes every section, see [DecodedSections].
     ///
-    /// Fails for an archive written with the LCS array, see
-    /// [GraphDecoder::decode_from_read_with].
+    /// Fails for an archive written with an index, see
+    /// [GraphDecoder::decode_from_read_with_index].
     pub fn decode_from_read(
         self,
     ) -> Result<DecodedSections, E> {
-        self.decode_from_read_with(None, None)
+        self.decode_from_read_with(None)
     }
 
     /// Same as [GraphDecoder::decode_from_read] for an archive written with
     /// [GraphEncoder::with_index](super::encoder::GraphEncoder::with_index)
-    /// and `index`. (To decode without the LCS array, see
-    /// [GraphDecoder::decode_from_read_with].)
+    /// and `index`: an error before any section is read if the header names
+    /// another index ([FileHeader::check_index]). (To decode without the LCS
+    /// array, see [GraphDecoder::decode_from_read_with].)
     pub fn decode_from_read_with_index(
         self,
         index: &Index,
     ) -> Result<DecodedSections, E> {
-        self.decode_from_read_with(Some(index.walk_index()), Some(index.k().try_into()?))
+        self.file_header.check_index(index.id())?;
+        self.decode_from_read_with(Some(index.walk_index()))
     }
 
     /// Same as [GraphDecoder::decode_from_read]; `index` is needed if the
-    /// archive was written with it (LCS contexts and graph nodes derived by
-    /// walks; its LCS array is optional), and `k` is the _k_-mer size it was
-    /// written with (None works for _k_ ≤ 255).
+    /// archive was written with one (LCS contexts and graph nodes derived by
+    /// walks; its LCS array is optional). The caller checks that it is the
+    /// index the header names (see [GraphDecoder::decode_from_read_with_index]);
+    /// _k_ comes from the header.
     pub fn decode_from_read_with(
         self,
         index: Option<WalkIndex>,
-        k: Option<u32>,
     ) -> Result<DecodedSections, E> {
         let header = self.file_header;
         let reader = self.reader;
+        if header.index.is_some() && index.is_none() {
+            return Err(Box::new(ArchiveError("the archive was written with an index; decode it with the index".to_string())))
+        }
+        let k = header.index.map(|id| id.k);
+        let n_contigs = header.n_contigs;
 
-        let file_ranges = read_file_ranges(reader, header.file_range_bytes as u64)?;
-        if file_ranges.as_ref().is_some_and(|r| r.last().map_or(0, |(_, range)| range.end) != header.n_queries) {
-            return Err(Box::new(ArchiveError(format!("file ranges do not cover {} contigs", header.n_queries))))
+        let file_ranges = read_file_ranges(reader, header.file_range_bytes)?;
+        if file_ranges.as_ref().is_some_and(|r| r.last().map_or(0, |(_, range)| range.end) != n_contigs) {
+            return Err(Box::new(ArchiveError(format!("file ranges do not cover {} contigs", n_contigs))))
         }
         let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
         let graph = ChainCsr::from_bytes(&read_bytes(reader, header.graph_bytes)?, index, k)?;
-        let hashes = read_section(reader, header.hash_bytes as u64)?;
-        let reversed = read_reversed(reader, header.strand_bytes as u64, header.n_queries as usize)?;
-        let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes as u64)?;
-        if snp_edits.as_ref().is_some_and(|edits| edits.n_colors() != header.n_queries as usize) {
-            return Err(Box::new(ArchiveError(format!("SNP section does not have {} colours", header.n_queries))))
+        let hashes: Option<Vec<super::ContigHash>> = read_section(reader, header.hash_bytes)?;
+        if let Some(hashes) = &hashes && hashes.len() != n_contigs as usize {
+            return Err(Box::new(ArchiveError(format!("{} hashes for {} contigs", hashes.len(), n_contigs))))
+        }
+        let reversed = read_reversed(reader, header.strand_bytes, n_contigs as usize)?;
+        let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes)?;
+        if snp_edits.as_ref().is_some_and(|edits| edits.n_colors() != n_contigs as usize) {
+            return Err(Box::new(ArchiveError(format!("SNP section does not have {} colours", n_contigs))))
         }
         if header.choice_bytes == 0 {
             return Err(Box::new(ArchiveError("the choice section is missing".to_string())))
         }
-        let choices = Choices::from_stored(&read_bytes(reader, header.choice_bytes)?, &graph, header.n_queries as usize)?;
+        let choices = Choices::from_stored(&read_bytes(reader, header.choice_bytes)?, &graph, n_contigs as usize)?;
 
         Ok(DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
     }
@@ -219,8 +231,9 @@ mod tests {
     use super::*;
     use super::super::encoder::GraphEncoder;
     use super::super::{GraphBuilder, GraphWalk};
+    use super::super::header::FILE_HEADER_BYTES;
     use super::super::snps::Snp;
-    use crate::testing::{dictionary, related_index};
+    use crate::testing::{dictionary, random_sequence, related_index};
 
     fn graph() -> (ChainCsr, Choices, Vec<Vec<(usize, Range<usize>)>>) {
         let dicts: Vec<Vec<(usize, Range<usize>)>> = vec![
@@ -257,7 +270,7 @@ mod tests {
 
         let mut input = bytes.as_slice();
         let decoder = GraphDecoder::new(&mut input).unwrap();
-        assert_eq!(decoder.header().n_queries, 2);
+        assert_eq!(decoder.header().n_contigs, 2);
         let DecodedSections { graph, choices, hashes: got_hashes, contig_names: got_names, file_ranges: got_ranges, reversed: got_reversed, snp_edits: got_snps } = decoder.decode_from_read().unwrap();
         assert_eq!(got_reversed, Some(vec![false, true]));
         assert_eq!(got_snps, Some(snps));
@@ -340,12 +353,47 @@ mod tests {
         for array in [Some(index.lcs()), None] {
             let walk = crate::walk::WalkIndex { sbwt: index.sbwt(), lcs: array };
             let mut input = with_lcs.as_slice();
-            let DecodedSections { graph, choices, .. } = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(walk), Some(15)).unwrap();
+            let DecodedSections { graph, choices, .. } = crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read_with(Some(walk)).unwrap();
             for (color, walk) in walks.iter().enumerate() {
                 assert_eq!(&graph.walk_path(&choices, color as u32).unwrap(), walk);
             }
         }
         let mut input = with_lcs.as_slice();
         assert!(crate::graph::decoder::GraphDecoder::new(&mut input).unwrap().decode_from_read().is_err());
+    }
+
+    #[test]
+    fn archives_name_their_index() {
+        let (seqs, index) = related_index(15);
+        let mut builder = GraphBuilder::new();
+        for seq in &seqs {
+            builder.add_dictionary(&crate::nlz::parse(seq, &index).unwrap());
+        }
+        let (graph, choices) = builder.finish();
+        let mut bytes = Vec::new();
+        GraphEncoder::new(graph, choices).with_index(&index).encode_to_write(&mut bytes).unwrap();
+
+        let mut input = bytes.as_slice();
+        let decoder = GraphDecoder::new(&mut input).unwrap();
+        assert_eq!(decoder.header().index, Some(index.id()));
+        assert!(decoder.decode_from_read_with_index(&index).is_ok());
+
+        // Same k, other k-mers: refused before any section is read.
+        let other = crate::index::Index::build(&[random_sequence(2000, 99)], &crate::index::BuildOpts { k: 15, ..Default::default() });
+        assert_ne!(other.id().fingerprint, index.id().fingerprint);
+        let err = GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read_with_index(&other).err().unwrap();
+        assert!(err.to_string().contains("different index"), "{}", err);
+    }
+
+    #[test]
+    fn corrupt_section_sizes_fail_without_allocating() {
+        let (graph, choices, _) = graph();
+        let mut bytes = Vec::new();
+        GraphEncoder::new(graph, choices).encode_to_write(&mut bytes).unwrap();
+        // The graph section (third size) claims 2^40 bytes.
+        let at = FILE_HEADER_BYTES - 5 * 8;
+        bytes[at..at + 8].copy_from_slice(&(1_u64 << 40).to_le_bytes());
+        let err = GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read().err().unwrap();
+        assert!(err.to_string().contains("truncated"), "{}", err);
     }
 }

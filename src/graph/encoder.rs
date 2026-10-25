@@ -26,7 +26,7 @@ use core::ops::Range;
 use std::io::Write;
 
 use postcard::to_allocvec;
-use crate::index::Index;
+use crate::index::{Index, IndexId};
 use crate::walk::WalkIndex;
 
 type E = Box<dyn std::error::Error>;
@@ -59,8 +59,9 @@ pub struct GraphEncoder<'a> {
     /// [collapsed](super::collapsed).
     index: Option<WalkIndex<'a>>,
 
-    /// _k_-mer size of the index, for the direct suffix length symbols
-    k: Option<u32>,
+    /// The index's identity, stored in the header; its _k_ sets the direct
+    /// suffix length symbols.
+    id: Option<IndexId>,
 }
 
 /// Serializes an optional section, 0 bytes if absent.
@@ -89,7 +90,7 @@ impl<'a> GraphEncoder<'a> {
             reversed: None,
             snp_edits: None,
             index: None,
-            k: None,
+            id: None,
         }
     }
 
@@ -134,13 +135,14 @@ impl<'a> GraphEncoder<'a> {
     /// suffix lengths per LCS context, the direct suffix length symbols for
     /// its _k_-mer size, and the nodes derived by walks in it, see
     /// [collapsed](super::collapsed). Decoding the archive then needs the
-    /// index, see [GraphDecoder::decode_from_read_with_index](super::decoder::GraphDecoder::decode_from_read_with_index).
+    /// index, see [GraphDecoder::decode_from_read_with_index](super::decoder::GraphDecoder::decode_from_read_with_index);
+    /// the header identifies it ([Index::id]).
     pub fn with_index(
         mut self,
         index: &'a Index,
     ) -> Self {
         self.index = Some(index.walk_index());
-        self.k = Some(index.k().try_into().expect("k does not fit in u32"));
+        self.id = Some(index.id());
         self
     }
 
@@ -227,27 +229,21 @@ impl<'a> GraphEncoder<'a> {
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;
-        let graph_bytes = self.graph.to_bytes(self.index, self.k)?;
+        let graph_bytes = self.graph.to_bytes(self.index, self.id.map(|id| id.k))?;
         let choice_bytes = self.choices.to_stored(&self.graph)?;
 
-        let header = FileHeader{
-            nlz_header: [0_u8; 6],
-            n_queries: n_colors,
+        let header = FileHeader {
+            index: self.id,
+            n_contigs: n_colors,
+            file_range_bytes: file_range_bytes.len() as u64,
             contig_name_bytes: contig_name_bytes.len() as u64,
             graph_bytes: graph_bytes.len() as u64,
-            hash_bytes: hash_bytes.len().try_into()?,
-            strand_bytes: strand_bytes.len().try_into()?,
-            snp_bytes: snp_bytes.len().try_into()?,
-            file_range_bytes: file_range_bytes.len().try_into()?,
+            hash_bytes: hash_bytes.len() as u64,
+            strand_bytes: strand_bytes.len() as u64,
+            snp_bytes: snp_bytes.len() as u64,
             choice_bytes: choice_bytes.len() as u64,
         };
-        let nbytes = bincode::encode_into_std_write(
-            &header,
-            writer,
-            bincode::config::standard().with_fixed_int_encoding(),
-        )?;
-
-        assert_eq!(nbytes, FILE_HEADER_BYTES);
+        header.write_to(writer)?;
 
         writer.write_all(&file_range_bytes)?;
         writer.write_all(&contig_name_bytes)?;
