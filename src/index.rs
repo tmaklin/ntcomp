@@ -81,29 +81,61 @@ impl Match {
     }
 }
 
-/// Bytes of an index's fingerprint, see [Index::id].
+/// Bytes of an index's fingerprints, see [IndexId].
 pub const FINGERPRINT_BYTES: usize = 8;
+
+/// Items per chunk of a fingerprint: the chunks are hashed in parallel.
+const FINGERPRINT_CHUNK: usize = 1 << 20;
 
 /// What identifies an index: archives store it and are decoded only with an
 /// index that has the same ([Index::id]).
+///
+/// The fingerprints are the first bytes of blake3 hashes of the index's
+/// contents in a fixed layout, independent of how they are stored, of the
+/// support structures and of the prefix lookup table: of the SBWT's four
+/// subset rows, which define the index, and of the LCS array, whose values
+/// the archive's suffix lengths depend on. Each is the hash of its length
+/// (u64), then the hashes, in order, of its chunks of [FINGERPRINT_CHUNK]
+/// items: the bits of a row as little-endian 64-bit words, the LCS values as
+/// little-endian u32s. The SBWT's is the hash of _k_ (u64) and its four
+/// rows' (A, C, G, T).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexId {
     pub k: u32,
     pub n_kmers: u64,
-    /// The first bytes of the blake3 hash of _k_ and the number of SBWT rows
-    /// (u64 each, little-endian) and the blake3 hashes of the SBWT's four
-    /// subset rows (A, C, G, T: each its bits as little-endian 64-bit words).
-    /// The rows define the index; the hash does
-    /// not depend on how they are stored or on the support structures, the
-    /// prefix lookup table or the LCS array, which follow from them.
-    pub fingerprint: [u8; FINGERPRINT_BYTES],
+    pub sbwt_fingerprint: [u8; FINGERPRINT_BYTES],
+    pub lcs_fingerprint: [u8; FINGERPRINT_BYTES],
 }
 
 impl std::fmt::Display for IndexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hex: String = self.fingerprint.iter().map(|b| format!("{:02x}", b)).collect();
-        write!(f, "k = {}, {} k-mers, fingerprint {}", self.k, self.n_kmers, hex)
+        let hex = |b: &[u8]| -> String { b.iter().map(|b| format!("{:02x}", b)).collect() };
+        write!(f, "k = {}, {} k-mers, SBWT {}, LCS {}", self.k, self.n_kmers, hex(&self.sbwt_fingerprint), hex(&self.lcs_fingerprint))
     }
+}
+
+/// The hash of `n` items in chunks, see [IndexId]: `bytes(range, out)` appends
+/// the bytes of the items in `range` to `out`.
+fn chunked_hash(
+    n: usize,
+    bytes: impl Fn(std::ops::Range<usize>, &mut Vec<u8>) + Sync,
+) -> blake3::Hash {
+    let chunks: Vec<blake3::Hash> = (0..n.div_ceil(FINGERPRINT_CHUNK)).into_par_iter().map(|c| {
+        let mut out = Vec::new();
+        bytes(c * FINGERPRINT_CHUNK..((c + 1) * FINGERPRINT_CHUNK).min(n), &mut out);
+        blake3::hash(&out)
+    }).collect();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(n as u64).to_le_bytes());
+    for chunk in &chunks { hasher.update(chunk.as_bytes()); }
+    hasher.finalize()
+}
+
+/// The first [FINGERPRINT_BYTES] bytes of `hash`.
+fn fingerprint(
+    hash: blake3::Hash,
+) -> [u8; FINGERPRINT_BYTES] {
+    hash.as_bytes()[..FINGERPRINT_BYTES].try_into().unwrap()
 }
 
 /// An SBWT index with its LCS array, see the module docs.
@@ -203,30 +235,34 @@ impl Index {
         self.sbwt.n_kmers()
     }
 
-    /// The index's identity: _k_, the number of _k_-mers and a fingerprint
-    /// of the SBWT, see [IndexId]. Computed once (the rows are hashed in
-    /// parallel).
+    /// The index's identity: _k_, the number of _k_-mers and the
+    /// fingerprints of the SBWT and the LCS array, see [IndexId]. Computed
+    /// once, in parallel.
     pub fn id(&self) -> IndexId {
         *self.id.get_or_init(|| {
             let rows = self.sbwt.sbwt();
-            let n = rows.len();
-            let row_hashes: Vec<blake3::Hash> = (0..4u8).into_par_iter().map(|c| {
-                let mut hasher = blake3::Hasher::new();
-                let mut words = vec![0_u64; n.div_ceil(64)];
-                rows.call_on_char_occurrences(0..n, c, |i| words[i / 64] |= 1 << (i % 64));
-                for chunk in words.chunks(1 << 16) {
-                    let bytes: Vec<u8> = chunk.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    hasher.update(&bytes);
-                }
-                hasher.finalize()
+            let n_words = rows.len().div_ceil(64);
+            let row_hashes: Vec<blake3::Hash> = (0..4_u8).into_par_iter().map(|c| {
+                // Chunks of words: bits [64 * start, 64 * end) of the row.
+                chunked_hash(n_words, |words, out| {
+                    let first = 64 * words.start;
+                    let mut buf = vec![0_u64; words.len()];
+                    rows.call_on_char_occurrences(first..(64 * words.end).min(rows.len()), c, |i| buf[(i - first) / 64] |= 1 << (i % 64));
+                    out.extend(buf.iter().flat_map(|w| w.to_le_bytes()));
+                })
             }).collect();
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&(self.k() as u64).to_le_bytes());
-            hasher.update(&(n as u64).to_le_bytes());
-            for h in &row_hashes { hasher.update(h.as_bytes()); }
-            let mut fingerprint = [0_u8; FINGERPRINT_BYTES];
-            fingerprint.copy_from_slice(&hasher.finalize().as_bytes()[..FINGERPRINT_BYTES]);
-            IndexId { k: self.k() as u32, n_kmers: self.n_kmers() as u64, fingerprint }
+            let mut sbwt = blake3::Hasher::new();
+            sbwt.update(&(self.k() as u64).to_le_bytes());
+            for row in &row_hashes { sbwt.update(row.as_bytes()); }
+            let lcs = chunked_hash(self.lcs.len(), |values, out| {
+                out.extend(values.flat_map(|i| (self.lcs.access(i) as u32).to_le_bytes()));
+            });
+            IndexId {
+                k: self.k() as u32,
+                n_kmers: self.n_kmers() as u64,
+                sbwt_fingerprint: fingerprint(sbwt.finalize()),
+                lcs_fingerprint: fingerprint(lcs),
+            }
         })
     }
 

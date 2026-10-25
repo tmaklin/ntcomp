@@ -380,7 +380,7 @@ mod tests {
 
         // Same k, other k-mers: refused before any section is read.
         let other = crate::index::Index::build(&[random_sequence(2000, 99)], &crate::index::BuildOpts { k: 15, ..Default::default() });
-        assert_ne!(other.id().fingerprint, index.id().fingerprint);
+        assert_ne!(other.id().sbwt_fingerprint, index.id().sbwt_fingerprint);
         let err = GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read_with_index(&other).err().unwrap();
         assert!(err.to_string().contains("different index"), "{}", err);
     }

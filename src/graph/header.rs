@@ -16,8 +16,9 @@
 //!
 //! **Layout** ([FILE_HEADER_BYTES] bytes, integers little-endian): the magic
 //! bytes [MAGIC], the format [VERSION] (u16), the index's _k_ (u32), number
-//! of _k_-mers (u64) and fingerprint ([FINGERPRINT_BYTES] bytes; all three
-//! zero for an archive written without an index, see [IndexId]), the number
+//! of _k_-mers (u64) and the fingerprints of its SBWT and its LCS array
+//! ([FINGERPRINT_BYTES] bytes each; all four zero for an archive written
+//! without an index, see [IndexId]), the number
 //! of contigs (u32), then the sizes (u64) of the sections in their order in
 //! the file: file ranges, contig names, graph, hashes, strands, SNPs and
 //! choices.
@@ -31,11 +32,12 @@ type E = Box<dyn std::error::Error>;
 /// The first bytes of an archive.
 pub const MAGIC: &[u8; 4] = b"NLOG";
 
-/// The format version this crate writes and reads.
-pub const VERSION: u16 = 1;
+/// The format version this crate writes and reads (1: one fingerprint of
+/// the index, its SBWT's).
+pub const VERSION: u16 = 2;
 
 /// Bytes of the header.
-pub const FILE_HEADER_BYTES: usize = 4 + 2 + 4 + 8 + FINGERPRINT_BYTES + 4 + 7 * 8;
+pub const FILE_HEADER_BYTES: usize = 4 + 2 + 4 + 8 + 2 * FINGERPRINT_BYTES + 4 + 7 * 8;
 
 /// Header of an archive written by [GraphEncoder](super::encoder::GraphEncoder).
 #[derive(Clone, Debug, PartialEq)]
@@ -90,10 +92,11 @@ impl FileHeader {
         let mut out = Vec::with_capacity(FILE_HEADER_BYTES);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        let id = self.index.unwrap_or(IndexId { k: 0, n_kmers: 0, fingerprint: [0; FINGERPRINT_BYTES] });
+        let id = self.index.unwrap_or(IndexId { k: 0, n_kmers: 0, sbwt_fingerprint: [0; FINGERPRINT_BYTES], lcs_fingerprint: [0; FINGERPRINT_BYTES] });
         out.extend_from_slice(&id.k.to_le_bytes());
         out.extend_from_slice(&id.n_kmers.to_le_bytes());
-        out.extend_from_slice(&id.fingerprint);
+        out.extend_from_slice(&id.sbwt_fingerprint);
+        out.extend_from_slice(&id.lcs_fingerprint);
         out.extend_from_slice(&self.n_contigs.to_le_bytes());
         for n in self.section_bytes() {
             out.extend_from_slice(&n.to_le_bytes());
@@ -121,6 +124,9 @@ impl FileHeader {
             return Err(Box::new(HeaderError("not an ntcomp archive".to_string())))
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version < VERSION {
+            return Err(Box::new(HeaderError(format!("the archive was written by an older version of ntcomp (archive version {}); encode it again", version))))
+        }
         if version != VERSION {
             return Err(Box::new(HeaderError(format!("unsupported archive version {} (this ntcomp reads version {})", version, VERSION))))
         }
@@ -128,8 +134,9 @@ impl FileHeader {
         let mut take = |n: usize| { let field = &bytes[at..at + n]; at += n; field };
         let k = u32::from_le_bytes(take(4).try_into()?);
         let n_kmers = u64::from_le_bytes(take(8).try_into()?);
-        let fingerprint: [u8; FINGERPRINT_BYTES] = take(FINGERPRINT_BYTES).try_into()?;
-        let index = (k != 0).then_some(IndexId { k, n_kmers, fingerprint });
+        let sbwt_fingerprint: [u8; FINGERPRINT_BYTES] = take(FINGERPRINT_BYTES).try_into()?;
+        let lcs_fingerprint: [u8; FINGERPRINT_BYTES] = take(FINGERPRINT_BYTES).try_into()?;
+        let index = (k != 0).then_some(IndexId { k, n_kmers, sbwt_fingerprint, lcs_fingerprint });
         let n_contigs = u32::from_le_bytes(take(4).try_into()?);
         let mut sizes = [0_u64; 7];
         for size in sizes.iter_mut() {
@@ -172,7 +179,7 @@ mod tests {
 
     fn header() -> FileHeader {
         FileHeader {
-            index: Some(IndexId { k: 31, n_kmers: 1234, fingerprint: [1, 2, 3, 4, 5, 6, 7, 8] }),
+            index: Some(IndexId { k: 31, n_kmers: 1234, sbwt_fingerprint: [1, 2, 3, 4, 5, 6, 7, 8], lcs_fingerprint: [9, 10, 11, 12, 13, 14, 15, 16] }),
             n_contigs: 5,
             file_range_bytes: 1, contig_name_bytes: 2, graph_bytes: 3, hash_bytes: 4, strand_bytes: 5, snp_bytes: 6, choice_bytes: 7,
         }
@@ -200,8 +207,11 @@ mod tests {
         old[..6].fill(0);
         assert!(err(old).contains("older version"));
         let mut newer = bytes;
-        newer[4] = 2;
-        assert!(err(newer).contains("version 2"));
+        newer[4] = VERSION as u8 + 1;
+        assert!(err(newer).contains(&format!("version {}", VERSION + 1)));
+        let mut older = bytes;
+        older[4] = VERSION as u8 - 1;
+        assert!(err(older).contains("older version"));
         let mut overflow = bytes;
         overflow[FILE_HEADER_BYTES - 16..].fill(0xff);
         assert!(err(overflow).contains("overflow"));
@@ -214,7 +224,8 @@ mod tests {
         let id = h.index.unwrap();
         assert!(h.check_index(id).is_ok());
         assert!(h.check_index(IndexId { n_kmers: 1235, ..id }).is_err());
-        assert!(h.check_index(IndexId { fingerprint: [0; FINGERPRINT_BYTES], ..id }).is_err());
+        assert!(h.check_index(IndexId { sbwt_fingerprint: [0; FINGERPRINT_BYTES], ..id }).is_err());
+        assert!(h.check_index(IndexId { lcs_fingerprint: [0; FINGERPRINT_BYTES], ..id }).is_err());
         assert!(FileHeader { index: None, ..h }.check_index(id).is_ok());
     }
 }
