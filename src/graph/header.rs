@@ -33,8 +33,9 @@ type E = Box<dyn std::error::Error>;
 pub const MAGIC: &[u8; 4] = b"NLOG";
 
 /// The format version this crate writes and reads (1: one fingerprint of
-/// the index, its SBWT's; 2: no section of runs of `N`).
-pub const VERSION: u16 = 3;
+/// the index, its SBWT's; 2: no section of runs of `N`; 3: runs of `N`
+/// only).
+pub const VERSION: u16 = 4;
 
 /// Bytes of the header.
 pub const FILE_HEADER_BYTES: usize = 4 + 2 + 4 + 8 + 2 * FINGERPRINT_BYTES + 4 + 8 * 8;

@@ -25,7 +25,8 @@ pub type Contig = (Vec<u8>, Vec<u8>);
 
 /// The records of a FASTA or FASTQ file (optionally compressed): each
 /// record's name (the header line after `>` or `@`) and its normalized
-/// sequence (upper case, other characters than A, C, G and T as N).
+/// sequence: upper case, U as T, `.` and `~` as `-`, the IUPAC codes kept
+/// (N, B, D, H, V, R, Y, S, W, K and M), any other character as N.
 pub fn read_contigs<P: AsRef<Path>>(
     path: P,
 ) -> Result<Vec<Contig>, E> {

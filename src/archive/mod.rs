@@ -73,7 +73,7 @@ mod tests {
     fn runs_of_n_are_cut_out_and_put_back() {
         let (seqs, index) = related_index(31);
         // Runs at the start, in the middle (one long, one a single N, two
-        // close together), at the end, and a contig of only N.
+        // close together), at the end, a contig of only N, and an IUPAC code.
         let with_runs = |seq: &[u8], runs: &[(usize, usize)]| {
             let mut out = seq.to_vec();
             for &(pos, len) in runs.iter().rev() {
@@ -86,16 +86,17 @@ mod tests {
             (b"b".to_vec(), with_runs(&seqs[1], &[(900, 250), (seqs[1].len(), 10)])),
             (b"c".to_vec(), seqs[2].clone()),
             (b"d".to_vec(), b"NNNN".to_vec()),
+            (b"e".to_vec(), with_runs(&seqs[2], &[(300, 1)]).into_iter().enumerate().map(|(i, b)| if i == 300 { b'R' } else { b }).collect()),
         ];
         let files: Vec<InputFile> = vec![(b"file".to_vec(), contigs.clone())];
         let mut writer = ArchiveWriter::new(ArchiveOpts::default(), &index);
         writer.add_files(&files).unwrap();
         let mut bytes = Vec::new();
         let summary = writer.write(&mut bytes).unwrap();
-        assert!(summary.contains("(7 runs)"), "{}", summary);
+        assert!(summary.contains("(8 runs)"), "{}", summary);
 
         let reader = ArchiveReader::open(&mut bytes.as_slice(), &index).unwrap();
-        let colors: Vec<u32> = (0..4).collect();
+        let colors: Vec<u32> = (0..5).collect();
         for decoded in reader.decoder(&colors).unwrap().decode(&colors).unwrap() {
             let decoded = decoded.unwrap();
             assert_eq!(decoded.sequence, contigs[decoded.color as usize].1, "colour {}", decoded.color);

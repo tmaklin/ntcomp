@@ -137,7 +137,7 @@ impl<'a> ArchiveWriter<'a> {
         let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(strands.into_par_iter()).enumerate().map(|(i, (sequence, reversed))| {
             let color = first_color + i;
             let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
-            let (cut, runs) = nruns::cut(&oriented).ok_or_else(|| format!("contig {}: a run of N is too long", color))?;
+            let (cut, runs) = nruns::cut(&oriented).ok_or_else(|| format!("contig {}: a character other than A, C, G, T, a gap or an IUPAC code, or a run of them too long", color))?;
             // Each piece between the runs is edited and parsed on its own;
             // the edited pieces, their edits and their dictionaries are
             // joined (the dictionary from the end: the last piece first).

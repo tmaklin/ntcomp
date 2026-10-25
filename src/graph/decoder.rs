@@ -281,7 +281,7 @@ mod tests {
         let hashes = vec![super::super::contig_hash(b"one"), super::super::contig_hash(b"two")];
         let ranges = vec![(b"file".to_vec(), 0..2)];
         let snps = SnpEdits::new(&[vec![], vec![Snp { pos: 3, base: b'A', index_base: b'G' }]]);
-        let runs = NRuns { runs: vec![vec![crate::nruns::NRun { pos: 2, len: 250 }], vec![]] };
+        let runs = NRuns { runs: vec![vec![crate::nruns::NRun { pos: 2, len: 250, bases: Vec::new() }], vec![]] };
         let bytes = encode(GraphEncoder::new(graph, choices)
             .with_contig_names(names.clone())
             .with_hashes(hashes.clone())
