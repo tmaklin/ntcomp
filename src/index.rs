@@ -55,6 +55,29 @@ impl Default for BuildOpts {
     }
 }
 
+/// One matching statistic of a sequence position: the length of the longest
+/// suffix of the sequence up to the position that is in the index (at most
+/// _k_) and its colex interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Match {
+    pub len: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Match {
+    fn new(
+        (len, interval): (usize, std::ops::Range<usize>),
+    ) -> Self {
+        Match { len: len as u32, start: interval.start as u32, end: interval.end as u32 }
+    }
+
+    /// The colex interval.
+    pub fn interval(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
 /// An SBWT index with its LCS array, see the module docs.
 pub struct Index {
     sbwt: SbwtIndex<SubsetMatrix>,
@@ -163,6 +186,24 @@ impl Index {
     /// For the matching statistics of sequences against the index.
     pub fn streaming(&self) -> StreamingIndex<'_, SbwtIndex<SubsetMatrix>, LcsArray> {
         StreamingIndex::new(&self.sbwt, &self.lcs)
+    }
+
+    /// The matching statistics of `sequence`.
+    pub fn matching_statistics(
+        &self,
+        sequence: &[u8],
+    ) -> Vec<Match> {
+        assert!(self.sbwt.n_sets() <= u32::MAX as usize, "colex ranks do not fit in u32");
+        self.streaming().matching_statistics_iter(sequence).map(Match::new).collect()
+    }
+
+    /// The matching statistic after `m` extended by the base `c`.
+    pub fn matching_statistics_step(
+        &self,
+        m: Match,
+        c: u8,
+    ) -> Match {
+        Match::new(self.streaming().matching_statistics_update_step(c, m.interval(), m.len as usize, usize::MAX))
     }
 
     /// The index as a [WalkIndex] (with its LCS array).
