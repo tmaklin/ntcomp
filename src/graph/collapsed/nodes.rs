@@ -130,9 +130,10 @@ pub(super) fn code_targets<C: Coder>(
     targets: Option<&[u32]>,
 ) -> Result<(Vec<u32>, u32), GraphDecodeError> {
     let mut models = TargetModels::new();
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(crate::codecs::prealloc(n));
     for i in 0..n {
         let (target, _) = models.code(c, targets.map(|t| t[i])).ok_or_else(|| GraphDecodeError("stored chains: targets truncated or invalid".to_string()))?;
+        if c.overrun() { return Err(GraphDecodeError("stored chains: targets truncated or invalid".to_string())) }
         out.push(target);
     }
     Ok((out, models.next_new))

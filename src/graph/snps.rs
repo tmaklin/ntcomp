@@ -296,8 +296,8 @@ fn code_all<C: Coder>(
     let mut m = Models::new();
     let n_colors = GammaModel::new().code(c, colours.map_or(0, |x| x.len()) as u64 + 1) - 1;
     let n_colors: usize = n_colors.try_into().map_err(|_| truncated())?;
-    let mut out: Vec<ColourSnps> = Vec::with_capacity(n_colors.min(1 << 20));
-    let mut lists: Vec<Vec<u32>> = Vec::with_capacity(n_colors.min(1 << 20));
+    let mut out: Vec<ColourSnps> = Vec::with_capacity(crate::codecs::prealloc(n_colors));
+    let mut lists: Vec<Vec<u32>> = Vec::with_capacity(crate::codecs::prealloc(n_colors));
     let mut ids: Vec<(u32, u32)> = Vec::new();
     let mut previous_empty = 1;
     for col in 0..n_colors {
@@ -312,8 +312,8 @@ fn code_all<C: Coder>(
         previous_empty = empty;
 
         // New SNPs: the gap from the base after the previous one, and the base.
-        let mut new: Vec<(u32, Stored)> = Vec::with_capacity((n_new as usize).min(1 << 20));
-        let mut list: Vec<u32> = Vec::with_capacity((n_new as usize).min(1 << 20));
+        let mut new: Vec<(u32, Stored)> = Vec::with_capacity(crate::codecs::prealloc(n_new as usize));
+        let mut list: Vec<u32> = Vec::with_capacity(crate::codecs::prealloc(n_new as usize));
         let (mut next, mut previous_length) = (0_u64, 0_usize);
         for i in 0..n_new {
             let (pos, stored) = truth.map_or((0, &Stored::Distance(1)), |t| (t.new[i as usize].0, &t.new[i as usize].1));
@@ -382,7 +382,7 @@ fn code_all<C: Coder>(
         if n_direct > ids_before {
             return Err(error("more repeats than earlier SNPs"))
         }
-        let mut direct: Vec<u32> = Vec::with_capacity(n_direct as usize);
+        let mut direct: Vec<u32> = Vec::with_capacity(crate::codecs::prealloc(n_direct as usize));
         let (mut previous, mut previous_length) = (None::<u64>, 0_usize);
         for i in 0..n_direct as usize {
             let id = truth.map_or(0, |t| t.direct[i] as u64);

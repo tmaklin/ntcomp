@@ -27,6 +27,14 @@
 //!   ([crate::tigs::write_tigs], [crate::tigs::read_tigs]).
 pub mod arith;
 pub mod bits;
+
+/// Capacity to reserve for `n` items when `n` comes from stored data: a
+/// corrupt count then grows the buffer only as items are decoded, instead
+/// of allocating it up front.
+pub(crate) fn prealloc(n: usize) -> usize {
+    n.min(1 << 20)
+}
+
 pub mod lzma;
 pub mod mix;
 pub mod tigs;

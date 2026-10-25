@@ -25,6 +25,7 @@
 //! are alternative paths through the same region.
 //!
 use crate::codecs::arith::{Coder, GammaModel};
+use crate::codecs::prealloc;
 use crate::graph::{SINK_NODE, SOURCE_NODE};
 
 /// Context of a chain length: the source junction's out-degree (capped at 8)
@@ -51,28 +52,30 @@ pub(super) fn code_topology<C: Coder>(
     shape: Option<(&[u64], &[u64], &[u64])>,
 ) -> Option<Topology> {
     let mut degree_model = GammaModel::new();
-    let mut degrees = vec![0_u64; n_junctions];
+    let mut degrees = Vec::with_capacity(prealloc(n_junctions));
     let mut n_chains = 0_u64;
-    for junction in (0..n_junctions).filter(|&j| j != SINK_NODE as usize) {
-        degrees[junction] = degree_model.code(c, shape.map_or(1, |s| s.0[junction]));
-        n_chains += degrees[junction];
-        if n_chains > u32::MAX as u64 { return None }
+    for junction in 0..n_junctions {
+        let degree = if junction == SINK_NODE as usize { 0 } else { degree_model.code(c, shape.map_or(1, |s| s.0[junction])) };
+        degrees.push(degree);
+        n_chains += degree;
+        if n_chains > u32::MAX as u64 || c.overrun() { return None }
     }
     let mut models: Vec<GammaModel> = (0..9 * 6).map(|_| GammaModel::new()).collect();
-    let mut inner = Vec::with_capacity(n_chains as usize);
+    let mut inner = Vec::with_capacity(prealloc(n_chains as usize));
     for &degree in &degrees {
         let mut previous = None;
         for _ in 0..degree {
             let w = models[chain_len_context(degree, previous)].code(c, shape.map_or(1, |s| s.1[inner.len()] + 1));
             inner.push(w - 1);
             previous = Some(w - 1);
+            if c.overrun() { return None }
         }
     }
     let mut length_model = GammaModel::new();
-    let mut contig_lens = Vec::with_capacity(degrees[SOURCE_NODE as usize] as usize);
+    let mut contig_lens = Vec::with_capacity(prealloc(degrees[SOURCE_NODE as usize] as usize));
     for i in 0..degrees[SOURCE_NODE as usize] as usize {
         let w = length_model.code(c, shape.map_or(1, |s| s.2[i] + 1));
-        if w - 1 > u32::MAX as u64 { return None }
+        if w - 1 > u32::MAX as u64 || c.overrun() { return None }
         contig_lens.push(w - 1);
     }
     Some((degrees, inner, contig_lens))

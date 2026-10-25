@@ -227,7 +227,7 @@ fn code_all<C: Coder, G: GraphWalk>(
         return Err(format!("{} colours in a graph of {} nodes", n_colors, g.n_nodes()))
     }
     let mut m = Model::new(g);
-    let mut streams = Vec::with_capacity(n_colors);
+    let mut streams = Vec::with_capacity(crate::codecs::prealloc(n_colors));
     let mut refs: Vec<(u32, u32)> = Vec::with_capacity(N_REFS);
     let mut cands: Vec<(u32, usize)> = Vec::new();
     let mut votes: Vec<(u32, usize)> = Vec::with_capacity(N_REFS);
