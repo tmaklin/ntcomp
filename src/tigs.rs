@@ -225,9 +225,18 @@ fn pow(b: u64, e: usize) -> u64 { (0..e).fold(1u64, |a, _| a.wrapping_mul(b)) }
 /// character other than A, C, G or T). Two 64-bit polynomial hashes per
 /// strand; the canonical hash is the smaller strand's.
 fn hashes(seq: &[u8], k: usize) -> Vec<Option<u128>> {
+    let mut out = vec![None; seq.len().saturating_sub(k - 1)];
+    for_each_hash(seq, k, |w, h| out[w] = Some(h));
+    out
+}
+
+/// Calls `f(w, h)` for every _k_-mer window `w` of `seq` with only A, C, G
+/// and T, with its canonical hash `h` (see [hashes]).
+fn for_each_hash(seq: &[u8], k: usize, mut f: impl FnMut(usize, u128)) {
     let (p1, p2) = (pow(B1, k - 1), pow(B2, k - 1));
     let (i1, i2) = (inv(B1), inv(B2));
-    let mut out = Vec::with_capacity(seq.len().saturating_sub(k - 1));
+    // Powers of the bases for the first k bases of a run.
+    let (pw1, pw2): (Vec<u64>, Vec<u64>) = (0..k).map(|e| (pow(B1, e), pow(B2, e))).unzip();
     let (mut f1, mut f2, mut r1, mut r2) = (0u64, 0u64, 0u64, 0u64);
     let mut valid = 0usize; // consecutive ACGT bases ending here
     for i in 0..seq.len() {
@@ -242,20 +251,17 @@ fn hashes(seq: &[u8], k: usize) -> Vec<Option<u128>> {
                     r1 = r1.wrapping_add((3 - c).wrapping_mul(p1)); r2 = r2.wrapping_add((3 - c).wrapping_mul(p2));
                 } else {
                     f1 = f1.wrapping_mul(B1).wrapping_add(c); f2 = f2.wrapping_mul(B2).wrapping_add(c);
-                    r1 = r1.wrapping_add((3 - c).wrapping_mul(pow(B1, valid))); r2 = r2.wrapping_add((3 - c).wrapping_mul(pow(B2, valid)));
+                    r1 = r1.wrapping_add((3 - c).wrapping_mul(pw1[valid])); r2 = r2.wrapping_add((3 - c).wrapping_mul(pw2[valid]));
                 }
                 valid += 1;
             },
         }
-        if i + 1 >= k {
-            out.push(if valid >= k {
-                let f = ((f1 as u128) << 64) | f2 as u128;
-                let r = ((r1 as u128) << 64) | r2 as u128;
-                Some(f.min(r))
-            } else { None });
+        if i + 1 >= k && valid >= k {
+            let fw = ((f1 as u128) << 64) | f2 as u128;
+            let rv = ((r1 as u128) << 64) | r2 as u128;
+            f(i + 1 - k, fw.min(rv));
         }
     }
-    out
 }
 
 // Steps ----------------------------------------------------------------------
@@ -274,7 +280,9 @@ fn count_core<T: Sync>(
         inputs.par_iter().for_each(|input| {
             let mut hs: Vec<u128> = Vec::new();
             for seq in read(input) {
-                hs.extend(hashes(&seq, k).into_iter().flatten().filter(|&h| fold(h) % partitions == p));
+                // The partition of a hash by multiply-shift (any split gives
+                // the same core).
+                for_each_hash(&seq, k, |_, h| if ((fold(h) as u128 * partitions as u128) >> 64) as u64 == p { hs.push(h) });
             }
             hs.sort_unstable();
             hs.dedup();
@@ -326,8 +334,8 @@ fn colex_ranks(
     k: usize,
 ) -> Vec<Option<usize>> {
     if seq.len() < k { return Vec::new() }
-    index.matching_statistics(seq)[k - 1..].iter()
-        .map(|(len, range)| if *len == k { Some(range.start) } else { None })
+    index.matching_statistics_iter(seq).skip(k - 1)
+        .map(|(len, range)| if len == k { Some(range.start) } else { None })
         .collect()
 }
 
