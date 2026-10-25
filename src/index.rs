@@ -23,7 +23,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use sbwt::{BitPackedKmerSortingDisk, BitPackedKmerSortingMem, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
+use std::sync::OnceLock;
+
+use rayon::prelude::*;
+use sbwt::{BitPackedKmerSortingDisk, BitPackedKmerSortingMem, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix, SubsetSeq};
 
 use crate::walk::{IndexWalk, WalkIndex};
 
@@ -78,10 +81,37 @@ impl Match {
     }
 }
 
+/// Bytes of an index's fingerprint, see [Index::id].
+pub const FINGERPRINT_BYTES: usize = 8;
+
+/// What identifies an index: archives store it and are decoded only with an
+/// index that has the same ([Index::id]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexId {
+    pub k: u32,
+    pub n_kmers: u64,
+    /// The first bytes of the blake3 hash of _k_ and the number of SBWT rows
+    /// (u64 each, little-endian) and the blake3 hashes of the SBWT's four
+    /// subset rows (A, C, G, T: each its bits as little-endian 64-bit words).
+    /// The rows define the index; the hash does
+    /// not depend on how they are stored or on the support structures, the
+    /// prefix lookup table or the LCS array, which follow from them.
+    pub fingerprint: [u8; FINGERPRINT_BYTES],
+}
+
+impl std::fmt::Display for IndexId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex: String = self.fingerprint.iter().map(|b| format!("{:02x}", b)).collect();
+        write!(f, "k = {}, {} k-mers, fingerprint {}", self.k, self.n_kmers, hex)
+    }
+}
+
 /// An SBWT index with its LCS array, see the module docs.
 pub struct Index {
     sbwt: SbwtIndex<SubsetMatrix>,
     lcs: LcsArray,
+    /// [Index::id], computed on first use.
+    id: OnceLock<IndexId>,
 }
 
 impl Index {
@@ -113,7 +143,7 @@ impl Index {
                 .dedup_batches(opts.dedup_batches)
                 .run(),
         };
-        Index { sbwt, lcs: lcs.expect("the LCS array is built") }
+        Index { sbwt, lcs: lcs.expect("the LCS array is built"), id: OnceLock::new() }
     }
 
     /// Loads the index `<prefix>.sbwt` and `<prefix>.lcs`.
@@ -138,7 +168,7 @@ impl Index {
         if lcs.len() != sbwt.n_sets() {
             return Err(format!("{}: the LCS array has {} values for the {} rows of {}", lcs_path, lcs.len(), sbwt.n_sets(), sbwt_path).into())
         }
-        Ok(Index { sbwt, lcs })
+        Ok(Index { sbwt, lcs, id: OnceLock::new() })
     }
 
     /// Saves the index as `<prefix>.sbwt` and `<prefix>.lcs`.
@@ -171,6 +201,33 @@ impl Index {
     /// Number of _k_-mers (with the reverse complements).
     pub fn n_kmers(&self) -> usize {
         self.sbwt.n_kmers()
+    }
+
+    /// The index's identity: _k_, the number of _k_-mers and a fingerprint
+    /// of the SBWT, see [IndexId]. Computed once (the rows are hashed in
+    /// parallel).
+    pub fn id(&self) -> IndexId {
+        *self.id.get_or_init(|| {
+            let rows = self.sbwt.sbwt();
+            let n = rows.len();
+            let row_hashes: Vec<blake3::Hash> = (0..4u8).into_par_iter().map(|c| {
+                let mut hasher = blake3::Hasher::new();
+                let mut words = vec![0_u64; n.div_ceil(64)];
+                rows.call_on_char_occurrences(0..n, c, |i| words[i / 64] |= 1 << (i % 64));
+                for chunk in words.chunks(1 << 16) {
+                    let bytes: Vec<u8> = chunk.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    hasher.update(&bytes);
+                }
+                hasher.finalize()
+            }).collect();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&(self.k() as u64).to_le_bytes());
+            hasher.update(&(n as u64).to_le_bytes());
+            for h in &row_hashes { hasher.update(h.as_bytes()); }
+            let mut fingerprint = [0_u8; FINGERPRINT_BYTES];
+            fingerprint.copy_from_slice(&hasher.finalize().as_bytes()[..FINGERPRINT_BYTES]);
+            IndexId { k: self.k() as u32, n_kmers: self.n_kmers() as u64, fingerprint }
+        })
     }
 
     /// The SBWT.
