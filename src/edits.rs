@@ -25,7 +25,7 @@
 //! ([crate::graph::snps]); the tig builder leaves out gaps that editing
 //! repairs ([crate::tigs]).
 //!
-use crate::index::Index;
+use crate::index::{Index, Match};
 use crate::walk::{IndexWalk, Pattern};
 
 /// Bases on both sides of an edit that identify it across contigs.
@@ -182,13 +182,24 @@ pub fn call_edits(
     sequence: &[u8],
     index: &Index,
 ) -> Vec<Edit> {
+    if sequence.len() <= index.k() {
+        return Vec::new()
+    }
+    call_edits_with(sequence, &index.matching_statistics(sequence), index)
+}
+
+/// Same as [call_edits] with the matching statistics `ms` of `sequence`.
+pub fn call_edits_with(
+    sequence: &[u8],
+    ms: &[Match],
+    index: &Index,
+) -> Vec<Edit> {
     let k = index.k();
     let n = sequence.len();
     if n <= k {
         return Vec::new()
     }
     let min_match = index.random_match_threshold(MAX_ERROR_PROB);
-    let ms = index.streaming().matching_statistics(sequence);
 
     let mut edits: Vec<Edit> = Vec::new();
     // The edited contig's match ending at i - 1, if a walk after an edit
@@ -199,12 +210,12 @@ pub fn call_edits(
         let pattern = match carried.take() {
             Some(pattern) => pattern,
             None => {
-                let (prev_len, len) = (ms[i - 1].0, ms[i].0);
+                let (prev_len, len) = (ms[i - 1].len as usize, ms[i].len as usize);
                 if prev_len < min_match || len >= (prev_len + 1).min(k) || base_code(sequence[i]).is_none() {
                     i += 1;
                     continue
                 }
-                (ms[i - 1].1.clone(), prev_len)
+                (ms[i - 1].interval(), prev_len)
             },
         };
 
@@ -221,7 +232,7 @@ pub fn call_edits(
                     });
                 }
                 // The original matching statistics still contain the edits here.
-                while pos < n && ms[pos].0 < k {
+                while pos < n && (ms[pos].len as usize) < k {
                     match index.step_right(&pattern, sequence[pos]) {
                         Some(next) => {
                             pattern = next;
@@ -230,7 +241,7 @@ pub fn call_edits(
                         None => break,
                     }
                 }
-                if pos < n && ms[pos].0 < k {
+                if pos < n && (ms[pos].len as usize) < k {
                     carried = Some(pattern);
                 }
                 i = pos;
@@ -283,6 +294,67 @@ pub fn apply_edits(
     Some((out, moved))
 }
 
+/// The matching statistics of `edited`, which is a sequence with `edits`
+/// applied (at their positions in `edited`, see [apply_edits]), from the
+/// matching statistics `ms` of the sequence: recomputed from each edit until
+/// they agree with those of the sequence again (from then on they are the
+/// same).
+pub fn matching_statistics_after_edits(
+    ms: Vec<Match>,
+    edited: &[u8],
+    edits: &[Edit],
+    index: &Index,
+) -> Vec<Match> {
+    if edits.is_empty() {
+        return ms
+    }
+    let mut out: Vec<Match> = Vec::with_capacity(edited.len());
+    // Outside the edits, position i of `edited` is i - shift of the sequence.
+    let mut shift: isize = 0;
+    let mut next = 0;
+    let mut synced = true;
+    let mut state = Match { len: 0, start: 0, end: index.sbwt().n_sets() as u32 };
+    let mut i = 0;
+    while i < edited.len() {
+        // The next edit's changed bases [start, end) in `edited`.
+        let (start, end, edit_shift) = match edits.get(next) {
+            Some(edit) => {
+                let pos = edit.pos as usize;
+                match &edit.change {
+                    Change::Sub { .. } => (pos, pos + 1, 0),
+                    Change::Del { bases } => (pos, pos, -(bases.len() as isize)),
+                    Change::Ins { bases } => (pos, pos + bases.len(), bases.len() as isize),
+                }
+            },
+            None => (usize::MAX, usize::MAX, 0),
+        };
+        if i >= start {
+            // The edit: unsynced from here.
+            synced = false;
+            shift += edit_shift;
+            next += 1;
+            while i < end {
+                state = index.matching_statistics_step(state, edited[i]);
+                out.push(state);
+                i += 1;
+            }
+        } else if synced {
+            // Copy up to the next edit.
+            let stop = start.min(edited.len());
+            out.extend_from_slice(&ms[(i as isize - shift) as usize..(stop as isize - shift) as usize]);
+            state = out[stop - 1];
+            i = stop;
+        } else {
+            // Step until the state agrees with the sequence's.
+            state = index.matching_statistics_step(state, edited[i]);
+            synced = state == ms[(i as isize - shift) as usize];
+            out.push(state);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,7 +395,10 @@ mod tests {
         assert!(called.iter().any(|e| matches!(e.change, Change::Ins { .. })), "{:?}", called);
         assert_eq!(called.len(), expected.len() + 4, "{:?}", called);
         // Editing gives the reference but for the SNP too close to the end.
-        let (edited, _) = apply_edits(&contig, called).unwrap();
+        let (edited, moved) = apply_edits(&contig, called).unwrap();
+        // The matching statistics updated after the edits are those of the edited contig.
+        let ms = index.matching_statistics(&contig);
+        assert_eq!(matching_statistics_after_edits(ms, &edited, &moved, &index), index.matching_statistics(&edited));
         let mut target = reference.clone();
         target[3990] = contig[contig.len() - 10];
         assert_eq!(edited, target);

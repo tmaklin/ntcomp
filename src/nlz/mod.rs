@@ -24,7 +24,7 @@
 //!
 use std::ops::Range;
 
-use crate::index::Index;
+use crate::index::{Index, Match};
 #[cfg(doc)]
 use crate::walk::WalkIndex;
 use crate::walk::IndexWalk;
@@ -124,28 +124,38 @@ pub fn parse(
     nucleotides: &[u8],
     index: &Index,
 ) -> Result<Dictionary, E> {
+    parse_with(nucleotides, index.matching_statistics(nucleotides), index)
+}
+
+/// Same as [parse] with the matching statistics `ms` of `nucleotides`
+/// ([Index::matching_statistics]).
+pub fn parse_with(
+    nucleotides: &[u8],
+    ms: Vec<Match>,
+    index: &Index,
+) -> Result<Dictionary, E> {
     let n = nucleotides.len();
     let mut implicit: Vec<bool> = Vec::new();
-    let matches: Vec<(usize, Range<usize>)> = {
+    let matches: Vec<(usize, usize)> = {
         let k = index.k();
-        let mut res = index.streaming().matching_statistics(nucleotides);
+        let mut res = ms;
 
         let mut i = n;
         let mut kept: Vec<usize> = Vec::new();
         while i > 0 {
-            if res[i - 1].0 == k && i > k + 1 {
+            if res[i - 1].len as usize == k && i > k + 1 {
                 // Left extend as [left_extend_kmer] with the sequence as the
                 // reference, through the rows of the matching statistics: the
                 // k-mer ending one base to the left is the predecessor the
                 // sequence takes, and its group holds all the predecessors.
                 let max_extension_len = i - k - 1;
-                let mut row = res[i - 1].1.start;
+                let mut row = res[i - 1].start as usize;
                 let mut extension_len = 0;
                 let mut stopped_in_sbwt = false;
                 while extension_len < max_extension_len {
                     let left = i - 2 - extension_len;
-                    if res[left].0 == k {
-                        let predecessor = res[left].1.start;
+                    if res[left].len as usize == k {
+                        let predecessor = res[left].start as usize;
                         if !index.only_in_group(predecessor) {
                             stopped_in_sbwt = true;
                             break
@@ -165,15 +175,15 @@ pub fn parse(
                 let phrase_len = k + extension_len;
 
                 // Store the whole left extension; the next entry ends where it starts.
-                res[i - 1].0 = phrase_len;
+                res[i - 1].len = phrase_len as u32;
                 kept.push(i - 1);
                 implicit.push(stopped_in_sbwt);
                 i -= phrase_len - 1;
             } else {
                 kept.push(i - 1);
                 implicit.push(false);
-                if i > res[i - 1].0 {
-                    i -= res[i - 1].0 - 1;
+                if i > res[i - 1].len as usize {
+                    i -= res[i - 1].len as usize - 1;
                 } else {
                     break;
                 }
@@ -185,7 +195,7 @@ pub fn parse(
                 break;
             }
         }
-        kept.iter().map(|x| res[*x].clone()).collect()
+        kept.iter().map(|x| (res[*x].len as usize, res[*x].start as usize)).collect()
     };
 
     let dictionary_bases = matches.iter().map(|x| x.0).sum::<usize>();
@@ -193,8 +203,8 @@ pub fn parse(
     assert_eq!(dictionary_bases, nucleotides.len());
     assert_eq!(matches.len(), implicit.len());
 
-    let entries = matches.into_iter().zip(implicit).map(|((len, colex), implicit)| {
-        let colex_rank = u32::try_from(colex.start).map_err(|_| "colex rank does not fit in u32")?;
+    let entries = matches.into_iter().zip(implicit).map(|((len, colex_rank), implicit)| {
+        let colex_rank = u32::try_from(colex_rank).map_err(|_| "colex rank does not fit in u32")?;
         let len = u32::try_from(len).map_err(|_| "dictionary entry longer than 2^32 bases")?;
         Ok(Entry { colex_rank, len, implicit })
     }).collect::<Result<Vec<Entry>, &str>>()?;

@@ -18,7 +18,7 @@ use std::ops::Range;
 
 use rayon::prelude::*;
 
-use crate::edits::{self, Edit};
+use crate::edits;
 use crate::fastx::Contig;
 use crate::graph::encoder::GraphEncoder;
 use crate::graph::snps::{self, EditedSnp, SnpEdits};
@@ -45,9 +45,7 @@ pub struct ArchiveOpts {
     /// least 1).
     pub reorient_sampling: u64,
     /// Edit SNPs and small indels towards the index before encoding, see
-    /// [edits]. Needs two passes over the input files:
-    /// [ArchiveWriter::call_edits] for every file, then
-    /// [ArchiveWriter::add_files] in the same order.
+    /// [edits].
     pub edit: bool,
 }
 
@@ -68,12 +66,8 @@ pub struct ArchiveWriter<'a> {
     opts: ArchiveOpts,
     index: &'a Index,
     builder: GraphBuilder,
-    /// Created when the first strand is chosen; dropped after the first pass
-    /// of editing.
+    /// Created when the first strand is chosen.
     strand_chooser: Option<StrandChooser>,
-    /// Per colour from [ArchiveWriter::call_edits]: the chosen strand and the
-    /// edits on it, until the contig is added.
-    called: Vec<(bool, Vec<Edit>)>,
     /// Per colour: whether the contig is stored reverse complemented.
     reversed: Vec<bool>,
     /// Per colour: the edits applied, with their contexts.
@@ -95,7 +89,6 @@ impl<'a> ArchiveWriter<'a> {
         ArchiveWriter {
             opts, index, builder,
             strand_chooser: None,
-            called: Vec::new(),
             reversed: Vec::new(),
             edited: Vec::new(),
             hashes: Vec::new(),
@@ -119,58 +112,34 @@ impl<'a> ArchiveWriter<'a> {
         sketches.into_iter().map(|sketch| chooser.choose_sketched(sketch)).collect()
     }
 
-    /// First pass of editing: chooses the strands and calls the edits of the
-    /// contigs of `files`, in parallel. Returns the colours they will get.
-    pub fn call_edits(
-        &mut self,
-        files: &[InputFile],
-    ) -> Vec<u32> {
-        let sequences: Vec<&[u8]> = files.iter().flat_map(|(_, contigs)| contigs).map(|(_, sequence)| sequence.as_slice()).collect();
-        let strands = self.choose_strands(&sequences);
-        let index = self.index;
-        let called: Vec<Vec<Edit>> = sequences.par_iter().zip(&strands).map(|(sequence, &reversed)| {
-            if reversed {
-                edits::call_edits(&strands::reverse_complement(sequence), index)
-            } else {
-                edits::call_edits(sequence, index)
-            }
-        }).collect();
-        let first: u32 = self.called.len().try_into().unwrap();
-        self.called.extend(strands.into_iter().zip(called));
-        (first..(first + sequences.len() as u32)).collect()
-    }
-
     /// Adds the contigs of `files`, encoded in parallel. Returns the colours
-    /// they got. With [ArchiveOpts::edit], their edits must have been called
-    /// ([ArchiveWriter::call_edits]).
+    /// they got.
+    ///
+    /// A contig's matching statistics are computed once: the edits are
+    /// called from them ([ArchiveOpts::edit]), and after the edits they are
+    /// updated from each edit on ([edits::matching_statistics_after_edits])
+    /// for parsing the edited contig.
     pub fn add_files(
         &mut self,
         files: &[InputFile],
     ) -> Result<Vec<u32>, E> {
         let sequences: Vec<&[u8]> = files.iter().flat_map(|(_, contigs)| contigs).map(|(_, sequence)| sequence.as_slice()).collect();
         let first_color = self.reversed.len();
-        // Strands and edits, in order.
-        let prepared: Vec<(bool, Vec<Edit>)> = if self.opts.edit {
-            // The strands were chosen in the first pass.
-            self.strand_chooser = None;
-            if self.called.len() < first_color + sequences.len() {
-                return Err(format!("SNPs of colour {} were not called before adding it", self.called.len().max(first_color)).into())
-            }
-            self.called[first_color..(first_color + sequences.len())].iter_mut().map(|(reversed, called)| (*reversed, std::mem::take(called))).collect()
-        } else {
-            self.choose_strands(&sequences).into_iter().map(|reversed| (reversed, Vec::new())).collect()
-        };
+        let strands = self.choose_strands(&sequences);
 
-        let index = self.index;
+        let (index, edit) = (self.index, self.opts.edit);
         type Encoded = (bool, nlz::Dictionary, Vec<EditedSnp>);
-        let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(prepared.into_par_iter()).enumerate().map(|(i, (sequence, (reversed, edits)))| {
+        let encoded: Vec<Result<Encoded, String>> = sequences.par_iter().zip(strands.into_par_iter()).enumerate().map(|(i, (sequence, reversed))| {
             let oriented = if reversed { strands::reverse_complement(sequence) } else { sequence.to_vec() };
-            let (oriented, edits) = edits::apply_edits(&oriented, edits)
-                .ok_or_else(|| format!("contig {} differs from the one its SNPs were called on", first_color + i))?;
+            let ms = index.matching_statistics(&oriented);
+            let edits = if edit { edits::call_edits_with(&oriented, &ms, index) } else { Vec::new() };
+            let (edited, edits) = edits::apply_edits(&oriented, edits)
+                .ok_or_else(|| format!("contig {}: the edits do not match it", first_color + i))?;
+            let ms = edits::matching_statistics_after_edits(ms, &edited, &edits, index);
             // Contexts in the edited contig, for storing shared SNPs once.
-            let edited = snps::with_contexts(&oriented, edits);
-            let dictionary = nlz::parse(&oriented, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
-            Ok((reversed, dictionary, edited))
+            let edited_snps = snps::with_contexts(&edited, edits);
+            let dictionary = nlz::parse_with(&edited, ms, index).map_err(|e| format!("contig {}: {}", first_color + i, e))?;
+            Ok((reversed, dictionary, edited_snps))
         }).collect();
 
         let encoded = encoded.into_iter().collect::<Result<Vec<Encoded>, String>>()?;
@@ -254,8 +223,6 @@ mod tests {
 
         let opts = ArchiveOpts { collapse_chains: true, edit: true, ..Default::default() };
         let mut writer = ArchiveWriter::new(opts, &index);
-        assert!(writer.add_files(&files).is_err(), "edits must be called first");
-        assert_eq!(writer.call_edits(&files), vec![0, 1, 2]);
         assert_eq!(writer.add_files(&files).unwrap(), vec![0, 1, 2]);
         let edits = writer.snp_edits().unwrap();
         assert_eq!(edits.n_snps(), 8);
