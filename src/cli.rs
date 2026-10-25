@@ -166,8 +166,11 @@ pub struct EncodeArgs {
 pub struct GraphArgs {
     // Inputs
     // // Input fasta or fastq query file(s)
-    #[arg(group = "input", required = true, help = "Querys file with sequence data.")]
+    #[arg(group = "input", required = true, help = "Assembly files to compress, one input file each (with -d: the archive).")]
     pub query_files: Vec<PathBuf>,
+
+    #[arg(short = 'l', long = "input-list", group = "input", required = true, conflicts_with = "decompress", help_heading = "Input", help = "File with paths or tab separated name and path on each line, compressed in this order (instead of files as arguments).")]
+    pub input_list: Option<String>,
 
     // // Prebuilt index
     #[arg(short = 'i', long = "index", help_heading = "Input", required = true, help = "Prefix for prebuilt <prefix>.sbwt and <prefix>.lcs")]
@@ -319,6 +322,15 @@ impl TigsArgs {
 }
 
 impl GraphArgs {
+    /// The files to compress: the arguments or those in `--input-list`.
+    pub fn input_files(&self) -> Result<Vec<PathBuf>, String> {
+        let mut files = self.query_files.clone();
+        if let Some(list) = &self.input_list {
+            files.extend(read_input_list(list, b'\t')?.into_iter().map(PathBuf::from));
+        }
+        Ok(files)
+    }
+
     /// The options for writing the archive.
     pub fn archive_opts(&self) -> ntcomp::archive::ArchiveOpts {
         ntcomp::archive::ArchiveOpts {

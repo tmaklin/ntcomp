@@ -190,13 +190,13 @@ fn graph(
     stdout.flush().or_exit();
 }
 
-/// Writes the archive of `args.query_files` to `out`.
+/// Writes the archive of the input files ([GraphArgs::input_files]) to `out`.
 fn graph_encode<W: Write>(
     args: &GraphArgs,
     index: &Index,
     out: &mut W,
 ) {
-    let (query_files, batch_size) = (&args.query_files, args.batch_size as usize);
+    let (query_files, batch_size) = (args.input_files().or_exit(), args.batch_size as usize);
     let n_queries = query_files.len();
 
     let progress = ProgressBar::new(n_queries as u64);
