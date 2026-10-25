@@ -22,7 +22,9 @@
 //! sequences as coloured paths in a shared graph; [legacy] is the plain NLZ
 //! file format, which stores them one after another.
 //!
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 use crate::index::{Index, Match};
 #[cfg(doc)]
@@ -264,6 +266,159 @@ impl Dictionary {
     }
 }
 
+/// The phrases decoded so far by [Dictionary::decode_cached], shared by the
+/// decoding of many dictionaries over the same index (so each graph edge's
+/// phrase is walked once): by entry (colex rank, `len`, 0 for an implicit
+/// one), the phrase's bases and, for an implicit one, whether its extension
+/// stopped in the index (else at a bound, so a longer one may follow).
+pub struct PhraseCache {
+    shards: Vec<Mutex<Phrases>>,
+}
+
+/// Phrases by entry, and whether each is complete; see [PhraseCache].
+type Phrases = HashMap<(u32, u32), (Arc<Packed>, bool)>;
+
+impl Default for PhraseCache {
+    fn default() -> Self {
+        PhraseCache { shards: (0..64).map(|_| Mutex::new(HashMap::new())).collect() }
+    }
+}
+
+impl PhraseCache {
+    fn shard(
+        &self,
+        key: (u32, u32),
+    ) -> &Mutex<Phrases> {
+        let h = (key.0 as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ key.1 as u64;
+        &self.shards[(h >> 58) as usize]
+    }
+
+    fn get(
+        &self,
+        key: (u32, u32),
+    ) -> Option<(Arc<Packed>, bool)> {
+        self.shard(key).lock().unwrap().get(&key).cloned()
+    }
+}
+
+/// Bases packed four to a byte (A, C, G, T as 0..3; the bases of the
+/// index's _k_-mers are all one of them).
+struct Packed {
+    bytes: Box<[u8]>,
+    len: usize,
+}
+
+impl Packed {
+    fn new(
+        bases: &[u8],
+    ) -> Self {
+        let mut bytes = vec![0_u8; bases.len().div_ceil(4)];
+        for (i, &b) in bases.iter().enumerate() {
+            let code = match b { b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3, _ => panic!("not a base of the index") };
+            bytes[i / 4] |= code << (2 * (i % 4));
+        }
+        Packed { bytes: bytes.into_boxed_slice(), len: bases.len() }
+    }
+
+    /// Writes the bases from `from` on to `out`.
+    fn unpack_to(
+        &self,
+        from: usize,
+        out: &mut [u8],
+    ) {
+        for (j, o) in out.iter_mut().enumerate() {
+            let i = from + j;
+            *o = b"ACGT"[(self.bytes[i / 4] >> (2 * (i % 4)) & 3) as usize];
+        }
+    }
+}
+
+/// The last `len` bases of the _k_-mer at `row` (`len` ≤ _k_), walking `len`
+/// steps.
+fn last_bases<I: IndexWalk>(
+    index: &I,
+    row: usize,
+    len: usize,
+) -> Vec<u8> {
+    let sbwt = index.sbwt();
+    let mut bases = Vec::with_capacity(len);
+    let mut cur = row;
+    for t in 0..len {
+        if t > 0 {
+            cur = sbwt.inverse_lf_step(cur).expect("a k-mer of the index");
+        }
+        bases.push(sbwt.inlabel(cur).expect("a k-mer of the index"));
+    }
+    bases.reverse();
+    bases
+}
+
+impl Dictionary {
+    /// Same as [Dictionary::decode], taking the phrases from `cache` and
+    /// adding the ones it does not have.
+    pub fn decode_cached<I: IndexWalk>(
+        &self,
+        index: &I,
+        cache: &PhraseCache,
+    ) -> Result<Vec<u8>, DecodeError> {
+        let sequence_length = self.sequence_len;
+        let mut sequence: Vec<u8> = vec![0; sequence_length];
+        let mut end = sequence_length;
+        let k = index.k();
+        for entry in &self.entries {
+            let key = (entry.colex_rank, if entry.implicit { 0 } else { entry.len });
+            let (phrase, len) = if entry.implicit {
+                // The encoder extends at most end - k - 1 characters; a
+                // phrase that stopped in the index, or extends that far, is
+                // cut to it.
+                let max = end.saturating_sub(k + 1);
+                let usable = cache.get(key).filter(|(p, complete)| *complete || p.len >= k + max);
+                let phrase = match usable {
+                    Some((p, _)) => p,
+                    None => {
+                        let (bases, stopped) = index.left_extend(entry.colex_rank as usize, max, true);
+                        let p = Arc::new(Packed::new(&bases));
+                        let mut shard = cache.shard(key).lock().unwrap();
+                        if shard.get(&key).is_none_or(|(old, _)| old.len < p.len) {
+                            shard.insert(key, (p.clone(), stopped));
+                        }
+                        p
+                    },
+                };
+                let len = phrase.len.min(k + max);
+                (phrase, len)
+            } else {
+                let len = entry.len as usize;
+                let phrase = match cache.get(key) {
+                    Some((p, _)) => p,
+                    None => {
+                        let bases = if len > k {
+                            let bases = index.left_extend(entry.colex_rank as usize, len - k, false).0;
+                            assert_eq!(bases.len(), len);
+                            bases
+                        } else {
+                            last_bases(index, entry.colex_rank as usize, len)
+                        };
+                        let p = Arc::new(Packed::new(&bases));
+                        cache.shard(key).lock().unwrap().insert(key, (p.clone(), true));
+                        p
+                    },
+                };
+                (phrase, len)
+            };
+            if len > end {
+                return Err(DecodeError(format!("dictionary covers more than {} bases", sequence_length)))
+            }
+            phrase.unpack_to(phrase.len - len, &mut sequence[(end - len)..end]);
+            end -= len;
+        }
+        if end != 0 {
+            return Err(DecodeError(format!("dictionary covers {} of {} bases", sequence_length - end, sequence_length)))
+        }
+        Ok(sequence)
+    }
+}
+
 /// Error from [Dictionary::decode]: the dictionary does not cover the
 /// sequence.
 #[derive(Debug)]
@@ -289,6 +444,7 @@ mod tests {
         let (sbwt, k) = (index.sbwt(), index.k());
 
         let mut n_extended = 0;
+        let cache = PhraseCache::default();
         for seq in &seqs {
             for end in k..=seq.len() {
                 let kmer = &seq[end - k..end];
@@ -328,6 +484,10 @@ mod tests {
             for dictionary in [&dictionary, &stored] {
                 assert_eq!(&dictionary.decode(&crate::walk::WalkIndex { sbwt, lcs: None }).unwrap(), seq);
                 assert_eq!(&dictionary.decode(&index).unwrap(), seq);
+                // Through the phrase cache shared by all sequences: walked,
+                // then taken from the cache.
+                assert_eq!(&dictionary.decode_cached(&index, &cache).unwrap(), seq);
+                assert_eq!(&dictionary.decode_cached(&index, &cache).unwrap(), seq);
             }
         }
         assert!(n_extended > 0, "no k-mer was left extended");

@@ -23,6 +23,7 @@ use crate::graph::decoder::{ArchiveError, DecodedSections, GraphDecoder};
 use crate::graph::snps::{self, SnpEdits};
 use crate::graph::{contig_hash, Choices, ContigHash, Csr, GraphWalk, StoredGraph};
 use crate::index::Index;
+use crate::nlz::PhraseCache;
 
 type E = Box<dyn std::error::Error>;
 
@@ -33,6 +34,8 @@ type SnpContexts = HashMap<(u32, u32), [u8; snps::CONTEXT]>;
 /// An archive read with the index it was written with.
 pub struct ArchiveReader<'a> {
     index: &'a Index,
+    /// The phrases decoded so far.
+    cache: PhraseCache,
     n_contigs: u32,
     graph: StoredGraph,
     choices: Choices,
@@ -68,7 +71,7 @@ impl<'a> ArchiveReader<'a> {
         if contig_names.as_ref().is_some_and(|names| names.len() != n_contigs as usize) {
             return Err(Box::new(ArchiveError(format!("{} contig names for {} contigs", contig_names.map_or(0, |n| n.len()), n_contigs))))
         }
-        Ok(ArchiveReader { index, n_contigs, graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
+        Ok(ArchiveReader { index, cache: PhraseCache::default(), n_contigs, graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits })
     }
 
     /// Number of contigs (colours).
@@ -146,7 +149,7 @@ impl<'a> ArchiveReader<'a> {
         color: u32,
     ) -> Result<Vec<u8>, String> {
         let dictionary = self.graph.walk_path(&self.choices, color).map_err(|e| e.to_string())?;
-        dictionary.decode(self.index).map_err(|e| e.to_string())
+        dictionary.decode_cached(self.index, &self.cache).map_err(|e| e.to_string())
     }
 
     /// Puts the SNPs of `color` back into its edited sequence, restores its
