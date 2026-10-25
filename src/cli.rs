@@ -13,7 +13,7 @@
 //
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(version)]
@@ -179,19 +179,20 @@ pub struct GraphArgs {
     #[arg(long = "fasta-cols", default_value_t = 80, help = ".fasta columns")]
     pub fasta_columns: usize,
 
+    // Encoding options: all on by default (the best archives).
     // // Collapse linear chains
-    #[arg(long = "collapse-chains", default_value_t = false, help = "Store linear chains of nodes as single edges.")]
+    #[arg(long = "no-collapse-chains", action = ArgAction::SetFalse, help = "Store every node separately (the plain CSR layout) instead of linear chains of nodes as single edges.")]
     pub collapse_chains: bool,
 
     // // Choose contig strands
-    #[arg(long = "reorient", default_value_t = false, help = "Store every contig on the strand that shares the most with the contigs before it.")]
+    #[arg(long = "no-reorient", action = ArgAction::SetFalse, help = "Store every contig on its input strand instead of the strand that shares the most with the contigs before it.")]
     pub reorient: bool,
 
     #[arg(long = "reorient-sampling", default_value_t = 32, value_parser = clap::value_parser!(u64).range(1..), help = "Sample one in this many 31-mers for choosing the strands.")]
     pub reorient_sampling: u64,
 
     // // Edit SNPs towards the index
-    #[arg(long = "edit-snps", default_value_t = false, help = "Edit SNPs and small indels against the index before encoding.")]
+    #[arg(long = "no-edit-snps", action = ArgAction::SetFalse, help = "Do not edit SNPs and small indels against the index before encoding.")]
     pub edit_snps: bool,
 
 
