@@ -32,7 +32,8 @@ use crate::graph::{GraphDecodeError, GraphWalk, SINK_COLEX, SINK_NODE, SOURCE_CO
 use crate::walk::{IndexWalk, WalkIndex};
 use sbwt::StreamingIndex;
 
-use super::nodes::{code_targets, NodeReader, NodeWriter, TargetModels, WalkModels};
+use super::nodes::{code_targets, NodeReader, NodeWriter, Prepared, TargetModels, WalkModels};
+use rayon::prelude::*;
 use super::suffix_lens::{max_direct_suffix_len, SuffixModel};
 use super::topology::code_topology;
 use super::ChainCsr;
@@ -141,6 +142,34 @@ impl ChainCsr {
         let mut end_targets = TargetModels::new();
         let mut model = SuffixModel::new(lcs_cap as usize + 1, max_direct);
         let mut suffix_lens = Encoder::new();
+        // The nodes and targets in node order (predecessor, node; None for the
+        // sink as a target), prepared in parallel when they are derived.
+        let mut order: Vec<(Option<(u32, u32)>, Option<u32>)> = Vec::new();
+        if derived {
+            for junction in 0..n_junctions {
+                let (start, end) = self.row(junction);
+                for chain in start..end {
+                    let inner = self.inner_nodes(chain);
+                    let lens = self.chain_suffix_lens(chain);
+                    for (i, &len) in lens.iter().enumerate() {
+                        let source = if i == 0 { self.junction_weights[junction] } else { inner[i - 1] };
+                        let from_source = junction == SOURCE_NODE as usize && i == 0;
+                        let pred = (!from_source).then_some((source, len));
+                        let x = if i + 1 < lens.len() {
+                            Some(inner[i])
+                        } else {
+                            let target = self.targets[chain];
+                            (target != SINK_NODE).then(|| self.junction_weights[target as usize])
+                        };
+                        order.push((pred, x));
+                    }
+                }
+            }
+        }
+        let prepared: Vec<Prepared> = order.par_iter().map(|&(pred, x)| NodeWriter::prepare(&nodes.walk, pred, x)).collect();
+        drop(order);
+        let mut prepared = prepared.into_iter();
+
         let mut reached = vec![false; n_junctions];
         reached[SOURCE_NODE as usize] = true;
         reached[SINK_NODE as usize] = true;
@@ -156,17 +185,20 @@ impl ChainCsr {
                         let context = index.map_or(0, |index| index.lcs_at(source as usize).min(lcs_cap as usize));
                         model.code(&mut suffix_lens, context, len).expect("suffix length encode");
                     }
-                    let pred = (!from_source).then_some((source, len));
                     if i + 1 < lens.len() {
-                        nodes.node(pred, inner[i], true);
+                        if derived {
+                            nodes.node_prepared(prepared.next().unwrap(), inner[i], true);
+                        } else {
+                            nodes.node(inner[i]);
+                        }
                     } else {
                         let target = self.targets[chain] as usize;
                         let is_new = !reached[target];
                         reached[target] = true;
                         if derived {
-                            nodes.end(pred, target as u32, self.junction_weights[target], is_new, &mut end_targets);
+                            nodes.end_prepared(prepared.next().unwrap(), target as u32, self.junction_weights[target], is_new, &mut end_targets);
                         } else if is_new {
-                            nodes.node(pred, self.junction_weights[target], false);
+                            nodes.node(self.junction_weights[target]);
                         }
                     }
                 }

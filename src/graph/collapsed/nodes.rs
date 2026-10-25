@@ -65,7 +65,7 @@ use sbwt::{LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 
 use crate::codecs::arith::{code_bit, code_tree, Coder, Decoder, Encoder, C0};
 use crate::codecs::bits::{BitReader, BitWriter};
-use crate::graph::{GraphDecodeError, SINK_NODE};
+use crate::graph::GraphDecodeError;
 use crate::walk::{IndexWalk, WalkIndex};
 
 /// Low bits of a target distance coded with adaptive models (the others raw).
@@ -195,6 +195,53 @@ fn code_walk<C: Coder>(
     u32::try_from(cur).ok()
 }
 
+/// A branch of a walk: its step, the in-degree, the first row of the
+/// predecessors' group and the predecessor taken.
+pub(super) type Branch = (u16, u8, u32, u8);
+
+/// The branches of the walk of _k_ left steps through `rows` (see
+/// [code_walk]; the walk starts at `rows[2k - 1]`, the phrase start), which
+/// reaches the colex rank returned.
+fn walk_branches(
+    index: &WalkIndex,
+    rows: &[usize],
+) -> (Vec<Branch>, u32) {
+    let k = index.sbwt.k();
+    let mut cur = rows[2 * k - 1];
+    let mut branches = Vec::new();
+    for step in 0..k {
+        let group = index.predecessors(cur).expect("derivable walk");
+        let in_degree = group.end - group.start;
+        cur = group.start;
+        if in_degree > 1 {
+            let chosen = rows[2 * k - 2 - step] - group.start;
+            branches.push((step as u16, in_degree as u8, group.start as u32, chosen as u8));
+            cur += chosen;
+        }
+    }
+    (branches, cur as u32)
+}
+
+/// Codes the `branches` of a walk, as [code_walk] does.
+fn code_branches<C: Coder>(
+    c: &mut C,
+    m: &mut WalkModels,
+    branches: &[Branch],
+) {
+    for &(step, in_degree, group_start, chosen) in branches {
+        let last = m.last_at.get(&group_start).map_or(4, |&x| x as usize);
+        let context = ((last * 2 + (step > 0) as usize) * MAX_IN_DEGREE + in_degree as usize - 1) * 4;
+        code_tree(c, &mut m.steps[context..context + 4], 2, chosen as u32);
+        m.last_at.insert(group_start, chosen);
+    }
+}
+
+/// What the encoder codes for a node or a chain's target, prepared
+/// independently of the other nodes (so in parallel): None without a phrase
+/// start (the rank is stored), else the predecessor's suffix length and, if
+/// the node is derived, the branches of its walk.
+pub(super) type Prepared = Option<(u32, Option<Vec<Branch>>)>;
+
 /// The walk index of the encoder and its streaming index (for the matching
 /// statistics that check a walk).
 pub(super) type WriterWalk<'a> = (WalkIndex<'a>, StreamingIndex<'a, SbwtIndex<SubsetMatrix>, LcsArray>);
@@ -239,56 +286,67 @@ impl<'a> NodeWriter<'a> {
         derivable.then_some(rows)
     }
 
-    /// Codes the walk from `start` to `x` through `rows`.
-    fn code_walk_to(
-        walks: &mut Encoder,
-        models: &mut WalkModels,
-        index: &WalkIndex,
-        start: &[u8],
-        rows: &[usize],
-        x: u32,
-    ) {
-        let reached = code_walk(walks, models, index, start, Some(rows));
-        assert_eq!(reached, Some(x), "node walk does not reach the node");
+    /// Prepares node `x` (None: the sink as a chain's target, never derived)
+    /// whose predecessor on its chain is `pred` (rank, suffix length; None
+    /// for the source), see [Prepared].
+    pub(super) fn prepare(
+        walk: &Option<WriterWalk<'a>>,
+        pred: Option<(u32, u32)>,
+        x: Option<u32>,
+    ) -> Prepared {
+        let (walk, start, len) = Self::start(walk, pred)?;
+        let branches = x.and_then(|x| Self::walk_rows(walk, &start, x).map(|rows| {
+            let (branches, reached) = walk_branches(&walk.0, &rows);
+            assert_eq!(reached, x, "node walk does not reach the node");
+            branches
+        }));
+        Some((len, branches))
     }
 
-    /// Codes node `x` whose predecessor on its chain is `pred` (rank, suffix
-    /// length; None for the source).
+    /// Codes node `x` of a graph stored without nodes derived by walks: its
+    /// rank.
     pub(super) fn node(
         &mut self,
-        pred: Option<(u32, u32)>,
+        x: u32,
+    ) {
+        self.ranks.write_truncated_binary(x, self.bound);
+    }
+
+    /// Codes the prepared node `x` ([NodeWriter::prepare]).
+    pub(super) fn node_prepared(
+        &mut self,
+        prepared: Prepared,
         x: u32,
         is_inner: bool,
     ) {
-        let Some((walk, start, len)) = Self::start(&self.walk, pred) else {
+        let Some((len, branches)) = prepared else {
             self.ranks.write_truncated_binary(x, self.bound);
             return
         };
-        let rows = Self::walk_rows(walk, &start, x);
         let flag = &mut self.models.flags[(is_inner as usize) * 2 + (len == 0) as usize];
-        code_bit(&mut self.walks, flag, rows.is_some() as u32);
-        match rows {
-            Some(rows) => Self::code_walk_to(&mut self.walks, &mut self.models, &walk.0, &start, &rows, x),
+        code_bit(&mut self.walks, flag, branches.is_some() as u32);
+        match branches {
+            Some(branches) => code_branches(&mut self.walks, &mut self.models, &branches),
             None => self.ranks.write_truncated_binary(x, self.bound),
         }
     }
 
     /// Codes the target junction `target` (colex rank `rank`, `is_new` if
-    /// this chain reaches it first) of a chain whose last node is `pred`:
-    /// by a walk if one exists, else by `targets` and a new target's rank.
-    pub(super) fn end(
+    /// this chain reaches it first) of a chain, prepared
+    /// ([NodeWriter::prepare]): by a walk if one exists, else by `targets`
+    /// and a new target's rank.
+    pub(super) fn end_prepared(
         &mut self,
-        pred: Option<(u32, u32)>,
+        prepared: Prepared,
         target: u32,
         rank: u32,
         is_new: bool,
         targets: &mut TargetModels,
     ) {
-        if let Some((walk, start, len)) = Self::start(&self.walk, pred) {
-            let rows = if target == SINK_NODE { None } else { Self::walk_rows(walk, &start, rank) };
-            code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], rows.is_some() as u32);
-            if let Some(rows) = rows {
-                Self::code_walk_to(&mut self.walks, &mut self.models, &walk.0, &start, &rows, rank);
+        if let Some((len, branches)) = prepared {
+            code_bit(&mut self.walks, &mut self.models.ends[(len == 0) as usize], branches.is_some() as u32);
+            if let Some(branches) = branches {
+                code_branches(&mut self.walks, &mut self.models, &branches);
                 if is_new {
                     targets.next_new += 1;
                 }
