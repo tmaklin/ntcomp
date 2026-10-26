@@ -20,7 +20,7 @@
 pub mod reader;
 pub mod writer;
 
-pub use reader::{ArchiveReader, ContigDecoder, DecodedContig};
+pub use reader::{ArchiveReader, ContigDecoder, DecodedContig, FileCheck};
 pub use writer::{ArchiveOpts, ArchiveWriter, InputFile};
 
 #[cfg(test)]
@@ -47,25 +47,56 @@ mod tests {
         assert_eq!((reader.file_name(0), reader.file_name(3)), (Some(&b"first"[..]), Some(&b"second"[..])));
         assert_eq!(reader.contig_name(1), Some(&b"contig1 sample"[..]));
 
-        // Every contig, in reverse order, two at a time.
+        // Every contig, in reverse order, two at a time: the second file
+        // (colours 1 to 3) is checked when its last contig is decoded, over
+        // two calls, then the first.
         let colors: Vec<u32> = (0..4).rev().collect();
         let mut decoder = reader.decoder(&colors).unwrap();
+        let mut checks = Vec::new();
         for chunk in colors.chunks(2) {
             for decoded in decoder.decode(chunk).unwrap() {
                 let decoded = decoded.unwrap();
                 assert_eq!(decoded.sequence, contigs[decoded.color as usize].1, "color {}", decoded.color);
-                assert_eq!(decoded.hash_match, Some(true));
             }
+            checks.push(decoder.finished_files());
         }
+        assert_eq!(checks, vec![vec![], vec![FileCheck { file: 1, hash_match: true }, FileCheck { file: 0, hash_match: true }]]);
 
-        // One contig by name (the whole name or its first word).
+        // One contig by name (the whole name or its first word): its file is
+        // not checked. Its whole file by the file's name is.
         assert_eq!(reader.find_contig("contig2 sample").unwrap(), vec![2]);
         assert_eq!(reader.find_contig("contig2").unwrap(), vec![2]);
-        let decoded = reader.decoder(&[2]).unwrap().decode(&[2]).unwrap().pop().unwrap().unwrap();
+        let mut decoder = reader.decoder(&[2]).unwrap();
+        let decoded = decoder.decode(&[2]).unwrap().pop().unwrap().unwrap();
         assert_eq!(decoded.sequence, contigs[2].1);
+        assert!(decoder.finished_files().is_empty());
+        let colors = reader.find_file("second").unwrap();
+        assert_eq!(colors, vec![1, 2, 3]);
+        let mut decoder = reader.decoder(&colors).unwrap();
+        decoder.decode(&colors).unwrap();
+        assert_eq!(decoder.finished_files(), vec![FileCheck { file: 1, hash_match: true }]);
+
+        // A changed contig name changes its file's hash only; a wrong hash
+        // fails its file only.
+        let mut renamed = files.clone();
+        renamed[1].1[0].0 = b"another name".to_vec();
+        let mut writer = ArchiveWriter::new(ArchiveOpts::default(), &index);
+        writer.add_files(&renamed).unwrap();
+        let mut other = Vec::new();
+        writer.write(&mut other).unwrap();
+        let mut other = ArchiveReader::open(&mut other.as_slice(), &index).unwrap();
+        let (hashes, other_hashes) = (reader.hashes.clone().unwrap(), other.hashes.clone().unwrap());
+        assert_eq!(hashes[0], other_hashes[0]);
+        assert_ne!(hashes[1], other_hashes[1]);
+        other.hashes = Some(hashes);
+        let all: Vec<u32> = (0..4).collect();
+        let mut decoder = other.decoder(&all).unwrap();
+        decoder.decode(&all).unwrap();
+        assert_eq!(decoder.finished_files(), vec![FileCheck { file: 0, hash_match: true }, FileCheck { file: 1, hash_match: false }]);
 
         // Unknown names and colours are errors.
         assert!(reader.find_contig("contig9").is_err());
+        assert!(reader.find_file("third").is_err());
         assert!(reader.decoder(&[4]).is_err());
     }
 
@@ -105,12 +136,14 @@ mod tests {
 
         let reader = ArchiveReader::open(&mut bytes.as_slice(), &index).unwrap();
         let colors: Vec<u32> = (0..5).collect();
-        for decoded in reader.decoder(&colors).unwrap().decode(&colors).unwrap() {
+        let mut decoder = reader.decoder(&colors).unwrap();
+        for decoded in decoder.decode(&colors).unwrap() {
             let decoded = decoded.unwrap();
             assert_eq!(decoded.sequence, contigs[decoded.color as usize].1, "colour {}", decoded.color);
-            assert_eq!(decoded.hash_match, Some(true));
             assert_eq!(reader.contig_name(decoded.color), Some(contigs[decoded.color as usize].0.as_slice()));
         }
+
+        assert_eq!(decoder.finished_files(), vec![FileCheck { file: 0, hash_match: true }]);
 
         // Without the cut, a parse fails instead of looping.
         assert!(crate::nlz::parse(&contigs[0].1, &index).is_err());

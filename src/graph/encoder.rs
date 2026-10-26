@@ -41,8 +41,9 @@ pub struct GraphEncoder<'a> {
     /// Choice stream
     choices: Choices,
 
-    /// Hashes of the contigs, see [ContigHash](super::ContigHash)
-    hashes: Option<Vec<super::ContigHash>>,
+    /// Hashes of the input files (one for all contigs without file
+    /// ranges), see [file_hash](super::file_hash)
+    hashes: Option<Vec<super::FileHash>>,
 
     /// Contig names
     contig_names: Option<Vec<Vec<u8>>>,
@@ -100,10 +101,11 @@ impl<'a> GraphEncoder<'a> {
         }
     }
 
-    /// Add the contigs' hashes ([contig_hash](super::contig_hash))
+    /// Add the input files' hashes ([file_hash](super::file_hash)): one per
+    /// file range, or one for all contigs without them.
     pub fn with_hashes(
         mut self,
-        hashes: Vec<super::ContigHash>,
+        hashes: Vec<super::FileHash>,
     ) -> Self {
         self.hashes = Some(hashes);
         self
@@ -253,6 +255,10 @@ impl<'a> GraphEncoder<'a> {
 
         let file_range_bytes = self.encode_file_ranges()?;
         let contig_name_bytes = self.encode_contig_names()?;
+        let n_files = self.file_ranges.as_ref().map_or(1, |r| r.len());
+        if self.hashes.as_ref().is_some_and(|h| h.len() != n_files) {
+            return Err(format!("{} hashes for {} files", self.hashes.as_ref().map_or(0, |h| h.len()), n_files).into())
+        }
         let hash_bytes = optional_section(&self.hashes)?;
         let strand_bytes = self.encode_reversed()?;
         let snp_bytes = self.encode_snp_edits()?;

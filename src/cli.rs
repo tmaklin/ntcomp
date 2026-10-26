@@ -212,8 +212,11 @@ pub struct GraphArgs {
     #[arg(long = "color", help_heading = "Decompression", help = "Decode by contig index(es) (0-based).")]
     pub colors: Vec<u32>,
 
-    #[arg(long = "contig", help_heading = "Decompression", help = "Decode by contig name(s).")]
+    #[arg(long = "contig", help_heading = "Decompression", help = "Decode by contig name(s); not checked against the hash unless every contig of its file is decoded.")]
     pub contigs: Vec<String>,
+
+    #[arg(long = "file", help_heading = "Decompression", help = "Decode every contig of the input file(s) with this name, checked against the file's hash.")]
+    pub files: Vec<String>,
 }
 
 // Decode data written with Encode

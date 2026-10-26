@@ -22,7 +22,7 @@ use crate::edits;
 use crate::fastx::Contig;
 use crate::graph::encoder::GraphEncoder;
 use crate::graph::snps::{self, EditedSnp, SnpEdits};
-use crate::graph::{contig_hash, ContigHash, GraphBuilder};
+use crate::graph::{contig_digest, file_hash, FileHash, GraphBuilder};
 use crate::index::Index;
 use crate::nlz;
 use crate::nruns::{self, NRun, NRuns};
@@ -55,7 +55,8 @@ impl Default for ArchiveOpts {
 }
 
 /// Builds an archive from input files added in order. Each contig gets the
-/// next colour; the archive keeps its hash, its name and its file.
+/// next colour; the archive keeps its name and its file, and a hash of every
+/// file ([file_hash]).
 ///
 /// A contig is stored on the strand chosen for it ([ArchiveOpts::reorient]),
 /// without its runs of `N` ([nruns]), with its edits applied
@@ -76,7 +77,8 @@ pub struct ArchiveWriter<'a> {
     edited: Vec<Vec<EditedSnp>>,
     /// Per colour: the runs of `N` cut out.
     n_runs: Vec<Vec<NRun>>,
-    hashes: Vec<ContigHash>,
+    /// Per input file: its hash.
+    hashes: Vec<FileHash>,
     contig_names: Vec<Vec<u8>>,
     file_ranges: Vec<(Vec<u8>, Range<u32>)>,
 }
@@ -166,7 +168,10 @@ impl<'a> ArchiveWriter<'a> {
         }).collect();
 
         let encoded = encoded.into_iter().collect::<Result<Vec<Encoded>, String>>()?;
-        self.hashes.par_extend(sequences.par_iter().map(|sequence| contig_hash(sequence)));
+        self.hashes.extend(files.iter().map(|(_, contigs)| {
+            let digests: Vec<_> = contigs.par_iter().map(|(name, sequence)| contig_digest(name, sequence)).collect();
+            file_hash(&digests)
+        }));
         let mut colors = Vec::with_capacity(sequences.len());
         for (reversed, dictionary, edited, runs) in encoded {
             colors.push(self.builder.add_dictionary(&dictionary));
@@ -269,10 +274,11 @@ mod tests {
         // In reverse order: the repeats need contexts from contigs not decoded yet.
         let reader = ArchiveReader::open(&mut bytes.as_slice(), &index).unwrap();
         let colors = [2, 1, 0];
-        for decoded in reader.decoder(&colors).unwrap().decode(&colors).unwrap() {
+        let mut decoder = reader.decoder(&colors).unwrap();
+        for decoded in decoder.decode(&colors).unwrap() {
             let decoded = decoded.unwrap();
             assert_eq!(decoded.sequence, contigs[decoded.color as usize].1, "colour {}", decoded.color);
-            assert_eq!(decoded.hash_match, Some(true));
         }
+        assert_eq!(decoder.finished_files(), vec![crate::archive::FileCheck { file: 0, hash_match: true }]);
     }
 }

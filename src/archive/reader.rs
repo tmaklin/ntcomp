@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 use crate::graph::decoder::{ArchiveError, DecodedSections, GraphDecoder};
 use crate::graph::snps::{self, SnpEdits};
-use crate::graph::{contig_hash, Choices, ChainCsr, ContigHash, Csr, GraphWalk};
+use crate::graph::{contig_digest, file_hash, Choices, ChainCsr, ContigDigest, Csr, FileHash, GraphWalk};
 use crate::index::Index;
 use crate::nlz::PhraseCache;
 use crate::nruns::{self, NRuns};
@@ -40,7 +40,8 @@ pub struct ArchiveReader<'a> {
     n_contigs: u32,
     graph: ChainCsr,
     choices: Choices,
-    hashes: Option<Vec<ContigHash>>,
+    /// Per input file (one for all contigs without file ranges).
+    pub(crate) hashes: Option<Vec<FileHash>>,
     contig_names: Option<Vec<Vec<u8>>>,
     file_ranges: Option<Vec<(Vec<u8>, Range<u32>)>>,
     reversed: Option<Vec<bool>>,
@@ -52,9 +53,16 @@ pub struct ArchiveReader<'a> {
 pub struct DecodedContig {
     pub color: u32,
     pub sequence: Vec<u8>,
-    /// Whether the sequence matches the stored hash (None if the archive has
-    /// no hashes).
-    pub hash_match: Option<bool>,
+}
+
+/// The check of an input file whose contigs have all been decoded
+/// ([ContigDecoder::finished_files]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileCheck {
+    /// The file's index (0 without file ranges).
+    pub file: usize,
+    /// Whether its contigs match the stored hash.
+    pub hash_match: bool,
 }
 
 impl<'a> ArchiveReader<'a> {
@@ -89,6 +97,39 @@ impl<'a> ArchiveReader<'a> {
         color: u32,
     ) -> Option<&[u8]> {
         self.contig_names.as_ref().and_then(|names| names.get(color as usize)).map(|name| name.as_slice())
+    }
+
+    /// Whether the archive stores hashes to check decoded files by.
+    pub fn has_hashes(&self) -> bool {
+        self.hashes.is_some()
+    }
+
+    /// The input file of contig `color`: its index (0 without file ranges).
+    pub fn file_of(
+        &self,
+        color: u32,
+    ) -> usize {
+        self.file_ranges.as_ref().map_or(0, |ranges| ranges.partition_point(|(_, range)| range.end <= color))
+    }
+
+    /// The contigs of input file `file` (all without file ranges).
+    pub fn file_colors(
+        &self,
+        file: usize,
+    ) -> Range<u32> {
+        self.file_ranges.as_ref().map_or(0..self.n_contigs, |ranges| ranges.get(file).map_or(0..0, |(_, range)| range.clone()))
+    }
+
+    /// The colours of the contigs of the input file named `name`. An error if
+    /// the archive has no file names or none matches.
+    pub fn find_file(
+        &self,
+        name: &str,
+    ) -> Result<Vec<u32>, E> {
+        let ranges = self.file_ranges.as_ref().ok_or("the archive has no file names")?;
+        let (_, range) = ranges.iter().find(|(file, _)| file.as_slice() == name.as_bytes())
+            .ok_or_else(|| format!("file {} not found", name))?;
+        Ok(range.clone().collect())
     }
 
     /// Name of the input file of contig `color` (None if the archive does
@@ -138,7 +179,7 @@ impl<'a> ArchiveReader<'a> {
                 }
             }
         }
-        Ok(ContigDecoder { reader: self, wanted, contexts: SnpContexts::new() })
+        Ok(ContigDecoder { reader: self, wanted, contexts: SnpContexts::new(), pending: HashMap::new(), finished: Vec::new() })
     }
 
     /// Decodes the stored (edited) sequence of `color` from the graph,
@@ -152,7 +193,7 @@ impl<'a> ArchiveReader<'a> {
     }
 
     /// Puts the SNPs of `color` back into its edited sequence, then its runs
-    /// of `N`, restores its strand and checks its hash.
+    /// of `N`, and restores its strand.
     fn finish_color(
         &self,
         color: u32,
@@ -173,9 +214,7 @@ impl<'a> ArchiveReader<'a> {
         } else {
             sequence
         };
-        // Not checked if the archive has no hashes.
-        let hash_match = self.hashes.as_ref().map(|hashes| contig_hash(&sequence) == hashes[idx]);
-        Ok(DecodedContig { color, sequence, hash_match })
+        Ok(DecodedContig { color, sequence })
     }
 
     /// The uncollapsed graph and the colours using each of its edges
@@ -196,6 +235,11 @@ pub struct ContigDecoder<'r, 'a> {
     reader: &'r ArchiveReader<'a>,
     wanted: HashMap<u32, Vec<u32>>,
     contexts: SnpContexts,
+    /// Per input file not complete yet: the digests of its contigs decoded
+    /// so far.
+    pending: HashMap<usize, Vec<Option<ContigDigest>>>,
+    /// The checks of the files completed since [ContigDecoder::finished_files].
+    finished: Vec<FileCheck>,
 }
 
 impl ContigDecoder<'_, '_> {
@@ -216,6 +260,10 @@ impl ContigDecoder<'_, '_> {
     /// Decodes the contigs `colors` in parallel, also decoding the contigs
     /// (not decoded yet) whose contexts their repeated SNPs need. An error
     /// if such a contig cannot be decoded; otherwise one result per colour.
+    ///
+    /// A file is checked against its hash once all its contigs have been
+    /// decoded, over any calls and in any order ([ContigDecoder::finished_files]);
+    /// the contigs of a file decoded in part are not checked.
     pub fn decode(
         &mut self,
         colors: &[u32],
@@ -239,9 +287,46 @@ impl ContigDecoder<'_, '_> {
             }
         }
         let contexts = &self.contexts;
-        Ok(colors.par_iter().zip(edited.into_par_iter()).map(|(&color, sequence)| {
-            sequence.and_then(|sequence| reader.finish_color(color, sequence, contexts))
-                .map_err(|e| ArchiveError(format!("decoding color {}: {}", color, e)))
-        }).collect())
+        let checked = reader.hashes.is_some();
+        let decoded: Vec<(Result<DecodedContig, ArchiveError>, Option<ContigDigest>)> = colors.par_iter().zip(edited.into_par_iter()).map(|(&color, sequence)| {
+            let contig = sequence.and_then(|sequence| reader.finish_color(color, sequence, contexts))
+                .map_err(|e| ArchiveError(format!("decoding color {}: {}", color, e)));
+            let digest = contig.as_ref().ok().filter(|_| checked).map(|c| contig_digest(reader.contig_name(color).unwrap_or_default(), &c.sequence));
+            (contig, digest)
+        }).collect();
+        for (&color, (_, digest)) in colors.iter().zip(&decoded) {
+            if let Some(digest) = digest {
+                self.add_digest(color, *digest);
+            }
+        }
+        Ok(decoded.into_iter().map(|(contig, _)| contig).collect())
+    }
+
+    /// Records the digest of decoded contig `color`; checks its file if that
+    /// completes it.
+    fn add_digest(
+        &mut self,
+        color: u32,
+        digest: ContigDigest,
+    ) {
+        let reader = self.reader;
+        let Some(hashes) = &reader.hashes else { return };
+        let file = reader.file_of(color);
+        let range = reader.file_colors(file);
+        let digests = self.pending.entry(file).or_insert_with(|| vec![None; range.len()]);
+        digests[(color - range.start) as usize] = Some(digest);
+        if digests.iter().all(|d| d.is_some()) {
+            let digests: Vec<ContigDigest> = self.pending.remove(&file).unwrap().into_iter().flatten().collect();
+            let hash_match = hashes.get(file) == Some(&file_hash(&digests));
+            self.finished.push(FileCheck { file, hash_match });
+        }
+    }
+
+    /// The checks of the files completed since the last call, in the order
+    /// they were completed.
+    pub fn finished_files(
+        &mut self,
+    ) -> Vec<FileCheck> {
+        std::mem::take(&mut self.finished)
     }
 }

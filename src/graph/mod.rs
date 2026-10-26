@@ -75,21 +75,41 @@ use crate::walk::WalkIndex;
 
 type E = Box<dyn std::error::Error>;
 
-/// Bytes of a contig's blake3 hash kept in archives (enough to check a
-/// decoded contig; the full 32 bytes were 6% of an archive).
-pub const CONTIG_HASH_BYTES: usize = 8;
+/// Bytes of an input file's hash kept in archives (enough to check a
+/// decoded file; per-contig hashes were a fifth of an archive of fragmented
+/// assemblies).
+pub const FILE_HASH_BYTES: usize = 8;
 
-/// A contig's hash as stored in archives: the first [CONTIG_HASH_BYTES] bytes
-/// of its blake3 hash.
-pub type ContigHash = [u8; CONTIG_HASH_BYTES];
+/// An input file's hash as stored in archives, see [file_hash].
+pub type FileHash = [u8; FILE_HASH_BYTES];
 
-/// [ContigHash] of a (normalized) contig sequence.
-pub fn contig_hash(
+/// A contig's blake3 hash, see [contig_digest].
+pub type ContigDigest = [u8; 32];
+
+/// The blake3 hash of a contig: the length of its name (u64,
+/// little-endian), its name and its (normalized) sequence.
+pub fn contig_digest(
+    name: &[u8],
     sequence: &[u8],
-) -> ContigHash {
-    let mut out = [0u8; CONTIG_HASH_BYTES];
-    out.copy_from_slice(&blake3::hash(sequence).as_bytes()[..CONTIG_HASH_BYTES]);
-    out
+) -> ContigDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(name.len() as u64).to_le_bytes());
+    hasher.update(name);
+    hasher.update(sequence);
+    *hasher.finalize().as_bytes()
+}
+
+/// The [FileHash] of a file's contigs: the first [FILE_HASH_BYTES] bytes of
+/// the blake3 hash of their [contig_digest]s in order, so that the contigs
+/// can be checked in any order.
+pub fn file_hash(
+    digests: &[ContigDigest],
+) -> FileHash {
+    let mut hasher = blake3::Hasher::new();
+    for digest in digests {
+        hasher.update(digest);
+    }
+    hasher.finalize().as_bytes()[..FILE_HASH_BYTES].try_into().unwrap()
 }
 
 /// Node index of the dummy source node.

@@ -239,6 +239,9 @@ fn graph_decode<W: Write>(
     for name in &args.contigs {
         want_colors.extend(archive.find_contig(name).map_err(|e| in_archive(&e)).or_exit());
     }
+    for name in &args.files {
+        want_colors.extend(archive.find_file(name).map_err(|e| in_archive(&e)).or_exit());
+    }
     if want_colors.is_empty() {
         want_colors = (0..archive.n_contigs()).collect();
     }
@@ -247,8 +250,13 @@ fn graph_decode<W: Write>(
     if !args.fasta {
         eprintln!("color\taccession\tcontig\tdecoded_len\thash_match\tseconds");
     }
-    // Colours are decoded in parallel in chunks, and written in the requested order.
+    // Colours are decoded in parallel in chunks, and written in the requested
+    // order. A file is checked once all its contigs are decoded: the report
+    // rows of its contigs wait for that (contigs of files decoded in part are
+    // reported unverified).
     let mut failed = false;
+    let mut waiting: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    let report = |rows: Vec<(String, String)>, check: &str| for (row, seconds) in rows { eprintln!("{}\t{}\t{}", row, check, seconds); };
     for chunk in want_colors.chunks(args.chunk_size(archive.n_contigs(), archive.n_files())) {
         let start_time = std::time::Instant::now();
         let decoded = decoder.decode(chunk).map_err(|e| in_archive(&e)).or_exit();
@@ -263,16 +271,32 @@ fn graph_decode<W: Write>(
                     continue
                 },
             };
-            failed |= contig.hash_match == Some(false);
             let contig_name: Vec<u8> = archive.contig_name(color).map_or_else(|| format!("color_{}", color).into_bytes(), |name| name.to_vec());
             if !args.fasta {
                 let file_name = archive.file_name(color).map_or("NA".to_string(), |name| String::from_utf8_lossy(name).to_string());
-                let hash_match = contig.hash_match.map_or("NA".to_string(), |x| x.to_string());
-                eprintln!("{}\t{}\t{}\t{}\t{}\t{:.3}", color, file_name, String::from_utf8_lossy(&contig_name), contig.sequence.len(), hash_match, seconds);
+                let row = (format!("{}\t{}\t{}\t{}", color, file_name, String::from_utf8_lossy(&contig_name), contig.sequence.len()), format!("{:.3}", seconds));
+                if !archive.has_hashes() {
+                    report(vec![row], "NA");
+                } else {
+                    let file = archive.file_of(color);
+                    match waiting.iter_mut().find(|(f, _)| *f == file) {
+                        Some((_, rows)) => rows.push(row),
+                        None => waiting.push((file, vec![row])),
+                    }
+                }
             } else {
                 fastx::write_fasta(out, &contig_name, &contig.sequence, args.fasta_columns).or_exit();
             }
         }
+        for check in decoder.finished_files() {
+            failed |= !check.hash_match;
+            if let Some(i) = waiting.iter().position(|(f, _)| *f == check.file) {
+                report(waiting.remove(i).1, &check.hash_match.to_string());
+            }
+        }
+    }
+    for (_, rows) in waiting {
+        report(rows, "unverified");
     }
     if failed {
         out.flush().or_exit();

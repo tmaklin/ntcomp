@@ -117,7 +117,8 @@ pub struct DecodedSections {
     pub graph: ChainCsr,
     pub choices: Choices,
     /// Hash of every contig.
-    pub hashes: Option<Vec<super::ContigHash>>,
+    /// Hash of every input file (of all contigs without file ranges).
+    pub hashes: Option<Vec<super::FileHash>>,
     pub contig_names: Option<Vec<Vec<u8>>>,
     /// Input files: name and colours.
     pub file_ranges: Option<Vec<(Vec<u8>, Range<u32>)>>,
@@ -216,9 +217,10 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
         let graph = ChainCsr::from_bytes(&read_bytes(reader, header.graph_bytes)?, index, k)?;
-        let hashes: Option<Vec<super::ContigHash>> = read_section(reader, header.hash_bytes)?;
-        if let Some(hashes) = &hashes && hashes.len() != n_contigs as usize {
-            return Err(Box::new(ArchiveError(format!("{} hashes for {} contigs", hashes.len(), n_contigs))))
+        let hashes: Option<Vec<super::FileHash>> = read_section(reader, header.hash_bytes)?;
+        let n_files = file_ranges.as_ref().map_or(1, |r| r.len());
+        if let Some(hashes) = &hashes && hashes.len() != n_files {
+            return Err(Box::new(ArchiveError(format!("{} hashes for {} files", hashes.len(), n_files))))
         }
         let reversed = read_reversed(reader, header.strand_bytes, n_contigs as usize)?;
         let snp_edits: Option<SnpEdits> = read_section(reader, header.snp_bytes)?;
@@ -274,7 +276,7 @@ mod tests {
     fn archive_roundtrip() {
         let (graph, choices, dicts) = graph();
         let names = vec![b"contig one".to_vec(), b"contig two".to_vec()];
-        let hashes = vec![super::super::contig_hash(b"one"), super::super::contig_hash(b"two")];
+        let hashes = vec![super::super::file_hash(&[super::super::contig_digest(b"one", b"ACGT")])];
         let ranges = vec![(b"file".to_vec(), 0..2)];
         let snps = SnpEdits::new(&[vec![], vec![Snp { pos: 3, base: b'A', index_base: b'G' }]]);
         let runs = NRuns { runs: vec![vec![crate::nruns::NRun { pos: 2, len: 250, bases: Vec::new() }], vec![]] };
