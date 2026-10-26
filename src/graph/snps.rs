@@ -526,6 +526,26 @@ impl SnpEdits {
     /// Puts the original contig of `color` back from its decoded (edited)
     /// one. `context` gives the context at a position of an earlier colour's
     /// edited contig (for the pairs in [SnpEdits::context_sources]).
+    /// The bases `color`'s edits put back minus those they remove: its
+    /// length minus its edited length. None for an unknown colour or id.
+    pub fn length_change(
+        &self,
+        color: u32,
+    ) -> Option<i64> {
+        let snps = self.colours.get(color as usize)?;
+        let change = |stored: &Stored| match stored {
+            Stored::Distance(_) => 0,
+            Stored::Deleted(bases) => bases.len() as i64,
+            Stored::Inserted(len) => -(*len as i64),
+        };
+        let mut total: i64 = snps.new.iter().map(|(_, s)| change(s)).sum();
+        for &id in &snps.repeats {
+            let &(f, i) = self.ids.get(id as usize)?;
+            total += change(&self.colours.get(f as usize)?.new.get(i as usize)?.1);
+        }
+        Some(total)
+    }
+
     pub fn revert(
         &self,
         color: u32,
@@ -713,11 +733,11 @@ mod tests {
         // a SNP of its own): the second stores the indels as repeats.
         let original = random_sequence(2000, 17);
         let del = Edit { pos: 500, change: Change::Del { bases: original[500..502].to_vec() } };
-        let ins = Edit { pos: 1200, change: Change::Ins { bases: b"GA".to_vec() } };
+        let ins = Edit { pos: 1200, change: Change::Ins { bases: b"GAT".to_vec() } };
         let own = Edit::from(snp(1700, original[1700], b"ACGT"[(base_code(original[1700]).unwrap() as usize + 1) % 4]));
         let colours = [vec![del.clone(), ins.clone()], vec![del, ins, own]];
         let edited: Vec<(Vec<u8>, Vec<Edit>)> = colours.iter().map(|c| apply_edits(&original, c.clone()).unwrap()).collect();
-        assert_eq!(edited[0].0.len(), original.len());
+        assert_eq!(edited[0].0.len(), original.len() + 1);
         let called: Vec<Vec<EditedSnp>> = edited.iter().map(|(e, moved)| with_contexts(e, moved.clone())).collect();
         let edits: SnpEdits = postcard::from_bytes(&postcard::to_allocvec(&SnpEdits::with_repeats(&called)).unwrap()).unwrap();
         assert_eq!(edits.n_snps(), 5);
@@ -727,6 +747,9 @@ mod tests {
             let mut sequence = edited[color].0.clone();
             edits.revert(color as u32, &mut sequence, &context).unwrap();
             assert_eq!(sequence, original, "colour {}", color);
+            // Their length change, the repeats' too.
+            assert_eq!(edits.length_change(color as u32), Some(-1));
         }
+        assert_eq!(edits.length_change(2), None);
     }
 }

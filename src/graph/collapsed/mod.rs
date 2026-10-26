@@ -249,6 +249,22 @@ impl ChainCsr {
     }
 }
 
+impl ChainCsr {
+    /// The stored length of `color`'s contig: the suffix length of the
+    /// chain its path takes out of the source.
+    pub fn sequence_len(
+        &self,
+        choices: &Choices,
+        color: u32,
+    ) -> Result<u64, GraphDecodeError> {
+        let mut reader = choices
+            .reader(color)
+            .ok_or_else(|| GraphDecodeError(format!("no choice stream for colour {}", color)))?;
+        let chain = take_edge(self.row(SOURCE_NODE as usize), &mut reader, color, SOURCE_NODE as usize)?;
+        Ok(self.chain_suffix_lens(chain)[0] as u64)
+    }
+}
+
 impl GraphWalk for ChainCsr {
     /// Number of junctions.
     fn n_nodes(&self) -> usize {

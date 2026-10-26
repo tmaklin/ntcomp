@@ -50,7 +50,7 @@
 //!   viewing; [collapsed]: the stored chain layout and its sections;
 //! - [paths]: walking a colour's path with its choices ([GraphWalk]);
 //! - [choices]: the choice streams and the model that codes them;
-//! - [snps]: the archive's SNP section;
+//! - [snps]: the archive's SNP section; [names]: its contig names;
 //! - [encoder], [decoder]: the archive file; [header]: its header.
 //!
 pub mod builder;
@@ -60,6 +60,7 @@ pub mod csr;
 pub mod decoder;
 pub mod encoder;
 pub mod header;
+pub mod names;
 pub mod paths;
 pub mod snps;
 

@@ -18,6 +18,7 @@
 use super::header::FileHeader;
 use crate::codecs::bits::BitReader;
 use super::choices::Choices;
+use super::names;
 use super::snps::SnpEdits;
 use crate::nruns::NRuns;
 use crate::codecs::lzma::{self, LzmaData};
@@ -69,16 +70,6 @@ fn read_section<T: serde::de::DeserializeOwned, R: Read>(
     Ok(Some(postcard::from_bytes(&read_bytes(input, n_bytes)?)?))
 }
 
-/// Contig names, LZMA compressed; None if the section is empty (absent).
-fn read_contig_names<R: Read>(
-    input: &mut R,
-    n_bytes: u64,
-) -> Result<Option<Vec<Vec<u8>>>, E> {
-    let Some(section) = read_section::<LzmaData, R>(input, n_bytes)? else {
-        return Ok(None)
-    };
-    Ok(Some(postcard::from_bytes(&lzma::decompress(&section)?)?))
-}
 
 /// Reads the file ranges written by the encoder (file names and contig counts,
 /// LZMA compressed); the ranges are contiguous from colour 0.
@@ -219,7 +210,8 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
         if file_ranges.as_ref().is_some_and(|r| r.last().map_or(0, |(_, range)| range.end) != n_contigs) {
             return Err(Box::new(ArchiveError(format!("file ranges do not cover {} contigs", n_contigs))))
         }
-        let contig_names = read_contig_names(reader, header.contig_name_bytes)?;
+        // The names are decoded last, by the contig lengths ([names]).
+        let name_bytes = read_bytes(reader, header.contig_name_bytes)?;
         if header.graph_bytes == 0 {
             return Err(Box::new(ArchiveError("the graph section is missing".to_string())))
         }
@@ -241,6 +233,10 @@ impl<'a, R: Read> GraphDecoder<'a, R> {
             return Err(Box::new(ArchiveError("the choice section is missing".to_string())))
         }
         let choices = Choices::from_stored(&read_bytes(reader, header.choice_bytes)?, &graph, n_contigs as usize)?;
+        let contig_names = if name_bytes.is_empty() { None } else {
+            let lengths = names::contig_lengths(&graph, &choices, snp_edits.as_ref(), n_runs.as_ref())?;
+            Some(names::decode(&name_bytes, file_ranges.as_deref(), &lengths)?)
+        };
 
         Ok(DecodedSections { graph, choices, hashes, contig_names, file_ranges, reversed, snp_edits, n_runs })
     }

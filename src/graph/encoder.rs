@@ -17,6 +17,7 @@
 use super::header::{FileHeader, FILE_HEADER_BYTES};
 use super::ChainCsr;
 use super::choices::Choices;
+use super::names;
 use super::snps::SnpEdits;
 use crate::nruns::NRuns;
 use crate::codecs::bits::BitWriter;
@@ -235,10 +236,9 @@ impl<'a> GraphEncoder<'a> {
     fn encode_contig_names(
         &self,
     ) -> Result<Vec<u8>, E> {
-        match &self.contig_names {
-            Some(contig_names) => Ok(to_allocvec(&lzma::compress(&to_allocvec(contig_names)?)?)?),
-            None => Ok(Vec::new()),
-        }
+        let Some(contig_names) = &self.contig_names else { return Ok(Vec::new()) };
+        let lengths = names::contig_lengths(&self.graph, &self.choices, self.snp_edits.as_ref(), self.n_runs.as_ref())?;
+        names::encode(contig_names, self.file_ranges.as_deref(), &lengths)
     }
 
     /// Writes the archive to `writer`.

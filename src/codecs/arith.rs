@@ -177,6 +177,7 @@ pub fn code_gamma<C: Coder>(
 /// 6-bit adaptive tree and the bits below its top one, the first
 /// [GammaModel::MODELLED_BITS] adaptive given the bit length and the bits
 /// above them, the rest raw.
+#[derive(Clone)]
 pub struct GammaModel {
     bits: Vec<u32>,
     low: Vec<u32>,

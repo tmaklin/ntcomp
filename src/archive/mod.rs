@@ -88,6 +88,9 @@ mod tests {
             (b"d".to_vec(), b"NNNN".to_vec()),
             (b"e".to_vec(), with_runs(&seqs[2], &[(300, 1)]).into_iter().enumerate().map(|(i, b)| if i == 300 { b'R' } else { b }).collect()),
         ];
+        // Names with the contig's length (whole, with its runs).
+        let contigs: Vec<(Vec<u8>, Vec<u8>)> = contigs.into_iter().enumerate()
+            .map(|(i, (_, seq))| (format!("NODE_{}_length_{}_cov_1.5", i + 1, seq.len()).into_bytes(), seq)).collect();
         let files: Vec<InputFile> = vec![(b"file".to_vec(), contigs.clone())];
         let mut writer = ArchiveWriter::new(ArchiveOpts::default(), &index);
         writer.add_files(&files).unwrap();
@@ -95,12 +98,18 @@ mod tests {
         let summary = writer.write(&mut bytes).unwrap();
         assert!(summary.contains("(8 runs)"), "{}", summary);
 
+        // The lengths the names are coded by are the contigs' lengths.
+        let sections = crate::graph::decoder::GraphDecoder::new(&mut bytes.as_slice()).unwrap().decode_from_read_with_index(&index).unwrap();
+        let lengths = crate::graph::names::contig_lengths(&sections.graph, &sections.choices, sections.snp_edits.as_ref(), sections.n_runs.as_ref()).unwrap();
+        assert_eq!(lengths, contigs.iter().map(|(_, s)| s.len() as u64).collect::<Vec<_>>());
+
         let reader = ArchiveReader::open(&mut bytes.as_slice(), &index).unwrap();
         let colors: Vec<u32> = (0..5).collect();
         for decoded in reader.decoder(&colors).unwrap().decode(&colors).unwrap() {
             let decoded = decoded.unwrap();
             assert_eq!(decoded.sequence, contigs[decoded.color as usize].1, "colour {}", decoded.color);
             assert_eq!(decoded.hash_match, Some(true));
+            assert_eq!(reader.contig_name(decoded.color), Some(contigs[decoded.color as usize].0.as_slice()));
         }
 
         // Without the cut, a parse fails instead of looping.
